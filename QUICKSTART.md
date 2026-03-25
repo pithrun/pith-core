@@ -1,6 +1,8 @@
 # Pith™ Quick Start
 
-Get persistent memory for Claude in under 5 minutes.
+Get persistent memory for your AI agent in under 5 minutes.
+
+> **Primary support:** Claude Desktop. Cursor, Windsurf, and Zed also work — see step 1 for client-specific setup.
 
 ## 1. Install
 
@@ -12,13 +14,15 @@ bash scripts/install.sh
 
 The installer handles Python venv, dependencies, MCP config, auto-start, and backups.
 
-## 2. Restart Claude Desktop
+## 2. Connect Your MCP Client
 
-Quit Claude Desktop completely (Cmd+Q / Ctrl+Q), then reopen it. Pith tools appear automatically.
+**Claude Desktop:** Quit completely (Cmd+Q / Ctrl+Q), then reopen. Pith tools appear automatically.
+
+**Cursor / Windsurf / Zed:** The installer writes an MCP config entry. Restart your editor — Pith appears as a connected tool server. See `scripts/configure_clients.py` for manual configuration.
 
 ## 3. Verify
 
-Open a new conversation and type:
+In any connected MCP client, ask:
 
 ```
 Run pith status and show me the results
@@ -28,8 +32,9 @@ You should see the server running with 0 concepts (fresh install).
 
 ## 4. Set Your Preferences
 
-Open `USER_PREFERENCES.md` in a text editor. Copy the code block contents into:
-**Claude Desktop** → Settings → Profile & Preferences → Save
+Open `USER_PREFERENCES.md` in a text editor. Copy the code block into your client's system prompt or profile:
+- **Claude Desktop:** Settings → Profile & Preferences → Save
+- **Cursor / Windsurf / Zed:** Add to your global system prompt in editor AI settings
 
 ## 5. Start Using Pith
 
