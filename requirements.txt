@@ -1,0 +1,15 @@
+fastapi>=0.115.0,<1.0.0                              # Upgraded from ==0.115.0 for mcp SDK compat (starlette>=0.46)
+uvicorn[standard]==0.27.0
+pydantic>=2.11.0,<3.0.0                              # mcp>=1.12 requires pydantic>=2.11 (host_required constraint); was ==2.10.0
+pyyaml==6.0.1
+scikit-learn==1.4.0
+numpy==1.26.3
+python-dotenv==1.0.0
+requests==2.31.0
+anthropic>=0.84.0
+mcp>=1.0.0,<2.0.0                                   # Python MCP SDK for pith_mcp.py stdio bridge
+httpx>=0.27.0,<1.0.0                                 # Async HTTP client for pith_mcp.py API calls
+sentence-transformers>=3.0.0,<4.0.0  # MATURITY-003: embedding dedup (requires torch, numpy<2 on x86_64)
+pytest==7.4.3
+pytest-asyncio>=0.21.0
+pytest-cov==4.1.0
