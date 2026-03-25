@@ -104,8 +104,8 @@ Side-by-side comparison based on published claims and measured data.
 |-----------|-------|---------|
 | Language | Python (FastAPI) | Rust |
 | Storage | SQLite + WAL | SQLite + ChaCha20-Poly1305 |
-| Cognitive layers | 8 governance layers | 5 emergent layers |
-| Belief lifecycle | 5-state (active, contested, revised, superseded, dormant) | Binary (store/retrieve) |
+| Cognitive layers | 9 governance modules | 5 emergent layers |
+| Belief lifecycle | 5-state (active, contested, resolved, superseded, stale) | Binary (store/retrieve) |
 | Temporal reasoning | Currency decay, half-life, temporal promotion | Not documented |
 | Meta-learning | L1-L4 feedback loops, prediction error | Not documented |
 | Contradiction detection | Embedding-based (64,949 detections) | Not documented |

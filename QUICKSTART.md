@@ -60,4 +60,4 @@ pith restart    # Fix most issues
 
 - Full docs: [README.md](README.md)
 - Troubleshooting: see README.md § Troubleshooting
-- File an issue: [github.com/pith-ai/pith-core/issues](https://github.com/pith-ai/pith-core/issues)
+- File an issue: [github.com/pithrun/pith-core/issues](https://github.com/pithrun/pith-core/issues)
