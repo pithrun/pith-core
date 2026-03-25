@@ -14,7 +14,7 @@
 | Governance events | 57,324 |
 | Contradictions detected | 64,949 |
 | Superseded concepts | 444 |
-| Test suite | 2,546+ tests |
+| Test suite | 3,528+ tests |
 
 ## 1. Cognitive Governance Benchmark (CogGov-Bench)
 
@@ -154,11 +154,9 @@ market segments.
 ## Reproducibility
 
 ```bash
-# Run latency benchmark
-cd pith-beta && python benchmarks/latency/run_latency_bench.py
-
-# Run CogGov-Bench (requires active database)
-python -c "
+# Run CogGov-Bench (requires active database with usage data)
+cd pith-core
+python3 -c "
 import sqlite3
 from app.coggov_bench import run_coggov_bench
 conn = sqlite3.connect('path/to/pith.db')
@@ -167,3 +165,8 @@ result = run_coggov_bench(conn)
 print(f'Score: {result.composite_score}/100')
 "
 ```
+
+Latency benchmarks require an active Pith server. Run
+`python3 pith_mcp.py` then measure end-to-end MCP tool call latency
+against your own database. Published figures reflect a 60-query suite
+over a real-usage database (4,874 concepts) on Apple Silicon (arm64).
