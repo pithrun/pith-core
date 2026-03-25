@@ -12,8 +12,8 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # Configuration
-DOWNLOAD_URL="${DOWNLOAD_URL:-https://github.com/esteyangandrew/pith-core/releases/latest/download}"
-CHECKSUM_URL="${CHECKSUM_URL:-https://github.com/esteyangandrew/pith-core/releases/latest/download}"
+DOWNLOAD_URL="${DOWNLOAD_URL:-https://github.com/pithrun/pith-core/releases/latest/download}"
+CHECKSUM_URL="${CHECKSUM_URL:-https://github.com/pithrun/pith-core/releases/latest/download}"
 PITH_HOME="${PITH_HOME:-$HOME/.pith}"
 PITH_VERSION="1.0.0"
 STEP_COUNT=9
@@ -1505,7 +1505,7 @@ echo "  5. Check status: ${YELLOW}pith status${NC}"
 echo ""
 echo -e "${BLUE}Documentation:${NC}"
 echo "  https://docs.pith.dev"
-echo "  https://github.com/esteyangandrew/pith-core"
+echo "  https://github.com/pithrun/pith-core"
 echo ""
 
 exit 0
