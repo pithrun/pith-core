@@ -1,4 +1,4 @@
-# Pith — Persistent Cognitive Infrastructure
+# Pith™ — Persistent Cognitive Infrastructure
 
 A persistent memory system for Claude. Your AI learns from every conversation — decisions, patterns, discoveries — and retrieves them when relevant.
 

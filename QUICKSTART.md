@@ -1,4 +1,4 @@
-# Pith Quick Start
+# Pith™ Quick Start
 
 Get persistent memory for Claude in under 5 minutes.
 
