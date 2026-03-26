@@ -2,6 +2,12 @@
 
 Pith is an Apache 2.0 open-source project. Contributions are welcome — bug reports, documentation improvements, new MCP client support, and architecture discussion.
 
+## Contributor License Agreement (CLA)
+
+All contributors must sign our [Individual Contributor License Agreement](https://gist.github.com/esteyangandrew/ee6d6cbc74646c74f97f4cec4d970429) before we can merge your pull request. The CLA is a lightweight agreement that confirms you have the right to contribute your code and that your contributions are licensed under Apache 2.0.
+
+When you open your first PR, the CLA assistant bot will comment with instructions. You only need to sign once — it covers all future contributions to any Pithrun repository.
+
 ## Quick orientation
 
 Pith is an MCP server that adds governed persistent memory to AI agents. The entry point is `pith_mcp.py` (the MCP bridge). Core logic lives in `app/`. The benchmark suite is `app/coggov_bench.py`.
@@ -94,8 +100,9 @@ print(f'Score: {result.composite_score}/100')
 1. Fork the repo and create a branch: `git checkout -b fix/my-fix`
 2. Make your change with a test (new tests go in `tests/`)
 3. Run the full suite: `PYTHONPATH=. .venv/bin/pytest tests/ -x`
-4. Open a PR against `main` with a clear description of what and why
-5. Reference any related Issue numbers
+4. Sign the CLA when prompted by the bot (first-time contributors only)
+5. Open a PR against `main` with a clear description of what and why
+6. Reference any related Issue numbers
 
 PR titles should follow: `fix: ...`, `feat: ...`, `docs: ...`, `perf: ...`
 
@@ -118,4 +125,4 @@ For security vulnerabilities, **do not open a public Issue**. Email `security@pi
 
 ## License
 
-By contributing, you agree that your contributions are licensed under the Apache 2.0 License.
+By contributing, you agree that your contributions are licensed under the Apache 2.0 License. All contributors must have a signed [CLA](https://gist.github.com/esteyangandrew/ee6d6cbc74646c74f97f4cec4d970429) on file.
