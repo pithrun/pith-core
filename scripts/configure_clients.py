@@ -138,6 +138,22 @@ CLIENT_REGISTRY = {
             "disabled": False,
         },
     },
+    "zed": {
+        "label": "Zed",
+        "detect_dirs": {
+            "macos":   "~/.config/zed",
+            "linux":   "~/.config/zed",
+            "windows": "%APPDATA%/Zed",
+        },
+        "config_file": {
+            "macos":   "~/.config/zed/settings.json",
+            "linux":   "~/.config/zed/settings.json",
+            "windows": "%APPDATA%/Zed/settings.json",
+        },
+        "json_root": "context_servers",
+        "extra_fields": {},
+        "zed_format": True,  # uses nested command object, not flat entry
+    },
 }
 
 # VS Code is special — project-level config only, different JSON schema
@@ -150,6 +166,21 @@ VSCODE_CONFIG = {
     },
 }
 
+# Codex CLI is special — uses TOML format at ~/.codex/config.toml
+# Format reference: https://developers.openai.com/codex/mcp
+CODEX_CONFIG = {
+    "label": "Codex CLI",
+    "detect_dirs": {
+        "macos":   "~/.codex",
+        "linux":   "~/.codex",
+        "windows": "~/.codex",
+    },
+    "config_file": {
+        "macos":   "~/.codex/config.toml",
+        "linux":   "~/.codex/config.toml",
+        "windows": "~/.codex/config.toml",
+    },
+}
 
 
 # ============================================================
@@ -169,6 +200,10 @@ def detect_clients(plat):
     vscode_dir = VSCODE_CONFIG["detect_dirs"].get(plat)
     if vscode_dir and os.path.isdir(_expand(vscode_dir, plat)):
         detected["vscode"] = VSCODE_CONFIG
+    # Codex CLI: check separately (TOML format)
+    codex_dir = CODEX_CONFIG["detect_dirs"].get(plat)
+    if codex_dir and os.path.isdir(_expand(codex_dir, plat)):
+        detected["codex"] = CODEX_CONFIG
     return detected
 
 
@@ -213,6 +248,22 @@ def _build_standard_payload(server_path, api_key, python_cmd=None, extra_fields=
     if extra_fields:
         entry.update(extra_fields)
     return entry
+
+
+def _build_zed_payload(server_path, api_key, python_cmd=None):
+    """Build Zed context_servers.pith entry (nested command object format)."""
+    cmd = python_cmd or _detect_python_cmd(server_path)
+    return {
+        "command": {
+            "path": cmd,
+            "args": [server_path],
+            "env": {
+                "PITH_API_KEY": api_key,
+                "PITH_API_URL": "http://localhost:8000",
+            },
+        },
+        "settings": {},
+    }
 
 
 def _backup_file(filepath):
@@ -276,6 +327,8 @@ def configure_standard_client(client_id, info, server_path, api_key, plat, dry_r
     # Clean up legacy server names
     for legacy_name in LEGACY_SERVER_NAMES:
         config.get(root_key, {}).pop(legacy_name, None)
+    if info.get("zed_format"):
+        entry = _build_zed_payload(server_path, api_key, python_cmd=python_cmd)
     config[root_key]["pith"] = entry
     _write_json(config_path, config)
 
@@ -287,6 +340,57 @@ def configure_standard_client(client_id, info, server_path, api_key, plat, dry_r
         return {"client": label, "action": "error", "error": "JSON validation failed after write", "path": config_path}
 
     result = {"client": label, "action": "configured", "path": config_path}
+    if backup:
+        result["backup"] = backup
+    return result
+
+
+def configure_codex(server_path, api_key, config_path, dry_run=False, python_cmd=None):
+    """Configure Codex CLI via ~/.codex/config.toml (TOML format).
+
+    Uses manual TOML merge to avoid requiring third-party toml libraries.
+    Only touches the [mcp_servers.pith] section; other config is preserved.
+    Format: https://developers.openai.com/codex/mcp
+    """
+    if dry_run:
+        return {"client": "Codex CLI", "action": "would_configure", "path": config_path}
+
+    backup = _backup_file(config_path)
+    cmd = python_cmd or _detect_python_cmd(server_path)
+
+    # Read existing TOML as raw text (preserve user config)
+    existing = ""
+    if os.path.isfile(config_path):
+        with open(config_path, "r") as f:
+            existing = f.read()
+
+    # Build the [mcp_servers.pith] block
+    lines_block = [
+        "[mcp_servers.pith]",
+        "command = " + json.dumps(cmd),
+        "args = " + json.dumps([server_path]),
+        "",
+        "[mcp_servers.pith.env]",
+        "PITH_API_KEY = " + json.dumps(api_key),
+        'PITH_API_URL = "http://localhost:8000"',
+        "",
+    ]
+    pith_block = "\n".join(lines_block)
+
+    # If [mcp_servers.pith] already exists, replace it; otherwise append
+    import re as _re
+    pat = r"\[mcp_servers\.pith\](?:.|\n)*?(?=\n\[|\Z)"
+    if _re.search(pat, existing, _re.DOTALL):
+        new_content = _re.sub(pat, pith_block.rstrip(), existing, flags=_re.DOTALL)
+    else:
+        sep = "\n\n" if existing.strip() else ""
+        new_content = existing.rstrip() + sep + pith_block
+
+    os.makedirs(os.path.dirname(config_path) or ".", exist_ok=True)
+    with open(config_path, "w") as f:
+        f.write(new_content)
+
+    result = {"client": "Codex CLI", "action": "configured", "path": config_path}
     if backup:
         result["backup"] = backup
     return result
@@ -434,7 +538,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Configure MCP clients to use the Pith server",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="Supported clients: Claude Desktop, Claude Code, Cursor, Windsurf, Cline, VS Code"
+        epilog="Supported clients: Claude Desktop, Claude Code, Cursor, Windsurf, Cline, VS Code, Zed, Codex CLI"
     )
     parser.add_argument("--server-path", required=True,
                         help="Absolute path to pith_mcp.py (MCP bridge)")
@@ -472,10 +576,15 @@ def main():
     detected.pop("vscode", None)
 
     # --- Phase 2: Configure global clients ---
+    codex_detected = "codex" in detected
+    detected.pop("codex", None)
+
     results = {"detected": list(detected.keys()), "configured": [], "skipped": [], "errors": []}
 
     if vscode_detected:
         results["detected"].append("vscode")
+    if codex_detected:
+        results["detected"].append("codex")
 
     for client_id, info in detected.items():
         try:
@@ -501,6 +610,15 @@ def main():
                 results["configured"].append(r)
             except Exception as e:
                 results["errors"].append({"file": ".vscode/mcp.json", "action": "error", "error": str(e)})
+
+    # --- Phase 3b: Codex CLI ---
+    if codex_detected:
+        codex_cfg_path = _expand(CODEX_CONFIG["config_file"][plat], plat)
+        try:
+            r = configure_codex(server_path, args.api_key, codex_cfg_path, args.dry_run, python_cmd=args.python_cmd)
+            results["configured"].append(r)
+        except Exception as e:
+            results["errors"].append({"client": "Codex CLI", "action": "error", "error": str(e)})
 
     # --- Phase 4: .gitignore ---
     if not args.skip_gitignore and not args.skip_project:
