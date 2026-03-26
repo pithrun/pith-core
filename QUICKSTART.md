@@ -2,7 +2,7 @@
 
 Get persistent memory for your AI agent in under 5 minutes.
 
-> **Primary support:** Claude Desktop. Cursor, Windsurf, and Zed also work — see step 1 for client-specific setup.
+> **Primary support:** Claude Desktop. Cursor, Windsurf, Zed, and Codex CLI also work — see step 1 for client-specific setup.
 
 ## 1. Install
 
@@ -18,7 +18,11 @@ The installer handles Python venv, dependencies, MCP config, auto-start, and bac
 
 **Claude Desktop:** Quit completely (Cmd+Q / Ctrl+Q), then reopen. Pith tools appear automatically.
 
-**Cursor / Windsurf / Zed:** The installer writes an MCP config entry. Restart your editor — Pith appears as a connected tool server. See `scripts/configure_clients.py` for manual configuration.
+**Cursor / Windsurf / Zed:** The installer writes an MCP config entry. Restart your editor — Pith appears as a connected tool server.
+
+**Codex CLI:** The installer writes a `[mcp_servers.pith]` entry to `~/.codex/config.toml`. Run `codex` in any project — Pith tools are available automatically.
+
+See `scripts/configure_clients.py` for manual configuration of any client.
 
 ## 3. Verify
 
