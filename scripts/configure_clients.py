@@ -377,11 +377,13 @@ def configure_codex(server_path, api_key, config_path, dry_run=False, python_cmd
     ]
     pith_block = "\n".join(lines_block)
 
-    # If [mcp_servers.pith] already exists, replace it; otherwise append
+    # Replace the full pith table group (parent + nested subtables like .env).
+    # Previous pattern only replaced the parent table and left old .env blocks behind,
+    # which created duplicate [mcp_servers.pith.env] headers on repeated runs.
     import re as _re
-    pat = r"\[mcp_servers\.pith\](?:.|\n)*?(?=\n\[|\Z)"
-    if _re.search(pat, existing, _re.DOTALL):
-        new_content = _re.sub(pat, pith_block.rstrip(), existing, flags=_re.DOTALL)
+    pat = r"(?ms)^\[mcp_servers\.pith\][\s\S]*?(?=^\[(?!mcp_servers\.pith(?:\.|\]))|\Z)"
+    if _re.search(pat, existing):
+        new_content = _re.sub(pat, pith_block.rstrip() + "\n\n", existing, count=1)
     else:
         sep = "\n\n" if existing.strip() else ""
         new_content = existing.rstrip() + sep + pith_block
