@@ -113,7 +113,12 @@ Backups are stored under `~/.pith/backups/` by default.
 
 ## Benchmarks
 
-The current public-release build reports `62.9/100` on the internal CogGov-Bench full suite. Treat this as release evidence, not a broad marketing claim, until the public benchmark ledger and reproduction instructions are finalized. See [BENCHMARKS.md](BENCHMARKS.md).
+Pith's launch benchmark evidence uses external benchmark families, not internal QA scores:
+
+- MemoryAgentBench / FactConsolidation for multi-hop memory and conflict-resolution tasks
+- LoCoMo-Plus official Cognitive all401 for long-context cognitive memory application
+
+See [BENCHMARKS.md](BENCHMARKS.md) for scores, run boundaries, artifact hashes, and claim caveats.
 
 ## Security
 
