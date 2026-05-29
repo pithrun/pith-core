@@ -68,7 +68,7 @@ function Exit-WithError {
 
     Write-Host ""
     Write-Host "  Migration did not complete. Your Docker setup has been restored." -ForegroundColor Red
-    Write-Host "  If you need help, contact andrew@pith.dev"
+    Write-Host "  If you need help, contact your beta support channel."
     exit 1
 }
 Write-Banner
@@ -517,7 +517,7 @@ Write-Host ""
 Write-Host "  [Cleanup] Docker container cleanup..." -ForegroundColor Blue
 Write-Host ""
 Write-Host "  Your Docker container has been stopped."
-Write-Host "  Your original data is safe in your pith-beta clone directory."
+Write-Host "  Your original data is safe in your previous Pith install directory."
 Write-Host ""
 $reply = Read-Host "  Remove Docker container '$($script:ContainerId)'? (y/n)"
 if ($reply -match "^[Yy]") {
@@ -575,7 +575,7 @@ Write-Host "    pith logs      - View server logs"
 Write-Host "    pith backup    - Create a backup"
 Write-Host "    pith restart   - Restart the server"
 Write-Host ""
-Write-Host "  You can safely delete your old pith-beta clone directory when ready."
+Write-Host "  You can safely delete your old Pith source directory when ready."
 Write-Host ""
 
-exit 0
+exit 0

@@ -5,7 +5,7 @@
 
 param(
     [switch]$Force = $false,
-    [string]$PithVersion = "1.1"
+    [string]$PithVersion = "1.0.1"
 )
 
 # Strict error handling
@@ -13,8 +13,8 @@ $ErrorActionPreference = 'Stop'
 $VerbosePreference = 'SilentlyContinue'
 
 # Configuration
-$DownloadUrl = if ($env:DOWNLOAD_URL) { $env:DOWNLOAD_URL } else { "https://install.pith.dev" }
-$ChecksumUrl = if ($env:CHECKSUM_URL) { $env:CHECKSUM_URL } else { "https://install.pith.dev/checksums" }
+$DownloadUrl = if ($env:DOWNLOAD_URL) { $env:DOWNLOAD_URL } else { "https://github.com/pithrun/pith-core/releases/latest/download" }
+$ChecksumUrl = if ($env:CHECKSUM_URL) { $env:CHECKSUM_URL } else { "https://github.com/pithrun/pith-core/releases/latest/download" }
 $PithHome = if ($env:PITH_HOME) { $env:PITH_HOME } else { "$env:USERPROFILE\.pith" }
 $StepCount = 8
 $CurrentStep = 0
@@ -94,7 +94,7 @@ catch {
 # If not found, check Microsoft Store Python and offer to install
 if (-not $PythonPath) {
     Write-Warning "Python 3 not found in PATH"
-    
+
     # Check if winget is available
     try {
         $WingetAvailable = $null -ne (Get-Command winget -ErrorAction SilentlyContinue)
@@ -186,7 +186,7 @@ $DownloadSuccess = $false
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $DistDir = Split-Path -Parent $ScriptDir
 
-if ((Test-Path "$DistDir\app\server.py") -and (Test-Path "$DistDir\pith_mcp.py")) {
+if ((Test-Path "$DistDir\app\api\server.py") -and (Test-Path "$DistDir\pith_mcp.py")) {
     Write-Host "  Detected distribution directory: $DistDir"
     if (-not (Test-Path $PithServerPath)) {
         New-Item -ItemType Directory -Path $PithServerPath -Force | Out-Null
@@ -221,32 +221,32 @@ if (-not $DownloadSuccess) {
 }
 
 # Strategy 3: Download from hosted URL (future)
-if ((-not $DownloadSuccess) -and $DownloadUrl -and ($DownloadUrl -ne "https://install.pith.dev")) {
+if (-not $DownloadSuccess) {
     Write-Host "Attempting download from: $DownloadUrl"
-    
+
     $TempDir = [System.IO.Path]::GetTempPath() + [System.Guid]::NewGuid().ToString()
     New-Item -ItemType Directory -Path $TempDir -Force | Out-Null
-    
+
     try {
         # Download server package
         $ServerUrl = "$DownloadUrl/$PithServerFilename"
         $ServerPath = Join-Path $TempDir $PithServerFilename
         Invoke-WebRequest -Uri $ServerUrl -OutFile $ServerPath -TimeoutSec 30 -ErrorAction SilentlyContinue
-        
+
         # Download checksum
         $ChecksumPath = Join-Path $TempDir $PithChecksumFilename
         $ChecksumUrl = "$ChecksumUrl/$PithChecksumFilename"
         Invoke-WebRequest -Uri $ChecksumUrl -OutFile $ChecksumPath -TimeoutSec 30 -ErrorAction SilentlyContinue
-        
+
         # Verify checksum
         if ((Test-Path $ServerPath) -and (Test-Path $ChecksumPath)) {
             $FileHash = (Get-FileHash -Path $ServerPath -Algorithm SHA256).Hash
             $ChecksumContent = (Get-Content $ChecksumPath | Select-Object -First 1) -split ' '
             $ExpectedHash = $ChecksumContent[0]
-            
+
             if ($FileHash -eq $ExpectedHash) {
                 Write-Success "Download successful and checksum verified"
-                
+
                 # Extract server
                 if (-not (Test-Path $PithServerPath)) {
                     New-Item -ItemType Directory -Path $PithServerPath -Force | Out-Null
@@ -380,10 +380,10 @@ $ApiKeyFile = "$PithHome\config\api.key"
 if (-not (Test-Path $ApiKeyFile)) {
     # Generate 32-byte random key as hex (64 chars)
     $ApiKey = -join ((1..32) | ForEach-Object { "{0:x2}" -f (Get-Random -Minimum 0 -Maximum 256) })
-    
+
     # Write with restricted permissions
     Set-Content -Path $ApiKeyFile -Value $ApiKey -NoNewline
-    
+
     # FIX S2: Set restrictive ACL (owner read-only)
     $Acl = Get-Acl -Path $ApiKeyFile
     $Acl.SetAccessRuleProtection($true, $false)
@@ -395,7 +395,7 @@ if (-not (Test-Path $ApiKeyFile)) {
     )
     $Acl.AddAccessRule($Rule)
     Set-Acl -Path $ApiKeyFile -AclObject $Acl
-    
+
     Write-Success "Generated API key: $($ApiKey.Substring(0, 16))... (saved to $ApiKeyFile)"
 }
 else {
@@ -570,11 +570,11 @@ $HealthCheckTimeout = $false
 
 try {
     $proc = Start-Process -FilePath $PythonExe `
-        -ArgumentList "-m uvicorn app:app --host 127.0.0.1 --port 8000" `
+        -ArgumentList "-m uvicorn app.api.server:app --host 127.0.0.1 --port 8000" `
         -WorkingDirectory $PithServerPath `
         -WindowStyle Hidden `
         -PassThru
-    
+
     $Stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     while ($Stopwatch.Elapsed.TotalSeconds -lt 30) {
         try {
@@ -590,7 +590,7 @@ try {
             Start-Sleep -Milliseconds 500
         }
     }
-    
+
     Stop-Process -Id $proc.Id -ErrorAction SilentlyContinue
 }
 catch {
@@ -675,7 +675,8 @@ Write-Host "  pith backup      Create WAL-safe backup"
 Write-Host "  pith restore     Restore from backup"
 Write-Host "  pith update      Update deps + embeddings"
 Write-Host "  pith version     Show version + capabilities"
-Write-Host "  pith maintenance VACUUM + ANALYZE database"
+Write-Host "  pith maintenance run   Run maintenance cycle"
+Write-Host "  pith maintenance status Show maintenance task status"
 Write-Host "  pith uninstall   Remove Pith completely"
 Write-Host ""
 

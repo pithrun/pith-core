@@ -23,7 +23,7 @@ $PithHome = if ($env:PITH_HOME) { $env:PITH_HOME } else { "$env:USERPROFILE\.pit
 $DbPath = if (Test-Path "$PithHome\data\pith.db") { "$PithHome\data\pith.db" } else { "$PithHome\data\brain.db" }
 $ArchiveDir = "$PithHome\backups"
 $Timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-$KeepBackups = if ($env:KEEP_BACKUPS) { [int]$env:KEEP_BACKUPS } else { 10 }
+$KeepBackups = if ($env:KEEP_BACKUPS) { [int]$env:KEEP_BACKUPS } else { 3 }
 
 # Default output path
 if (-not $Output) {

@@ -42,8 +42,47 @@ _SIG_COUNTING = re.compile(
 )
 
 _SIG_RELATIONAL = re.compile(
-    r'\b(?:where the|in which|to which|from which|attended by|'
-    r'the person who|the one who|who .{1,20} the .{1,20} that)\b',
+    r'\b(?:'
+    # Original patterns — explicit relational indicators
+    r'where the|in which|to which|from which|attended by|'
+    r'the person who|the one who|the (?:broadcaster|organization) who|'
+    r'who .{1,20} the .{1,20} that|'
+    # RETRIEVAL-088: Multi-hop chain indicators for MAB-FC style questions.
+    # "of the <role/entity-type>" chains — the core MH signal. Questions
+    # like "What is the country of citizenship of the performer of..." have
+    # nested "of the X" clauses requiring entity chain traversal.
+    r'of the (?:country|person|author|creator|founder|spouse|'
+    r'employer|performer|institution|organization|sport|city|'
+    r'language|continent|capital|birthplace|religion|genre|'
+    r'director|manager|developer|officeholder|individual|'
+    r'CEO|chief|head|home country|notable work|place of death|'
+    r'company|manufacturer|nation|broadcaster|HQ)|'
+    # "associated with" chains (sport/position associations)
+    r'associated with|'
+    # Possessive multi-hop: "X's birthplace/country/etc."
+    r"'s (?:birthplace|citizenship|country|spouse|employer|position)|"
+    # Passive chains: "played by", "created by", etc.
+    r'(?:held|played|created|written|performed|developed|'
+    r'established|founded|managed|coached) by|'
+    # Relational head phrases: "the birthplace of", "capital city of", etc.
+    r'(?:home country|birthplace|capital city|place of (?:birth|death|formation)|'
+    r'location of (?:formation|headquarters)|continent of origin|'
+    r'language used|country of origin|chief of state|chief executive|'
+    r'notable work|broadcaster) of|'
+    r'place of origin for the (?:broadcaster|organization)|'
+    # "where X holds/was" — location-possessive chains
+    r'where \w+ (?:holds?|held|was|is|are|originated)|'
+    # Misc relational signals
+    r'recognized as the|commonly known as|'
+    # "did/is the author/creator/spouse of"
+    r'(?:did|does|is|was) the (?:author|creator|founder|spouse|manager|director) of|'
+    # Chain reasoning indicators
+    r'credited with|responsible for the|'
+    r'(?:belong|belongs) to|that originated|country that|'
+    r'would you categorize|holds the position|'
+    # Language chain patterns
+    r'speak,? write|languages? (?:spoken|written|used|did)'
+    r')\b',
     re.IGNORECASE,
 )
 
@@ -65,9 +104,17 @@ _SIG_RECALL = re.compile(
 )
 
 _SIG_PREFERENCE = re.compile(
-    r'\b(?:prefer|favorite|like most|enjoy most|what kind of|'
+    r'\b(?:prefer|favorite|favourite|like most|enjoy most|'
+    r'what (?:type|kind) of [^?.!]{1,80}\b'
+    r'(?:enjoy|enjoys|like|likes|love|loves|prefer|prefers|favorite|favourite)\b|'
     r'suggestions? (?:for|on|about)|recommend(?:ation)?s? for|'
     r'what (?:do|would) I (?:like|prefer|enjoy))\b',
+    re.IGNORECASE,
+)
+
+_SIG_MOVIE_TYPE_PREFERENCE = re.compile(
+    r'\bwhat (?:type|kind) of (?:movies?|films?) [^?.!]{1,80}\b'
+    r'(?:enjoy|enjoys|like|likes|love|loves|prefer|prefers|favorite|favourite|watch|watching)\b',
     re.IGNORECASE,
 )
 
@@ -151,7 +198,11 @@ def classify_query(query: str) -> RetrievalConfig:
         config.use_multihop = True
         config.use_entity_chain = True
         config.force_entity_chain = True
-        config.entity_chain_budget_ms = max(config.entity_chain_budget_ms, 200)
+        # RETRIEVAL-077: Increase budget from 200→500ms for relational queries.
+        # Entity chain needs 3-4 hops for multi-hop questions. At 200ms, 35%
+        # of chains exhaust budget at hop 2 before reaching bridging facts.
+        # Successful full-chain traversals take ~300-500ms on 2k-4k brains.
+        config.entity_chain_budget_ms = max(config.entity_chain_budget_ms, 500)
 
     # Temporal: recency boost
     if "temporal" in signals:
@@ -180,6 +231,15 @@ def classify_query(query: str) -> RetrievalConfig:
     )
 
     return config
+
+
+def query_bridge_terms(query: str, signals: list[str] | tuple[str, ...]) -> list[str]:
+    """Return conservative lexical bridge terms for classified query shapes."""
+    if "preference" not in signals:
+        return []
+    if _SIG_MOVIE_TYPE_PREFERENCE.search(query):
+        return ["genre", "genres", "love", "loves"]
+    return []
 
 
 # ---------------------------------------------------------------------------

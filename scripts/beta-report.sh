@@ -60,6 +60,7 @@ if [[ -n "$API_KEY" ]]; then
 fi
 
 API="http://localhost:8000"
+API_TIMEOUT="${PITH_REPORT_API_TIMEOUT:-5}"
 
 echo ""
 echo -e "${BOLD}================================${NC}"
@@ -84,8 +85,28 @@ fi
 # --- Stats (try API, fall back to direct DB) ---
 echo -e "${BOLD}--- Pith Stats ---${NC}"
 if [ "$API_ONLINE" = true ]; then
-    STATS=$(curl -sf $HEADERS "$API/pith_stats")
-    echo "$STATS" | python3 -c "
+    STATS=$(curl -sf --max-time "$API_TIMEOUT" $HEADERS "$API/pith_stats?detail=fast" 2>/dev/null)
+    if [ -z "$STATS" ]; then
+        echo -e "${YELLOW}  Stats API timed out or failed — using direct DB access${NC}"
+        python3 -c "
+import sqlite3
+conn = sqlite3.connect('$DB_PATH')
+conn.execute('PRAGMA journal_mode=WAL')
+conn.execute('PRAGMA busy_timeout=10000')
+total = conn.execute(\"SELECT COUNT(*) FROM concepts WHERE status='active'\").fetchone()[0]
+assoc = conn.execute('SELECT COUNT(*) FROM associations').fetchone()[0]
+areas = conn.execute(\"SELECT COUNT(DISTINCT knowledge_area) FROM concepts WHERE status='active'\").fetchone()[0]
+avg_conf = conn.execute(\"SELECT AVG(confidence) FROM concepts WHERE status='active'\").fetchone()[0] or 0
+avg_stab = conn.execute(\"SELECT AVG(stability) FROM concepts WHERE status='active'\").fetchone()[0] or 0
+print(f'  Total concepts:     {total}')
+print(f'  Associations:       {assoc}')
+print(f'  Knowledge areas:    {areas}')
+print(f'  Avg confidence:     {avg_conf:.2f}')
+print(f'  Avg stability:      {avg_stab:.2f}')
+conn.close()
+"
+    else
+        echo "$STATS" | python3 -c "
 import sys, json
 d = json.load(sys.stdin)
 print(f'  Total concepts:     {d.get(\"total_concepts\", 0)}')
@@ -93,7 +114,27 @@ print(f'  Associations:       {d.get(\"associations\", 0)}')
 print(f'  Knowledge areas:    {d.get(\"knowledge_areas\", 0)}')
 print(f'  Avg confidence:     {d.get(\"avg_confidence\", 0):.2f}')
 print(f'  Avg stability:      {d.get(\"avg_stability\", 0):.2f}')
+status = d.get('freshness_status')
+state = d.get('freshness_state') or 'unknown'
+reason = d.get('freshness_reason') or 'unspecified'
+if not status:
+    if d.get('stale'):
+        status = 'legacy_stale'
+        reason = 'freshness_status_missing'
+    elif d.get('partial'):
+        status = 'legacy_partial'
+        reason = 'freshness_status_missing'
+    else:
+        status = 'unknown'
+        reason = 'freshness_status_missing'
+details = [status, state, reason]
+if d.get('cache_age_ms') is not None:
+    details.append(f'cache_age_ms={d.get(\"cache_age_ms\")}')
+if d.get('max_stale_ms') is not None:
+    details.append(f'max_stale_ms={d.get(\"max_stale_ms\")}')
+print(f'  Stats freshness:    {\"; \".join(details)}')
 "
+    fi
 else
     python3 -c "
 import sqlite3

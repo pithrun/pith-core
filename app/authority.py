@@ -45,10 +45,10 @@ import json
 import logging
 import sqlite3
 
-from app.config import (
+from app.core.config import (
     AUTHORITY_EVIDENCE_WEIGHT as CFG_EVIDENCE_W,
 )
-from app.config import (
+from app.core.config import (
     AUTHORITY_EVOLUTION_CORRECTION_BONUS,
     AUTHORITY_EVOLUTION_VERSION_DIVISOR,
     AUTHORITY_TYPE_WEIGHT_DEFAULT,
@@ -58,16 +58,16 @@ from app.config import (
     PRESENTATION_CONTEXT,
     PRESENTATION_DIRECTIVE,
 )
-from app.config import (
+from app.core.config import (
     AUTHORITY_EVOLUTION_WEIGHT as CFG_EVOLUTION_W,
 )
-from app.config import (
+from app.core.config import (
     AUTHORITY_STABILITY_WEIGHT as CFG_STABILITY_W,
 )
-from app.config import (
+from app.core.config import (
     AUTHORITY_TYPE_WEIGHT as CFG_TYPE_W,
 )
-from app.datetime_utils import _utc_now_iso
+from app.core.datetime_utils import _utc_now_iso
 
 logger = logging.getLogger(__name__)
 
@@ -250,7 +250,7 @@ def batch_compute_authority(conn: sqlite3.Connection, concept_ids: list[str] | N
     now = _utc_now_iso()
 
     # Federation Phase 0: Precompute KA distributions for percentile ranking
-    from app.config import get_feature_flag
+    from app.core.config import get_feature_flag
 
     ka_governance_enabled = get_feature_flag("KA_RELATIVE_GOVERNANCE_ENABLED", False)
     ka_distributions: dict[str, list[float]] = {}
@@ -273,7 +273,7 @@ def batch_compute_authority(conn: sqlite3.Connection, concept_ids: list[str] | N
         ).fetchall()
 
     updated = 0
-    from app.constants import TYPE_AUTHORITY_CAPS
+    from app.core.constants import TYPE_AUTHORITY_CAPS
 
     for row in rows:
         cid = row[0]

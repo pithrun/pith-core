@@ -53,22 +53,31 @@ if ! command -v python3 &> /dev/null; then
 fi
 echo -e "${GREEN}✓ Python $(python3 --version)${NC}"
 
-# Read API key
-API_KEY=""
-if [[ -f "$API_KEY_FILE" ]] && [[ "$API_KEY_FILE" == *.key ]]; then
-    API_KEY=$(cat "$API_KEY_FILE" 2>/dev/null)
-elif [[ -f "$API_KEY_FILE" ]]; then
-    API_KEY=$(grep "PITH_API_KEY=" "$API_KEY_FILE" 2>/dev/null | cut -d'=' -f2)
-fi
-if [[ -z "$API_KEY" ]]; then
-    echo -e "${YELLOW}⚠ No API key found — generate one during install${NC}"
-    API_KEY="dev-api-key-change-in-production"
-fi
-
 # Detect platform
 PLATFORM="macos"
 if [[ "$(uname -s)" == "Linux" ]]; then
     PLATFORM="linux"
+fi
+
+if [[ "$SERVER_PATH" == "$PITH_HOME_DIR/pith-server/pith_mcp.py" ]]; then
+    if ! python3 - <<'PY'
+import os
+import sys
+from pathlib import Path
+
+repo_root = Path(os.path.expanduser("~/.pith/pith-server")).resolve()
+sys.path.insert(0, str(repo_root))
+from app.governance.runtime_install_guard import classify_runtime_path
+
+report = classify_runtime_path(os.path.expanduser("~/.pith/pith-server"))
+print(report["detail"])
+raise SystemExit(1 if report["violation"] else 0)
+PY
+    then
+        echo -e "${RED}✗ Installed runtime alias is unsafe${NC}"
+        echo "  Repair ~/.pith/pith-server before configuring MCP clients."
+        exit 1
+    fi
 fi
 
 # Use configure_clients.py if available
@@ -78,7 +87,7 @@ if [[ -f "$CONFIGURE_SCRIPT" ]]; then
     python3 "$CONFIGURE_SCRIPT" \
         --server-path "$SERVER_PATH" \
         --python-cmd "$PYTHON_CMD" \
-        --api-key "$API_KEY" \
+        --source-key-from-file "$PITH_HOME/.env" \
         --project-dir "$(dirname "$SERVER_PATH")" \
         --platform "$PLATFORM"
     echo ""
@@ -86,6 +95,23 @@ if [[ -f "$CONFIGURE_SCRIPT" ]]; then
     echo "  Note: Using Python MCP bridge (pith_mcp.py). Node.js is no longer required."
 else
     echo -e "${YELLOW}⚠ configure_clients.py not found, configuring Claude Desktop only${NC}"
+    API_KEY=""
+    if [[ -f "$API_KEY_FILE" ]] && [[ "$API_KEY_FILE" == *.key ]]; then
+        API_KEY=$(tr -d '\r\n' < "$API_KEY_FILE" 2>/dev/null)
+    elif [[ -f "$API_KEY_FILE" ]]; then
+        API_KEY=$(grep "PITH_API_KEY=" "$API_KEY_FILE" 2>/dev/null | cut -d'=' -f2- | tr -d '\r\n')
+    fi
+    if [[ -z "$API_KEY" ]]; then
+        echo -e "${RED}✗ No API key found. Refusing to write broken MCP client config.${NC}"
+        if [[ "$API_KEY_FILE" == "$PROJECT_DIR/.env" ]]; then
+            echo "  Detected distribution checkout without a usable PITH_API_KEY."
+            echo "  Run scripts/install.sh first so clients point at ~/.pith/pith-server,"
+            echo "  or configure an installed server explicitly."
+        else
+            echo "  Expected non-empty key in: $API_KEY_FILE"
+        fi
+        exit 1
+    fi
     # Inline fallback for Claude Desktop
     if [[ "$(uname)" == "Darwin" ]]; then
         CONFIG_DIR="$HOME/Library/Application Support/Claude"

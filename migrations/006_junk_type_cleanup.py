@@ -6,6 +6,7 @@ Also fix 85 concepts with corrupted content_updated_at/created_at values.
 
 import json
 import logging
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -28,9 +29,43 @@ TYPE_REMAP = {
     "client_extraction": "observation",
 }
 
+MIGRATION_ID = "DATA-006-JUNK-TYPE-CLEANUP"
+DESCRIPTION = "Migration 006 junk type and corrupted timestamp cleanup"
+FORCE_ENV_VAR = "PITH_FORCE_MIGRATION_006"
+READONLY_SKIP_ENV = "PITH_BENCHMARK_READONLY"
+
+
+def needs_migration(conn):
+    """Return true when migration 006 still has cleanup work to perform."""
+    placeholders = ",".join("?" for _ in TYPE_REMAP)
+    if conn.execute(
+        f"SELECT 1 FROM concepts WHERE concept_type IN ({placeholders}) LIMIT 1",
+        tuple(TYPE_REMAP.keys()),
+    ).fetchone():
+        return True
+    if conn.execute(
+        """SELECT 1 FROM concepts
+           WHERE content_updated_at IS NOT NULL
+             AND length(content_updated_at) < 10
+           LIMIT 1"""
+    ).fetchone():
+        return True
+    return bool(
+        conn.execute(
+            """SELECT 1 FROM concepts
+           WHERE created_at IS NOT NULL
+             AND length(created_at) < 10
+           LIMIT 1"""
+        ).fetchone()
+    )
+
 
 def migrate(conn):
     """Remap junk concept_types and fix corrupted timestamps."""
+    if os.environ.get("PITH_BENCHMARK_READONLY", "").lower() in ("true", "1"):
+        logger.info("Migration 006 skipped (PITH_BENCHMARK_READONLY)")
+        return {"status": "skipped", "reason": "benchmark_readonly"}
+
     # Phase 1: Remap junk types
     total_remapped = 0
     for old_type, new_type in TYPE_REMAP.items():
@@ -103,3 +138,4 @@ def migrate(conn):
         ),
         ts_fixed,
     )
+    return {"status": "success", "remapped": total_remapped, "timestamps_fixed": ts_fixed}

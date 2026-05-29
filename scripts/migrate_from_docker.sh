@@ -88,7 +88,7 @@ cleanup_on_error() {
     if [[ $exit_code -ne 0 ]]; then
         echo ""
         echo -e "${RED}Migration did not complete. Your Docker setup has been restored.${NC}"
-        echo -e "If you need help, contact andrew@pith.dev"
+        echo -e "If you need help, contact your beta support channel."
     fi
 }
 
@@ -544,7 +544,7 @@ echo ""
 echo -e "${BLUE}[Cleanup]${NC} Docker container cleanup..."
 echo ""
 echo "Your Docker container has been stopped. Would you like to remove it?"
-echo "  (Your original data is safe in your pith-beta clone directory)"
+echo "  (Your original data is safe in your previous Pith install directory)"
 echo ""
 read -p "Remove Docker container '$CONTAINER_ID'? (y/n): " -r
 if [[ $REPLY =~ ^[Yy]$ ]]; then
@@ -594,7 +594,7 @@ echo "  pith logs      — View server logs"
 echo "  pith backup    — Create a backup"
 echo "  pith restart   — Restart the server"
 echo ""
-echo "You can safely delete your old pith-beta clone directory when ready."
+echo "You can safely delete your old Pith source directory when ready."
 echo ""
 
 exit 0
