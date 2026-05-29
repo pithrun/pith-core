@@ -13,7 +13,7 @@
 #   KEEP_SYNCED   — Max backups to retain per tier (default: 5)
 #
 # Cron example (daily at 2:30am):
-#   30 2 * * * cd ~/Desktop/pith-beta && bash scripts/backup/sync_backups.sh >> data/sync.log 2>&1
+#   30 2 * * * cd /path/to/pith && bash scripts/backup/sync_backups.sh >> data/sync.log 2>&1
 # ============================================================
 set -e
 

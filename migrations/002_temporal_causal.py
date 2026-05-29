@@ -42,6 +42,10 @@ def get_existing_columns(conn: sqlite3.Connection, table: str) -> set:
 
 def run_migration(db_path: str = None):
     """Execute migration 002."""
+    if os.environ.get("PITH_BENCHMARK_READONLY", "").lower() in ("true", "1"):
+        logger.info("Migration 002 skipped (PITH_BENCHMARK_READONLY)")
+        return {"status": "skipped", "reason": "benchmark_readonly"}
+
     path = db_path or DB_PATH
     conn = sqlite3.connect(path)
     conn.execute("PRAGMA journal_mode=WAL")

@@ -12,7 +12,7 @@
 # Usage: bash scripts/backup/safe_backup.sh [--output /path/to/backup.db]
 #
 # Cron example (every 3 hours, 6am-11pm):
-#   0 6,9,12,15,18,21 * * * cd ~/Desktop/pith-beta && bash scripts/backup/safe_backup.sh >> data/backup.log 2>&1
+#   0 6,9,12,15,18,21 * * * cd /path/to/pith && bash scripts/backup/safe_backup.sh >> data/backup.log 2>&1
 # ============================================================
 set -e
 
@@ -105,15 +105,15 @@ if [ "$CONCEPTS" = "0" ] || [ -z "$CONCEPTS" ]; then
 fi
 
 # --- Retention: keep only the last N automated backups ---
-KEEP=${KEEP_BACKUPS:-10}
+KEEP=${KEEP_BACKUPS:-3}
 if [ -d "$ARCHIVE_DIR" ]; then
-    BACKUPS=($(ls -1t "$ARCHIVE_DIR"/pith_backup_*.db "$ARCHIVE_DIR"/pith_backup_*.db 2>/dev/null | grep -v '\-shm$\|\-wal$'))
+    BACKUPS=($(ls -1t "$ARCHIVE_DIR"/pith_backup_*.db 2>/dev/null | grep -v '\-shm$\|\-wal$'))
     COUNT=${#BACKUPS[@]}
     if [ "$COUNT" -gt "$KEEP" ]; then
         PRUNED=0
         for OLD_BACKUP in "${BACKUPS[@]:$KEEP}"; do
             rm -f "$OLD_BACKUP" "${OLD_BACKUP}-shm" "${OLD_BACKUP}-wal"
-            ((PRUNED++))
+            ((PRUNED+=1))
         done
         log "  Retention: kept $KEEP, pruned $PRUNED old backup(s)"
     else

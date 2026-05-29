@@ -9,7 +9,7 @@ Key differences from benchmark version:
 
 Feature-flagged via PITH_MULTIHOP_ENABLED.
 
-Spec: pith-internal/specs/RETRIEVAL_037_SPRINT_PLAN.md
+Spec: RETRIEVAL_037 sprint design notes.
 Source: benchmarks/adapter/multihop.py (HybridMultiHopRetriever)
 """
 
@@ -306,7 +306,7 @@ class ProductionMultiHopRetriever:
         embedding. This prevents embedding model degradation at large pool
         sizes (see RETRIEVAL-033).
         """
-        from app.embedding import embedding_engine
+        from app.storage.embedding import embedding_engine
         import numpy as np
 
         if not clauses or not activated_concepts:

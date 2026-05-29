@@ -18,7 +18,7 @@ switch ($action) {
         Write-Host "Starting Pith Brain Server..."
         Push-Location $PithServerPath
         $proc = Start-Process -FilePath $PythonExe `
-            -ArgumentList "-m uvicorn app:app --host 127.0.0.1 --port 8000" `
+            -ArgumentList "-m uvicorn app.api.server:app --host 127.0.0.1 --port 8000" `
             -WindowStyle Hidden -PassThru
         $proc.Id | Out-File "$PithHome\pith.pid"
         Start-Sleep -Seconds 2
@@ -128,10 +128,24 @@ switch ($action) {
         }
     }
     "maintenance" {
-        Write-Host "Running maintenance..."
-        $dbPath = Resolve-DbPath
-        & $PythonExe -c "import sqlite3; c=sqlite3.connect(r'$dbPath'); c.execute('VACUUM'); c.execute('ANALYZE'); print('VACUUM + ANALYZE complete'); c.close()"
-        Write-Host "Maintenance complete"
+        $maintenanceAction = if ($args.Count -gt 1) { $args[1] } else { "run" }
+        switch ($maintenanceAction) {
+            "run" {
+                Write-Host "Running maintenance..."
+                if ($args.Count -gt 2) {
+                    & $PythonExe -m app.ops.maintenance_cli run @($args[2..($args.Count - 1)])
+                } else {
+                    & $PythonExe -m app.ops.maintenance_cli run
+                }
+            }
+            "status" {
+                & $PythonExe -m app.ops.maintenance_cli status
+            }
+            default {
+                Write-Host "Usage: pith maintenance {run|status}" -ForegroundColor Yellow
+                exit 1
+            }
+        }
     }
     "version" {
         $CapFile = "$PithHome\.install_capabilities"
@@ -228,12 +242,14 @@ switch ($action) {
             "Windsurf"       = "$env:APPDATA\Windsurf\User\globalStorage\windsurf.mcp\config.json"
             "Cline"          = "$env:APPDATA\Code\User\globalStorage\saoudrizwan.claude-dev\settings\cline_mcp_settings.json"
             "Continue"       = "$env:USERPROFILE\.continue\config.json"
+            "Codex"          = "$env:USERPROFILE\.codex\config.toml"
         }
         foreach ($name in $clients.Keys) {
             $path = $clients[$name]
+            $pattern = if ($name -eq "Codex") { '\[mcp_servers\.pith\]' } else { '"pith"' }
             if (Test-Path $path) {
                 $content = Get-Content $path -Raw -ErrorAction SilentlyContinue
-                if ($content -match '"pith"') {
+                if ($content -match $pattern) {
                     Write-Host "  ${name}:$((' ' * (16 - $name.Length)))configured"
                 } elseif ($content -match "brain-mcp") {
                     Write-Host "  ${name}:$((' ' * (16 - $name.Length)))configured (legacy brain-mcp — run installer to update)"
@@ -298,7 +314,10 @@ switch ($action) {
         Write-Host "  restore     Restore from a backup file"
         Write-Host "  update      Update dependencies + embeddings"
         Write-Host "  uninstall   Remove Pith completely"
-        Write-Host "  maintenance Run VACUUM + ANALYZE on database"
+        Write-Host "  maintenance run [--phases 1,2,3] [--dry-run]"
+        Write-Host "                Run maintenance cycle"
+        Write-Host "  maintenance status"
+        Write-Host "                Show maintenance task status"
         Write-Host "  version     Show version and capabilities"
         Write-Host "  report      Generate diagnostics report"
     }

@@ -31,7 +31,9 @@ def check_content_policy(text: str) -> bool:
     return bool(AUTHORITY_CLAIM_PATTERN.search(text))
 
 
-SUMMARY_OVERLAP_THRESHOLD = 0.5  # Below this = substantial rewrite
+SUMMARY_OVERLAP_THRESHOLD = 0.5  # Below this = substantial rewrite (maturity downgrade to PROVISIONAL)
+# Below this = HIJACK block (summary replacement refused) — INGEST-057
+HIJACK_BLOCK_THRESHOLD = 0.30
 
 
 def compute_summary_overlap(old_summary: str, new_summary: str) -> float:

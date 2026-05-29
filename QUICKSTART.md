@@ -1,72 +1,77 @@
-# Pith™ Quick Start
+# Pith Quick Start
 
-Get persistent memory for your AI agent in under 5 minutes.
-
-> **Primary support:** Claude Desktop. Cursor, Windsurf, Zed, and Codex CLI also work — see step 1 for client-specific setup.
+Install Pith, verify the local service, then connect your AI client.
 
 ## 1. Install
 
 ```bash
-# Mac/Linux
-cd /path/to/pith
-bash scripts/install.sh
+curl -fsSL https://pith.run/install | bash
 ```
 
-The installer handles Python venv, dependencies, MCP config, auto-start, and backups.
+The installer sets up `~/.pith`, creates a virtual environment, configures the local service, generates an API key, writes selected client configuration, and runs a health check.
 
-## 2. Connect Your MCP Client
+If you need a non-default port:
 
-**Claude Desktop:** Quit completely (Cmd+Q / Ctrl+Q), then reopen. Pith tools appear automatically.
-
-**Cursor / Windsurf / Zed:** The installer writes an MCP config entry. Restart your editor — Pith appears as a connected tool server.
-
-**Codex CLI:** The installer writes a `[mcp_servers.pith]` entry to `~/.codex/config.toml`. Run `codex` in any project — Pith tools are available automatically.
-
-See `scripts/configure_clients.py` for manual configuration of any client.
-
-## 3. Verify
-
-In any connected MCP client, ask:
-
-```
-Run pith status and show me the results
+```bash
+PITH_PORT=8123 curl -fsSL https://pith.run/install | bash
 ```
 
-You should see the server running with 0 concepts (fresh install).
+If port `8000` is occupied, the installer can automatically choose a free port in the configured scan range and persist it.
 
-## 4. Set Your Preferences
+## 2. Verify
 
-Open `USER_PREFERENCES.md` in a text editor. Copy the code block into your client's system prompt or profile:
-- **Claude Desktop:** Settings → Profile & Preferences → Save
-- **Cursor / Windsurf / Zed:** Add to your global system prompt in editor AI settings
+Open a new terminal window so your shell picks up the `pith` command:
 
-## 5. Start Using Pith
+```bash
+pith status
+```
 
-Just chat normally. Pith learns automatically from every conversation. There's nothing special you need to do — Claude will call Pith tools behind the scenes.
+A healthy install should report that Pith is running.
 
-## Core API (3 functions)
+## 3. Connect Your Client
 
-If you're building on Pith or want to understand what's happening under the hood:
+### Claude Desktop
 
-| Function | What it does |
-|----------|-------------|
-| `pith_conversation_turn` | Retrieves relevant context AND learns from the previous exchange in a single call |
-| `pith_checkpoint` | Saves/loads execution state for cross-session task resumption |
-| `pith_session_end` | Closes a session and triggers consolidation |
+Restart Claude Desktop completely. If you skipped the instructions step during install, run:
 
-These three functions cover 90%+ of typical usage. The full API exposes 40+ tools for search, reflection, knowledge graph operations, and more — see the [full documentation](README.md).
+```bash
+pith protocol
+```
+
+Paste the copied instructions into Claude Desktop settings, save, quit Claude with Cmd+Q, and reopen it.
+
+### Codex
+
+Confirm `~/.codex/AGENTS.md` contains the Pith cognitive loop and that `~/.pith/bin/pith api conversation_turn --stdin-json` is referenced. If Codex was installed after Pith, rerun the installer or the client configuration step.
+
+### VS Code, Cursor, and Windsurf
+
+The installer writes MCP/client configuration where possible. Restart the app after installation. Some clients require an additional global rule or instruction file before the model reliably calls Pith every turn.
+
+## 4. Use It
+
+Use your AI client normally. A configured agent should retrieve Pith context before substantive responses and learn durable decisions after meaningful exchanges.
+
+For manual lifecycle calls, use:
+
+```bash
+~/.pith/bin/pith api conversation_turn --stdin-json
+~/.pith/bin/pith api checkpoint --stdin-json
+~/.pith/bin/pith api session_end --stdin-json
+```
 
 ## Common Commands
 
 ```bash
-pith status     # Is it running?
-pith logs       # What's happening?
-pith backup     # Protect your data
-pith restart    # Fix most issues
+pith status
+pith logs
+pith restart
+pith backup
+pith version
 ```
 
-## Need Help?
+## Help
 
 - Full docs: [README.md](README.md)
-- Troubleshooting: see README.md § Troubleshooting
-- File an issue: [github.com/pithrun/pith-core/issues](https://github.com/pithrun/pith-core/issues)
+- Security reporting: [SECURITY.md](SECURITY.md)
+- Issues: [github.com/pithrun/pith-core/issues](https://github.com/pithrun/pith-core/issues)
