@@ -1,0 +1,106 @@
+name: Install failure
+description: Report a problem installing or starting Pith.
+title: "[install]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting an install issue. Please do not paste API keys, bearer tokens, full `.env` files, private project contents, or database files.
+
+  - type: input
+    id: install_command
+    attributes:
+      label: Install command
+      description: Paste the command you ran. Remove any private tokens first.
+      placeholder: curl -fsSL https://pith.run/install | bash
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - macOS
+        - Linux
+        - Windows
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: os_version
+    attributes:
+      label: OS version and architecture
+      placeholder: macOS 14.5, arm64
+    validations:
+      required: true
+
+  - type: input
+    id: shell
+    attributes:
+      label: Terminal and shell
+      placeholder: Terminal.app with zsh, iTerm2 with zsh, bash, etc.
+
+  - type: textarea
+    id: terminal_output
+    attributes:
+      label: Last 40 lines of terminal output
+      description: Include the error and surrounding lines. Redact secrets before submitting.
+      render: shell
+    validations:
+      required: true
+
+  - type: dropdown
+    id: pith_home_created
+    attributes:
+      label: Did ~/.pith get created?
+      options:
+        - "Yes"
+        - "No"
+        - "I don't know"
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics
+      description: Run the commands that work on your machine and paste the output. Skip commands that are unavailable.
+      value: |
+        command -v pith
+        ls -la ~/.pith 2>/dev/null | head
+        pith status
+        pith logs
+      render: shell
+
+  - type: dropdown
+    id: port_8000
+    attributes:
+      label: Is port 8000 already in use?
+      options:
+        - "No"
+        - "Yes"
+        - "I don't know"
+
+  - type: dropdown
+    id: client
+    attributes:
+      label: AI client you are trying to use
+      options:
+        - Claude Desktop
+        - Claude Code
+        - Cursor
+        - VS Code
+        - Windsurf
+        - Codex
+        - None yet
+        - Other
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Additional context
+      description: Anything else that helps us reproduce the issue.
