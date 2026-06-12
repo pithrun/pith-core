@@ -1,0 +1,181 @@
+name: release-validation
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release-validation:
+    name: release-validation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Describe validation boundary
+        run: |
+          echo "release-validation checks repository syntax and launch-surface hygiene only."
+          echo "It does not publish a release, upload assets, deploy workers, write R2, or prove an end-to-end install."
+
+      - name: Verify required release files
+        run: |
+          set -euo pipefail
+          required_files=(
+            README.md
+            QUICKSTART.md
+            BENCHMARKS.md
+            CHANGELOG.md
+            SECURITY.md
+            CONTRIBUTING.md
+            requirements.txt
+            scripts/install.sh
+            scripts/install.ps1
+            pith_mcp.py
+          )
+          for path in "${required_files[@]}"; do
+            test -f "$path" || { echo "Missing required file: $path" >&2; exit 1; }
+          done
+
+      - name: Python syntax check
+        run: |
+          python -m compileall -q app migrations pith_mcp.py skill_deployer.py scripts/configure_clients.py
+
+      - name: Bash syntax check
+        run: |
+          set -euo pipefail
+          bash -n scripts/install.sh
+          bash -n scripts/backup/safe_backup.sh
+          bash -n scripts/backup/setup_schedule.sh
+          bash -n scripts/backup/sync_backups.sh
+          bash -n scripts/beta-report.sh
+          bash -n scripts/setup-mcp.sh
+
+      - name: PowerShell syntax check when parser is available
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v pwsh >/dev/null 2>&1; then
+            pwsh -NoLogo -NoProfile -Command "\
+              \$tokens = \$null; \
+              \$errors = \$null; \
+              \$null = [System.Management.Automation.Language.Parser]::ParseFile('scripts/install.ps1', [ref]\$tokens, [ref]\$errors); \
+              if (\$errors.Count -gt 0) { \$errors | ForEach-Object { Write-Error \$_ }; exit 1 }"
+          else
+            echo "pwsh unavailable; skipping PowerShell parser check in v1."
+          fi
+
+      - name: Local Markdown link check
+        run: |
+          python - <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+          from urllib.parse import unquote
+
+          docs = [
+              Path("README.md"),
+              Path("QUICKSTART.md"),
+              Path("BENCHMARKS.md"),
+              Path("CHANGELOG.md"),
+              Path("SECURITY.md"),
+              Path("CONTRIBUTING.md"),
+          ]
+
+          link_re = re.compile(r"(?<!!)\[[^\]]+\]\(([^)]+)\)")
+
+          def slug(heading: str) -> str:
+              value = heading.strip().lower()
+              value = re.sub(r"[^\w\s-]", "", value)
+              value = re.sub(r"\s+", "-", value)
+              return value
+
+          failures = []
+          for doc in docs:
+              text = doc.read_text(encoding="utf-8", errors="replace")
+              anchors = {
+                  slug(line.lstrip("#").strip())
+                  for line in text.splitlines()
+                  if line.startswith("#")
+              }
+              for raw in link_re.findall(text):
+                  target = raw.strip()
+                  if not target or target.startswith(("http://", "https://", "mailto:")):
+                      continue
+                  if target.startswith("#"):
+                      anchor = unquote(target[1:])
+                      if anchor and anchor not in anchors:
+                          failures.append(f"{doc}: missing local anchor {target}")
+                      continue
+                  path_part, _, anchor_part = target.partition("#")
+                  if path_part:
+                      linked = (doc.parent / unquote(path_part)).resolve()
+                      repo_root = Path.cwd().resolve()
+                      try:
+                          linked.relative_to(repo_root)
+                      except ValueError:
+                          failures.append(f"{doc}: link escapes repo: {target}")
+                          continue
+                      if not linked.exists():
+                          failures.append(f"{doc}: missing linked file {target}")
+                          continue
+                  if anchor_part and path_part:
+                      linked_text = linked.read_text(encoding="utf-8", errors="replace")
+                      linked_anchors = {
+                          slug(line.lstrip("#").strip())
+                          for line in linked_text.splitlines()
+                          if line.startswith("#")
+                      }
+                      if unquote(anchor_part) not in linked_anchors:
+                          failures.append(f"{doc}: missing anchor {target}")
+
+          if failures:
+              print("\n".join(failures), file=sys.stderr)
+              sys.exit(1)
+          PY
+
+      - name: Scoped public-surface hygiene scan
+        run: |
+          python - <<'PY'
+          import sys
+          from pathlib import Path
+
+          scanned_paths = [
+              Path("README.md"),
+              Path("QUICKSTART.md"),
+              Path("BENCHMARKS.md"),
+              Path("CHANGELOG.md"),
+              Path("SECURITY.md"),
+              Path("CONTRIBUTING.md"),
+              Path("scripts/install.sh"),
+              Path("scripts/install.ps1"),
+          ]
+          forbidden = [
+              "esteyangandrew/pith-core",
+              "_session_worktrees",
+              "/Volumes/Pith-Archive",
+              "PITH_INSTALL_RC_TOKEN",
+              "install-rc",
+              "pith-release-rc",
+              "internal launch",
+              "approval packet",
+              "private staging",
+          ]
+
+          failures = []
+          for path in scanned_paths:
+              text = path.read_text(encoding="utf-8", errors="replace")
+              lowered = text.lower()
+              for term in forbidden:
+                  if term.lower() in lowered:
+                      failures.append(f"{path}: forbidden public-surface term: {term}")
+
+          if failures:
+              print("\n".join(failures), file=sys.stderr)
+              sys.exit(1)
+          PY
