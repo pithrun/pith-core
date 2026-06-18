@@ -25,7 +25,6 @@ import functools
 import json
 import logging
 import os
-import threading
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -37,7 +36,8 @@ from app.storage import owned_connection
 logger = logging.getLogger(__name__)
 
 # MAINT-035 / ARGUS-C3-F2: Configurable per-phase timeout, clamped to [30, 600] seconds
-# Default 120s preserved. Override with PITH_MAINTENANCE_PHASE_TIMEOUT for large brains.
+# Default 420s reflects current full-reflection runtime on the rose profile. Override
+# with PITH_MAINTENANCE_PHASE_TIMEOUT for smaller/larger brains.
 # Parse+clamp logic extracted into _parse_phase_timeout() for unit-testable config parsing
 # without module reload (importlib.reload re-executes all module-level code).
 
@@ -46,19 +46,19 @@ def _parse_phase_timeout(env_value: str | None) -> int:
     """Parse and clamp PITH_MAINTENANCE_PHASE_TIMEOUT env value.
 
     Args:
-        env_value: Raw string from os.environ (or None → use default 120).
+        env_value: Raw string from os.environ (or None -> use default 420).
 
     Returns:
         Clamped integer timeout in seconds, within [30, 600].
     """
     try:
-        raw = int(env_value) if env_value is not None else 120
+        raw = int(env_value) if env_value is not None else 420
     except (ValueError, TypeError):
         logger.warning(
-            "MAINT-035: Invalid PITH_MAINTENANCE_PHASE_TIMEOUT=%r, using default 120",
+            "MAINT-035: Invalid PITH_MAINTENANCE_PHASE_TIMEOUT=%r, using default 420",
             env_value,
         )
-        raw = 120
+        raw = 420
     clamped = max(30, min(600, raw))
     if raw != clamped:
         logger.warning(
@@ -179,7 +179,7 @@ async def phase1_scheduled_tasks(conn=None, dry_run: bool = False) -> dict:
 async def phase2_reflection(conn=None, dry_run: bool = False) -> dict:
     """Run full reflection: decay, forgetting, strengthening, merging.
 
-    Uses reflection_engine.reflect(mode='full') which handles:
+    Uses the shared reflection runner, which delegates to full reflection for:
       - Confidence decay (concepts not accessed in 30+ days)
       - Active forgetting (archive low-salience, low-access concepts)
       - Strengthening (boost frequently-accessed concepts)
@@ -194,38 +194,58 @@ async def phase2_reflection(conn=None, dry_run: bool = False) -> dict:
         should = reflection_engine.should_reflect()
         return {"dry_run": True, "should_reflect": should}
 
-    loop = asyncio.get_running_loop()
-    cancel_event = threading.Event()
-    deadline_monotonic = time.monotonic() + max(
-        1.0,
-        PHASE_TIMEOUT_SECONDS - REFLECTION_TIMEOUT_SAFETY_MARGIN_SECONDS,
-    )
-    future = loop.run_in_executor(
-        None,
-        functools.partial(
-            reflection_engine.reflect,
+    from app.ops.reflection_runner import ReflectionRunRequest, run_reflection_async
+
+    result = await run_reflection_async(
+        ReflectionRunRequest(
             mode="full",
-            cancel_event=cancel_event,
-            deadline_monotonic=deadline_monotonic,
-            long_step_min_remaining_seconds=REFLECTION_LONG_STEP_MIN_BUDGET_SECONDS,
-        ),
+            source="maintenance",
+            require_ready=False,
+            allow_degraded=True,
+            timeout_seconds=PHASE_TIMEOUT_SECONDS,
+        )
     )
-    try:
-        summary = await future
-    except asyncio.CancelledError:
-        cancel_event.set()
-        raise
-    # MAINT-026: reflect() runs in thread executor so asyncio.wait_for timeout
-    # can cancel the phase if it exceeds PHASE_TIMEOUT_SECONDS (previously
-    # reflect() blocked the event loop with no cancellation point).
+    if result.status == "failed":
+        raise RuntimeError(result.error or "reflection runner failed")
+    if result.status == "rejected":
+        reason = result.admission.reason if result.admission else "reflection_rejected"
+        payload = {
+            "reflection_summary": {"status": "skipped", "reason": reason},
+            "runner_status": result.status,
+            "run_id": result.run_id,
+        }
+        if reason == "reflection_already_running":
+            payload["budget_deferred"] = True
+            payload["budget_status"] = "deferred"
+        else:
+            payload["budget_aborted"] = True
+            payload["budget_status"] = "aborted"
+        return payload
+
+    summary = result.summary
+    # MAINT-026: reflection runs through the shared runner, which executes in a
+    # thread and passes cooperative cancellation/deadline hints to reflect().
     # AF-03 fix + Amendment 4: null safety + JSON serialization
     if summary is None:
         return {"reflection_summary": {"status": "skipped", "reason": "no_consolidation_candidates"}}
     summary_dict = summary.model_dump() if hasattr(summary, "model_dump") else summary
+    budget_status = getattr(summary, "budget_status", None)
+    if getattr(summary, "aborted", False) and budget_status == "deferred":
+        return {
+            "reflection_summary": summary_dict,
+            "budget_deferred": True,
+            "budget_status": budget_status,
+            "abort_reason": getattr(summary, "abort_reason", None),
+            "last_completed_step": getattr(summary, "last_completed_step", None),
+            "abort_stage": getattr(summary, "abort_stage", None),
+            "deferred_phases": getattr(summary, "deferred_phases", []),
+            "phase_budget_decisions": getattr(summary, "phase_budget_decisions", {}),
+        }
     if getattr(summary, "aborted", False):
         return {
             "reflection_summary": summary_dict,
             "budget_aborted": True,
+            "budget_status": budget_status or "aborted",
             "abort_reason": getattr(summary, "abort_reason", None),
             "last_completed_step": getattr(summary, "last_completed_step", None),
             "abort_stage": getattr(summary, "abort_stage", None),
@@ -2171,6 +2191,14 @@ async def run_maintenance(
                 )
                 report.warnings.append(warning_msg)
                 logger.warning(warning_msg)
+            elif result.get("budget_deferred"):
+                logger.info(
+                    "Phase %s (%s) deferred within reflection budget: %s after %s",
+                    phase_num,
+                    phase_name,
+                    result.get("abort_reason", "unknown"),
+                    result.get("abort_stage") or result.get("last_completed_step") or "unknown",
+                )
             logger.info(f"Maintenance phase {phase_num} ({phase_name}): done in {elapsed}s")
 
             # §3.4: Run sub-phases (e.g., contradiction_sweep after reflection)
@@ -2205,6 +2233,7 @@ async def run_maintenance(
                 report.results[phase_name] = {
                     "elapsed_seconds": elapsed,
                     "budget_aborted": True,
+                    "budget_status": "aborted",
                     "abort_reason": "outer_timeout",
                     "last_completed_step": None,
                     "reflection_summary": {
@@ -2252,10 +2281,13 @@ def _write_heartbeat(report: MaintenanceReport, *, source: str = "manual") -> No
         if reflection_result:
             heartbeat["reflection_status"] = {
                 "budget_aborted": bool(reflection_result.get("budget_aborted")),
+                "budget_deferred": bool(reflection_result.get("budget_deferred")),
+                "budget_status": reflection_result.get("budget_status"),
                 "abort_reason": reflection_result.get("abort_reason"),
                 "last_completed_step": reflection_result.get("last_completed_step"),
                 "abort_stage": reflection_result.get("abort_stage"),
                 "elapsed_seconds": reflection_result.get("elapsed_seconds"),
+                "deferred_phases": reflection_result.get("deferred_phases", []),
             }
         os.makedirs(os.path.dirname(heartbeat_path), exist_ok=True)
         with open(heartbeat_path, "w") as f:

@@ -8,6 +8,7 @@ import subprocess
 from functools import lru_cache
 from pathlib import Path
 
+from app.core.fork_safety import should_suppress_optional_subprocess
 from app.core.profile import get_active_profile, resolve_data_dir
 
 
@@ -20,6 +21,8 @@ def _resolve_git_commit() -> str:
     env_commit = os.environ.get("PITH_GIT_COMMIT", "").strip()
     if env_commit:
         return env_commit
+    if should_suppress_optional_subprocess("runtime_identity_git_commit"):
+        return "unknown"
     try:
         result = subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"],

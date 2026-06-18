@@ -2,6 +2,7 @@
 
 import logging
 
+from app.cognitive.ka_admission import resolve_ka_admission
 # FIX-3(A4): Import from config.py (centralized) to avoid circular import risk
 from app.core.config import MIN_CONFIDENCE_CHANGE, MIN_EVIDENCE_CHANGE
 from app.core.datetime_utils import _utc_now_iso
@@ -87,6 +88,16 @@ def create_concept(proposal: ConceptProposal) -> Concept:
         raw_area=proposal.knowledge_area or "general",
         strict=False,
     )
+    normalized_area, ka_admission_metadata = resolve_ka_admission(
+        summary=proposal.summary or "",
+        knowledge_area=normalized_area,
+        ka_source=ka_source,
+        ka_confidence=ka_confidence,
+        raw_area=proposal.knowledge_area or "general",
+        extraction_source="propose",
+        trusted_intentional_general=False,
+        now=_utc_now_iso(),
+    )
     # Memory Integrity §5.2.3: Evidence method anti-spoofing
     sanitized_evidence = proposal.evidence
     try:
@@ -135,6 +146,7 @@ def create_concept(proposal: ConceptProposal) -> Concept:
         metadata={
             "knowledge_area": normalized_area,
             "knowledge_area_source": ka_source,
+            **ka_admission_metadata,
             "created_by": "learning_engine",
             "agent_id": proposal.agent_id,
         },

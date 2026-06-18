@@ -453,7 +453,7 @@ for name, entry in servers.items():
             entry['command'] = 'node'
             entry['args'] = [pith_server]
         if api_key:
-            entry.setdefault('env', {})['BRAIN_API_KEY'] = api_key
+            entry.setdefault('env', {})['PITH_API_KEY'] = api_key
         updated = True
         print(f'Updated MCP entry: {name}')
         print(f'  -> server.js: {pith_server}')
@@ -466,7 +466,7 @@ if not updated:
             servers[name]['command'] = 'node'
             servers[name]['args'] = [pith_server]
             if api_key:
-                servers[name].setdefault('env', {})['BRAIN_API_KEY'] = api_key
+                servers[name].setdefault('env', {})['PITH_API_KEY'] = api_key
             updated = True
             print(f'Updated MCP entry: {name} (matched by name)')
             break

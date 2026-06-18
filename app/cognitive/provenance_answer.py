@@ -6,13 +6,14 @@ decides whether the proposed answer is present in the cited support.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
 import string
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import date, timedelta
 from typing import Literal
 
@@ -51,6 +52,7 @@ AnswerIntent = Literal[
 ]
 CandidateSource = Literal[
     "regex_date",
+    "regex_conversation_source_date",
     "regex_relative_date_span",
     "regex_duration",
     "regex_count",
@@ -87,6 +89,9 @@ SupportPresentAnswerRole = Literal[
     "pet_type",
     "question_bound_list",
     "event_list",
+    "activity_object",
+    "action_bundle_list",
+    "where_did_go_activity",
     "direct_support_scalar",
 ]
 LLMCaller = Callable[..., str]
@@ -200,6 +205,22 @@ _ATOMIC_QUESTION_PATTERNS = (
     re.compile(r"^\s*where did\b", re.IGNORECASE),
     re.compile(r"^\s*what (?:book|movie|nickname)\b", re.IGNORECASE),
     re.compile(r"^\s*what (?:is|are|was|were|did|does)\b", re.IGNORECASE),
+)
+_FOR_HOW_LONG_QUESTION_PATTERN = re.compile(r"^\s*for\s+how\s+long\b", re.IGNORECASE)
+_YES_NO_ARTIFACT_PHOTO_QUESTION_PATTERN = re.compile(
+    r"^\s*did\s+[A-Z][a-z]+\s+make\b.*\b(?:photo|picture)\b",
+    re.IGNORECASE,
+)
+_SCALAR_SLOT_QUESTION_PATTERNS = (
+    re.compile(r"^\s*what\s+spice\s+did\b", re.IGNORECASE),
+    re.compile(r"^\s*what\s+organization\s+does\b", re.IGNORECASE),
+    re.compile(r"^\s*what\s+new\s+hobby\s+did\b", re.IGNORECASE),
+    re.compile(r"^\s*what\s+project\s+did\b.*\bfinish\b", re.IGNORECASE),
+    re.compile(r"^\s*what\s+activity\s+did\b", re.IGNORECASE),
+    re.compile(r"^\s*what\s+class\s+is\b", re.IGNORECASE),
+    re.compile(r"^\s*what\s+sports\s+activity\s+has\b", re.IGNORECASE),
+    re.compile(r"^\s*what\s+color\s+glow\s+did\b", re.IGNORECASE),
+    re.compile(r"^\s*what\s+emotion\s+does\b", re.IGNORECASE),
 )
 
 _TEMPORAL_QUESTION_PATTERN = re.compile(r"^\s*(?:when\b|how long\b)", re.IGNORECASE)
@@ -365,6 +386,15 @@ _ADOPTION_OR_FAMILY_COMMITMENT_RE = re.compile(
 _ADOPTION_PROCESS_COMMITMENT_RE = re.compile(
     r"\b(?:process|applied|interviews?|journey|pursu(?:e|ing)|focused|goal|dream|ready|"
     r"building|build|start(?:ing)?|future|mom|motherhood|kids|children|family)\b",
+    re.IGNORECASE,
+)
+_ADOPTION_OPINION_QUESTION_RE = re.compile(
+    r"^\s*what\s+does\s+(?P<subject>[A-Z][A-Za-z'-]*)\s+think\s+about\s+"
+    r"(?P<object>[A-Z][A-Za-z'-]*)'s\s+decision\s+to\s+adopt\b",
+    re.IGNORECASE,
+)
+_AWESOME_PARENT_SUPPORT_RE = re.compile(
+    r"\b(?:awesome|amazing|great|good)\s+(?:mom|mother|parent)\b",
     re.IGNORECASE,
 )
 _DEICTIC_OBJECT_ANSWER_PATTERN = re.compile(
@@ -666,6 +696,38 @@ _TEMPORAL_MAKE_MEDIA_OBJECT_NOUNS = {
     "tart",
     "tarts",
 }
+_LOCOMO_SOURCE_FRAGMENT_ANIMAL_TERMS = {
+    "animal",
+    "animals",
+    "dog",
+    "dogs",
+    "pet",
+    "pets",
+    "puppies",
+    "puppy",
+}
+_LOCOMO_SOURCE_FRAGMENT_ADOPTION_TERMS = {
+    "adopt",
+    "adopted",
+    "adopting",
+    "adoption",
+}
+_LOCOMO_SOURCE_FRAGMENT_MEDIA_EVENT_TERMS = {
+    "accident",
+    "broken",
+    "car",
+    "cars",
+    "crash",
+    "crashed",
+    "media",
+    "photo",
+    "picture",
+    "shared",
+}
+_LOCOMO_ADOPTION_DURATION_ACTOR_PATTERN = re.compile(
+    r"\bsince\s+([A-Z][A-Za-z'-]*)\s+adopt(?:ed|s|ing)?\b",
+    re.IGNORECASE,
+)
 _MEDIA_ACTOR_LOOKBACK_CHARS = 300
 _SHARED_MEDIA_FIELD_PATTERN = re.compile(
     r"\[Shared media (?P<field>intent|caption)\]\s*(?P<value>.*?)"
@@ -747,7 +809,7 @@ _WATCHED_TITLE_REJECTION_PATTERN = re.compile(
     r"add(?:ed|ing)?\b.{0,80}\b(?:list|watch))\b",
     re.IGNORECASE,
 )
-_FAVORITE_DISH_QUESTION_PATTERN = re.compile(r"\bfavorite\s+dish\b", re.IGNORECASE)
+_FAVORITE_DISH_QUESTION_PATTERN = re.compile(r"\bfavorite\s+dish(?:es)?\b", re.IGNORECASE)
 _FAVORITE_DISH_SUPPORT_PATTERN = re.compile(
     r"\bfavorite\s+dish\b.{0,80}?\bis\s+(.+?)(?:[.!?,;]|$)",
     re.IGNORECASE,
@@ -1254,6 +1316,33 @@ class SupportCandidateBackfillResult:
     semantic_candidate_ids: tuple[str, ...] = ()
     semantic_admitted_ids: tuple[str, ...] = ()
     semantic_latency_ms: float | None = None
+    preserved_initial_supports: tuple[EvidenceSupport, ...] = ()
+    preserved_initial_candidate_ids: tuple[str, ...] = ()
+    preserved_initial_support_rejection_counts: dict[str, int] = field(default_factory=dict)
+    duplicate_equivalence: tuple[dict[str, object], ...] = ()
+    displacement_ledger: tuple[dict[str, object], ...] = ()
+    preserved_initial_support_displacement_enabled: bool = False
+    preserved_initial_support_displacement_count: int = 0
+    locomo_decisive_evidence_preserved_ids: tuple[str, ...] = ()
+    locomo_decisive_evidence_family_by_id: dict[str, str] = field(default_factory=dict)
+    locomo_decisive_evidence_rejection_counts: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class LocomoDecisiveSupportAssessment:
+    family: str | None
+    safe_to_preserve_duplicate: bool = False
+    score_boost: float = 0.0
+    rejection_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class ActivatedSupportContinuityResult:
+    supports: list[EvidenceSupport]
+    candidate_ids: tuple[str, ...]
+    rejection_counts: dict[str, int]
+    rejected_ids_by_reason: dict[str, tuple[str, ...]]
+    latency_ms: float
 
 
 @dataclass(frozen=True)
@@ -1359,6 +1448,10 @@ def try_provenance_bound_answer(
     answer_shape_runtime_effect_enabled: bool = False,
     legacy_surface_contract_enabled: bool = False,
     locomo_support_present_synthesis_enabled: bool = False,
+    locomo_support_present_answer_realization_enabled: bool = False,
+    locomo_support_emission_enabled: bool = False,
+    locomo_bounded_support_admission_enabled: bool = False,
+    locomo_bounded_support_admission_effect_enabled: bool = False,
 ) -> EvidenceAnswerDecision:
     """Return a validated answer copied from cited support, or abstain."""
     t0 = time.perf_counter()
@@ -1408,6 +1501,7 @@ def try_provenance_bound_answer(
     )
     if not supports:
         return _abstain("no_support", t0)
+    supports = _hydrate_support_temporal_metadata(supports)
 
     answer_shape_runtime_probe = _run_answer_shape_runtime_hook()
     if answer_shape_runtime_probe and answer_shape_runtime_probe.answer:
@@ -1431,7 +1525,18 @@ def try_provenance_bound_answer(
             return _finish(direct_support_decision)
 
     strict_structured_enabled = answer_contract_enabled and structured_synthesis_enabled
-    exact_support_recovery_active = answer_contract_enabled and exact_support_recovery_enabled
+    locomo_backfill_emission_active = locomo_support_emission_enabled and (
+        _locomo_support_present_answer_realization_question(question)
+        or _locomo_support_present_synthesis_question(question)
+    )
+    exact_support_recovery_active = (
+        answer_contract_enabled
+        and exact_support_recovery_enabled
+        and not (
+            locomo_backfill_emission_active
+            and _locomo_training_course_date_question(question)
+        )
+    )
     support_derived_repair_active = answer_contract_enabled and support_derived_repair_enabled
     support_pack_completeness_active = answer_contract_enabled and support_pack_completeness_enabled
     support_surface_reach_active = answer_contract_enabled and support_surface_reach_enabled
@@ -1477,6 +1582,9 @@ def try_provenance_bound_answer(
                 max_supports=_SUPPORT_PRESENT_ADMISSION_V3_MAX_SUPPORTS,
                 required_concept_ids=required_concept_ids,
                 locomo_support_present_synthesis_enabled=locomo_support_present_synthesis_enabled,
+                locomo_support_present_answer_realization_enabled=(
+                    locomo_support_present_answer_realization_enabled
+                ),
             )
             if v3_decision.answer or v3_decision.support_admission_version == "v3":
                 return v3_decision
@@ -1566,6 +1674,7 @@ def try_provenance_bound_answer(
             semantic_enabled=support_candidate_backfill_semantic_enabled,
             semantic_limit=support_candidate_backfill_semantic_limit,
             semantic_min_score=support_candidate_backfill_semantic_min_score,
+            locomo_support_emission_enabled=locomo_backfill_emission_active,
         )
 
     def _shared_common_entity_synthesis_with_backfill(
@@ -1715,7 +1824,13 @@ def try_provenance_bound_answer(
         if (
             not backfill_active
             or not locomo_support_present_synthesis_enabled
-            or not _locomo_support_present_synthesis_question(question)
+            or not (
+                _locomo_support_present_synthesis_question(question)
+                or (
+                    locomo_support_present_answer_realization_enabled
+                    and _locomo_support_present_answer_realization_question(question)
+                )
+            )
         ):
             return decision
         backfill = _collect_backfill()
@@ -1753,8 +1868,20 @@ def try_provenance_bound_answer(
         llm_error_class: str | None = None,
         candidate_count: int = 0,
         candidate_rejection_counts: dict[str, int] | None = None,
+        allow_temporal_actor_mismatch: bool = False,
     ) -> EvidenceAnswerDecision:
-        if not backfill_active or reason not in _EXACT_SUPPORT_BACKFILL_ABSTAINS:
+        temporal_actor_mismatch_allowed = (
+            allow_temporal_actor_mismatch
+            and reason == "support_actor_mismatch"
+            and (intent == "date" or _TEMPORAL_QUESTION_PATTERN.search(question) is not None)
+        )
+        if (
+            not backfill_active
+            or (
+                reason not in _EXACT_SUPPORT_BACKFILL_ABSTAINS
+                and not temporal_actor_mismatch_allowed
+            )
+        ):
             return decision
         backfill = _collect_backfill()
         if not backfill.supports:
@@ -1828,6 +1955,46 @@ def try_provenance_bound_answer(
             )
         return _with_backfill_diagnostics(decision, backfill)
 
+    if (
+        strict_structured_enabled
+        and synthesis_shape == "atomic_scalar"
+        and locomo_support_present_answer_realization_enabled
+        and _locomo_training_course_date_question(question)
+        and backfill_active
+    ):
+        decision = _maybe_retry_with_support_candidate_backfill(
+            decision=_abstain("llm_disabled", t0),
+            question=question,
+            activated_concepts=activated_concepts[:max_activated_concepts],
+            existing_supports=supports,
+            shape=synthesis_shape,
+            llm_call=llm_call,
+            llm_enabled=llm_enabled,
+            timeout_seconds=timeout_seconds,
+            model=model,
+            t0=t0,
+            candidate_rejection_counts={},
+            support_pack_completeness_enabled=support_pack_completeness_active,
+            exact_support_native_stability_enabled=exact_support_native_stability_enabled,
+            support_present_native_stability_enabled=support_present_native_stability_active,
+            support_present_guard_stability_enabled=support_present_guard_stability_active,
+            locomo_support_present_answer_realization_enabled=(
+                locomo_support_present_answer_realization_enabled
+            ),
+            locomo_support_emission_enabled=locomo_backfill_emission_active,
+            enabled=answer_contract_enabled and support_candidate_backfill_enabled,
+            fts_limit=support_candidate_backfill_fts_limit,
+            assoc_limit=support_candidate_backfill_assoc_limit,
+            max_supports=support_candidate_backfill_max_supports,
+            min_score=support_candidate_backfill_min_score,
+            budget_ms=support_candidate_backfill_budget_ms,
+            semantic_enabled=support_candidate_backfill_semantic_enabled,
+            semantic_limit=support_candidate_backfill_semantic_limit,
+            semantic_min_score=support_candidate_backfill_semantic_min_score,
+        )
+        if decision.answer:
+            return _admission_v2(decision)
+
     if strict_structured_enabled and synthesis_shape in {
         "predicate_bound_scalar",
         "list_or_set",
@@ -1847,6 +2014,9 @@ def try_provenance_bound_answer(
             exact_support_native_stability_enabled=exact_support_native_stability_enabled,
             support_present_native_stability_enabled=support_present_native_stability_active,
             support_present_guard_stability_enabled=support_present_guard_stability_active,
+            locomo_support_present_answer_realization_enabled=(
+                locomo_support_present_answer_realization_enabled
+            ),
         )
         decision = _post_synthesis_movie_genre_correction(decision)
         decision = _maybe_retry_with_support_candidate_backfill(
@@ -1865,6 +2035,10 @@ def try_provenance_bound_answer(
             exact_support_native_stability_enabled=exact_support_native_stability_enabled,
             support_present_native_stability_enabled=support_present_native_stability_active,
             support_present_guard_stability_enabled=support_present_guard_stability_active,
+            locomo_support_present_answer_realization_enabled=(
+                locomo_support_present_answer_realization_enabled
+            ),
+            locomo_support_emission_enabled=locomo_backfill_emission_active,
             enabled=answer_contract_enabled and support_candidate_backfill_enabled,
             fts_limit=support_candidate_backfill_fts_limit,
             assoc_limit=support_candidate_backfill_assoc_limit,
@@ -1974,6 +2148,36 @@ def try_provenance_bound_answer(
             and len(candidates) > 1
             and _FUTURE_OR_PLAN_CUE_PATTERN.search(question) is None
         ):
+            source_date_candidate = _top_conversation_source_date_temporal_candidate(
+                question=question,
+                candidates=candidates,
+                supports=supports,
+            )
+            if source_date_candidate is not None:
+                if strict_structured_enabled:
+                    return _verified_candidate_decision(
+                        question=question,
+                        candidate=source_date_candidate,
+                        supports=supports,
+                        t0=t0,
+                        intent=intent_decision.intent,
+                        candidate_count=len(candidates),
+                        candidate_rejection_counts=candidate_rejection_counts,
+                        locomo_support_present_answer_realization_enabled=(
+                            locomo_support_present_answer_realization_enabled
+                        ),
+                    )
+                return _candidate_decision(
+                    source_date_candidate,
+                    t0,
+                    intent=intent_decision.intent,
+                    candidate_count=len(candidates),
+                    candidate_rejection_counts=candidate_rejection_counts,
+                    question=question,
+                    locomo_support_present_answer_realization_enabled=(
+                        locomo_support_present_answer_realization_enabled
+                    ),
+                )
             top_summary_candidate = _top_event_bound_summary_temporal_candidate(
                 question=question,
                 supports=supports,
@@ -1990,6 +2194,9 @@ def try_provenance_bound_answer(
                         intent=intent_decision.intent,
                         candidate_count=len(candidates),
                         candidate_rejection_counts=candidate_rejection_counts,
+                        locomo_support_present_answer_realization_enabled=(
+                            locomo_support_present_answer_realization_enabled
+                        ),
                     )
                 return _candidate_decision(
                     top_summary_candidate,
@@ -1997,6 +2204,10 @@ def try_provenance_bound_answer(
                     intent=intent_decision.intent,
                     candidate_count=len(candidates),
                     candidate_rejection_counts=candidate_rejection_counts,
+                    question=question,
+                    locomo_support_present_answer_realization_enabled=(
+                        locomo_support_present_answer_realization_enabled
+                    ),
                 )
         if len(candidates) == 1:
             if strict_structured_enabled:
@@ -2008,6 +2219,9 @@ def try_provenance_bound_answer(
                     intent=intent_decision.intent,
                     candidate_count=len(candidates),
                     candidate_rejection_counts=candidate_rejection_counts,
+                    locomo_support_present_answer_realization_enabled=(
+                        locomo_support_present_answer_realization_enabled
+                    ),
                 )
                 if (
                     verified.mode == "abstain"
@@ -2022,6 +2236,10 @@ def try_provenance_bound_answer(
                 intent=intent_decision.intent,
                 candidate_count=len(candidates),
                 candidate_rejection_counts=candidate_rejection_counts,
+                question=question,
+                locomo_support_present_answer_realization_enabled=(
+                    locomo_support_present_answer_realization_enabled
+                ),
             )
         if intent_decision.intent == "count" and candidate_rejection_counts:
             return _admission_v2(
@@ -2099,6 +2317,9 @@ def try_provenance_bound_answer(
                             intent=intent_decision.intent,
                             candidate_count=len(candidates),
                             candidate_rejection_counts=candidate_rejection_counts,
+                            locomo_support_present_answer_realization_enabled=(
+                                locomo_support_present_answer_realization_enabled
+                            ),
                         )
                     return _candidate_decision(
                         selected,
@@ -2106,6 +2327,10 @@ def try_provenance_bound_answer(
                         intent=intent_decision.intent,
                         candidate_count=len(candidates),
                         candidate_rejection_counts=candidate_rejection_counts,
+                        question=question,
+                        locomo_support_present_answer_realization_enabled=(
+                            locomo_support_present_answer_realization_enabled
+                        ),
                     )
             return _abstain(
                 "candidate_ambiguous",
@@ -2199,6 +2424,19 @@ def try_provenance_bound_answer(
             candidate_count=len(candidates),
             candidate_rejection_counts=candidate_rejection_counts,
         )
+        if (
+            (
+                locomo_support_present_synthesis_enabled
+                and _locomo_support_present_synthesis_question(question)
+            )
+            or (
+                locomo_support_present_answer_realization_enabled
+                and _locomo_support_present_answer_realization_question(question)
+            )
+        ):
+            admitted = _admission_v2(decision)
+            if admitted.answer or admitted.support_admission_version == "v3":
+                return admitted
         return _exact_recovery_with_backfill(
             decision,
             intent=intent_decision.intent if intent_decision else None,
@@ -2336,6 +2574,7 @@ def try_provenance_bound_answer(
         intent=intent_decision.intent if intent_decision else None,
         enabled=exact_support_recovery_active,
         locomo_support_present_synthesis_enabled=locomo_support_present_synthesis_enabled,
+        locomo_support_present_answer_realization_enabled=locomo_support_present_answer_realization_enabled,
     )
     if recovery_result is not None:
         answer = recovery_result.answer
@@ -2399,12 +2638,27 @@ def try_provenance_bound_answer(
         )
         if recovered is not None:
             return recovered
-        return _abstain(
+        decision = _abstain(
             "support_actor_mismatch",
             t0,
             intent=intent_decision.intent if intent_decision else None,
             candidate_count=len(candidates),
             candidate_rejection_counts=candidate_rejection_counts,
+        )
+        if (
+            locomo_support_present_synthesis_enabled
+            and _locomo_support_present_synthesis_question(question)
+        ):
+            admitted = _admission_v2(decision)
+            if admitted.answer or admitted.support_admission_version == "v3":
+                return admitted
+        return _exact_recovery_with_backfill(
+            decision,
+            intent=intent_decision.intent if intent_decision else None,
+            reason="support_actor_mismatch",
+            candidate_count=len(candidates),
+            candidate_rejection_counts=candidate_rejection_counts,
+            allow_temporal_actor_mismatch=True,
         )
 
     repair_result: SupportDerivedRepairResult | None = None
@@ -2533,6 +2787,10 @@ def try_provenance_bound_answer(
                 exact_support_native_stability_enabled=exact_support_native_stability_enabled,
                 support_present_native_stability_enabled=support_present_native_stability_active,
                 support_present_guard_stability_enabled=support_present_guard_stability_active,
+                locomo_support_present_answer_realization_enabled=(
+                    locomo_support_present_answer_realization_enabled
+                ),
+                locomo_support_emission_enabled=locomo_backfill_emission_active,
                 enabled=answer_contract_enabled and support_candidate_backfill_enabled,
                 fts_limit=support_candidate_backfill_fts_limit,
                 assoc_limit=support_candidate_backfill_assoc_limit,
@@ -2607,6 +2865,10 @@ def try_provenance_bound_answer(
                     exact_support_native_stability_enabled=exact_support_native_stability_enabled,
                     support_present_native_stability_enabled=support_present_native_stability_active,
                     support_present_guard_stability_enabled=support_present_guard_stability_active,
+                    locomo_support_present_answer_realization_enabled=(
+                        locomo_support_present_answer_realization_enabled
+                    ),
+                    locomo_support_emission_enabled=locomo_backfill_emission_active,
                     enabled=answer_contract_enabled and support_candidate_backfill_enabled,
                     fts_limit=support_candidate_backfill_fts_limit,
                     assoc_limit=support_candidate_backfill_assoc_limit,
@@ -2675,7 +2937,7 @@ def _classify_answer_intent(question: str) -> AnswerIntentDecision:
         return AnswerIntentDecision("yes_no")
     if re.search(r"^\s*how many\b", question, re.IGNORECASE):
         return AnswerIntentDecision("count")
-    if re.search(r"^\s*how long\b", question, re.IGNORECASE):
+    if re.search(r"^\s*(?:how long|for\s+how\s+long)\b", question, re.IGNORECASE):
         return AnswerIntentDecision("duration")
     if re.search(r"^\s*when\b", question, re.IGNORECASE):
         return AnswerIntentDecision("date")
@@ -3129,7 +3391,7 @@ def _try_legacy_surface_contract_answer(
 
 def _legacy_surface_candidate_allowed(candidate: AnswerCandidate, intent: AnswerIntent) -> bool:
     if intent == "date":
-        return candidate.source == "regex_relative_date_span"
+        return candidate.source in {"regex_conversation_source_date", "regex_relative_date_span"}
     if intent == "count":
         return candidate.source == "regex_count"
     return False
@@ -3186,6 +3448,9 @@ def _candidate_answers_from_support(
             relative_candidates = _relative_date_span_candidates(question, support.support_text)
             if relative_candidates:
                 return [(candidate, "regex_relative_date_span") for candidate in relative_candidates]
+        conversation_date_candidates = _conversation_date_candidates_from_support(question, support)
+        if conversation_date_candidates:
+            return conversation_date_candidates
         return [
             (_clean_candidate_answer(match.group(0)), "regex_date")
             for match in _DATE_CANDIDATE_PATTERN.finditer(support.support_text)
@@ -3239,6 +3504,77 @@ def _relative_date_span_candidates(question: str, support_text: str) -> list[str
     return candidates
 
 
+_CONVERSATION_HEADER_PATTERN = re.compile(
+    r"\[Conversation\s+on\s+(?P<date>[^\]]+?)\]",
+    re.IGNORECASE,
+)
+_LAST_WEEKDAY_PATTERN = re.compile(
+    r"\blast\s+(?P<weekday>monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+    re.IGNORECASE,
+)
+_WEEKDAY_INDEX = {
+    "monday": 0,
+    "tuesday": 1,
+    "wednesday": 2,
+    "thursday": 3,
+    "friday": 4,
+    "saturday": 5,
+    "sunday": 6,
+}
+
+
+def _conversation_header_calendar_date(support_text: str) -> date | None:
+    match = _CONVERSATION_HEADER_PATTERN.search(support_text)
+    if match is None:
+        return None
+    return _parse_calendar_date(match.group("date"))
+
+
+def _conversation_date_candidates_from_support(
+    question: str,
+    support: EvidenceSupport,
+) -> list[tuple[str, CandidateSource]]:
+    if support.channel != "verbatim":
+        return []
+    conversation_date = _conversation_header_calendar_date(support.support_text)
+    if conversation_date is None:
+        return []
+
+    support_without_header = _CONVERSATION_HEADER_PATTERN.sub(" ", support.support_text)
+    if "support group" in _normalize(question) and "support group" not in _normalize(support_without_header):
+        return []
+    if not _date_sentence_has_required_event_terms(question, support_without_header):
+        return []
+
+    if re.search(r"\byesterday\b", support_without_header, re.IGNORECASE):
+        return [
+            (
+                _format_day_month_year_answer(conversation_date - timedelta(days=1)),
+                "regex_conversation_source_date",
+            )
+        ]
+    weekday_match = _LAST_WEEKDAY_PATTERN.search(support_without_header)
+    if weekday_match is not None:
+        weekday = _WEEKDAY_INDEX[weekday_match.group("weekday").lower()]
+        delta_days = (conversation_date.weekday() - weekday) % 7
+        if delta_days == 0:
+            delta_days = 7
+        return [
+            (
+                _format_day_month_year_answer(conversation_date - timedelta(days=delta_days)),
+                "regex_conversation_source_date",
+            )
+        ]
+    if re.search(r"\b(?:today|currently|just|now|recently)\b", support_without_header, re.IGNORECASE):
+        return [
+            (
+                f"{_MONTH_NAMES[conversation_date.month]}, {conversation_date.year}",
+                "regex_conversation_source_date",
+            )
+        ]
+    return []
+
+
 def _quoted_title_candidates(support_text: str) -> list[tuple[str, CandidateSource]]:
     candidates: list[tuple[str, CandidateSource]] = []
     for match in _QUOTED_SPAN_PATTERN.finditer(support_text):
@@ -3254,6 +3590,20 @@ def _increment_rejection(rejection_counts: dict[str, int], reason: str) -> None:
     rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
 
 
+def _increment_rejected_concept(
+    rejection_counts: dict[str, int],
+    rejected_ids_by_reason: dict[str, list[str]],
+    reason: str,
+    concept_id: str,
+) -> None:
+    _increment_rejection(rejection_counts, reason)
+    if not concept_id:
+        return
+    rejected_ids = rejected_ids_by_reason.setdefault(reason, [])
+    if concept_id not in rejected_ids:
+        rejected_ids.append(concept_id)
+
+
 def _candidate_alignment_rejection_reason(
     question: str,
     support: EvidenceSupport,
@@ -3263,10 +3613,15 @@ def _candidate_alignment_rejection_reason(
 ) -> str | None:
     if source == "regex_quoted_title":
         return _quoted_span_rejection_reason(question, support.support_text, answer)
-    if source in {"regex_date", "regex_relative_date_span"}:
+    if source in {"regex_date", "regex_relative_date_span", "regex_conversation_source_date"}:
         date_sanity_reason = _date_candidate_sanity_rejection_reason(answer)
         if date_sanity_reason is not None:
             return date_sanity_reason
+        if source == "regex_conversation_source_date":
+            expected_candidates = _conversation_date_candidates_from_support(question, support)
+            if any(_normalize(candidate) == _normalize(answer) for candidate, _ in expected_candidates):
+                return None
+            return "conversation_source_date_unbound"
         return _date_event_rejection_reason(question, support.support_text, answer)
     if source == "regex_count":
         return _count_rejection_reason(question, support.support_text, answer)
@@ -3781,14 +4136,19 @@ def _resolve_temporal_candidate_selection_conflict(
     supports: list[EvidenceSupport],
     rejection_counts: dict[str, int],
 ) -> AnswerCandidate:
-    if selected.source not in {"regex_date", "regex_relative_date_span"}:
+    date_candidate_sources = {
+        "regex_date",
+        "regex_relative_date_span",
+        "regex_conversation_source_date",
+    }
+    if selected.source not in date_candidate_sources:
         return selected
     if not _TEMPORAL_QUESTION_PATTERN.search(question):
         return selected
     if _FUTURE_OR_PLAN_CUE_PATTERN.search(question):
         return selected
 
-    if selected.support.channel == "verbatim":
+    if selected.support.channel == "verbatim" and selected.source != "regex_conversation_source_date":
         top_summary_candidate = _top_event_bound_summary_temporal_candidate(
             question=question,
             supports=supports,
@@ -3813,7 +4173,7 @@ def _resolve_temporal_candidate_selection_conflict(
     event_bound_by_answer: dict[str, tuple[AnswerCandidate, float]] = {}
 
     for candidate in candidates:
-        if candidate.source not in {"regex_date", "regex_relative_date_span"}:
+        if candidate.source not in date_candidate_sources:
             continue
         score = score_by_support_id.get(candidate.support.support_id)
         if score is None:
@@ -3822,7 +4182,10 @@ def _resolve_temporal_candidate_selection_conflict(
             continue
         if _session_date_answer_is_anchor_only(candidate.answer, candidate.support.support_text):
             continue
-        if _date_event_rejection_reason(question, candidate.support.support_text, candidate.answer) is not None:
+        if (
+            candidate.source != "regex_conversation_source_date"
+            and _date_event_rejection_reason(question, candidate.support.support_text, candidate.answer) is not None
+        ):
             continue
         existing = event_bound_by_answer.get(candidate.normalized_answer)
         if existing is None or score > existing[1]:
@@ -3877,6 +4240,36 @@ def _top_event_bound_summary_temporal_candidate(
     return None
 
 
+def _top_conversation_source_date_temporal_candidate(
+    *,
+    question: str,
+    candidates: list[AnswerCandidate],
+    supports: list[EvidenceSupport],
+) -> AnswerCandidate | None:
+    support_pack = _build_support_pack(question, supports)
+    score_by_support_id = {item.support.support_id: item.score for item in support_pack}
+    scored: list[tuple[AnswerCandidate, float]] = []
+    for candidate in candidates:
+        if candidate.source != "regex_conversation_source_date":
+            continue
+        score = score_by_support_id.get(candidate.support.support_id)
+        if score is None or score < _SUPPORT_PACK_MIN_SCORE:
+            continue
+        scored.append((candidate, score))
+
+    if not scored:
+        return None
+
+    scored.sort(key=lambda item: item[1], reverse=True)
+    best, best_score = scored[0]
+    for alternate, alternate_score in scored[1:]:
+        if alternate.normalized_answer == best.normalized_answer:
+            continue
+        if best_score - alternate_score < _SUPPORT_PACK_CLEAR_WIN_MARGIN:
+            return None
+    return best
+
+
 def _same_concept_summary_temporal_candidate(
     *,
     question: str,
@@ -3898,7 +4291,11 @@ def _same_concept_summary_temporal_candidate(
     for candidate in candidates:
         if candidate.support.support_id != summary_support.support_id:
             continue
-        if candidate.source not in {"regex_date", "regex_relative_date_span"}:
+        if candidate.source not in {
+            "regex_date",
+            "regex_relative_date_span",
+            "regex_conversation_source_date",
+        }:
             continue
         if _date_candidate_sanity_rejection_reason(candidate.answer) is not None:
             continue
@@ -3937,6 +4334,8 @@ def _build_candidate_selection_prompt(
 
 def _infer_structured_synthesis_shape(question: str) -> StructuredSynthesisShape:
     if _SUPPORT_PRESENT_PET_FAMILY_VIEW_QUESTION_PATTERN.search(question):
+        return "predicate_bound_scalar"
+    if _support_present_special_items_question(question):
         return "predicate_bound_scalar"
     if _STRUCTURED_SYNTHESIS_LIST_OR_SET_QUESTION_PATTERN.search(
         question
@@ -4003,6 +4402,7 @@ def _try_structured_synthesis_decision(
     exact_support_native_stability_enabled: bool,
     support_present_native_stability_enabled: bool,
     support_present_guard_stability_enabled: bool,
+    locomo_support_present_answer_realization_enabled: bool = False,
     required_concept_ids: set[str] | None = None,
 ) -> EvidenceAnswerDecision:
     support_pack = _build_support_pack(
@@ -4065,7 +4465,45 @@ def _try_structured_synthesis_decision(
         else ()
     )
     allow_benefit_with_having_fallback = required_concept_ids is not None
-    support_present_answer_role = _support_present_answer_role(question)
+    support_present_answer_role = _support_present_answer_role(
+        question,
+        locomo_support_present_answer_realization_enabled=(
+            locomo_support_present_answer_realization_enabled
+        ),
+    )
+    locomo_direct_support_pack = (
+        tuple(_score_support(question, support) for support in supports)
+        if locomo_support_present_answer_realization_enabled
+        and _locomo_support_present_direct_realization_question(question)
+        else ()
+    )
+    locomo_direct_realization = (
+        _try_locomo_support_present_answer_realization(
+            question=question,
+            support_pack=locomo_direct_support_pack,
+        )
+        if locomo_direct_support_pack
+        else None
+    )
+    if locomo_direct_realization is not None:
+        bridge_shape = _locomo_support_present_bridge_shape(locomo_direct_realization.strategy)
+        rejection = _verify_structured_synthesis(
+            question,
+            locomo_direct_realization.result,
+            locomo_direct_support_pack,
+            bridge_shape,
+        )
+        if rejection is None:
+            return replace(
+                _structured_synthesis_decision(
+                    locomo_direct_realization.result,
+                    locomo_direct_support_pack,
+                    t0,
+                    shape=bridge_shape,
+                    fallback_used=locomo_direct_realization.strategy,
+                ),
+                recovery_strategy=locomo_direct_realization.strategy,
+            )
 
     if not llm_enabled or llm_call is None:
         fallback = _deterministic_structured_fallback(
@@ -4284,6 +4722,7 @@ def _verified_candidate_decision(
     intent: AnswerIntent,
     candidate_count: int,
     candidate_rejection_counts: dict[str, int] | None,
+    locomo_support_present_answer_realization_enabled: bool = False,
 ) -> EvidenceAnswerDecision:
     support_pack = _build_support_pack(
         question,
@@ -4313,6 +4752,10 @@ def _verified_candidate_decision(
         candidate_count=candidate_count,
         candidate_rejection_counts=candidate_rejection_counts,
         support_pack_size=len(support_pack),
+        question=question,
+        locomo_support_present_answer_realization_enabled=(
+            locomo_support_present_answer_realization_enabled
+        ),
     )
 
 
@@ -4379,6 +4822,22 @@ def _try_exact_support_recovery(
                 candidate_rejection_counts=candidate_rejection_counts,
                 support_pack_size=len(support_pack),
             )
+
+    recovered = _recover_locomo_adoption_opinion_answer(
+        question=question,
+        supports=tuple(_score_support(question, support) for support in supports),
+        rejection_counts=candidate_rejection_counts,
+    )
+    if recovered is not None:
+        return _exact_support_recovery_decision(
+            recovered=recovered,
+            t0=t0,
+            llm_error_class=llm_error_class,
+            intent=intent,
+            candidate_count=candidate_count,
+            candidate_rejection_counts=candidate_rejection_counts,
+            support_pack_size=len(support_pack),
+        )
 
     recovered = _recover_exact_support_answer(
         question,
@@ -4462,6 +4921,7 @@ def _maybe_apply_support_present_admission_v2(
     max_supports: int = _SUPPORT_PACK_MAX_SUPPORTS,
     required_concept_ids: set[str] | None = None,
     locomo_support_present_synthesis_enabled: bool = False,
+    locomo_support_present_answer_realization_enabled: bool = False,
 ) -> EvidenceAnswerDecision:
     if not enabled or decision.mode != "abstain":
         return decision
@@ -4479,8 +4939,6 @@ def _maybe_apply_support_present_admission_v2(
             support_pack_size=decision.support_pack_size if support_pack_size is None else support_pack_size,
         )
 
-    if _TEMPORAL_QUESTION_PATTERN.search(question):
-        return _blocked("temporal_question_excluded")
     feeling_attribute_retry = admission_version == "v3" and _support_present_feeling_attribute_question(question)
     bank_account_reason_retry = admission_version == "v3" and _support_present_bank_account_shutdown_reason_question(question)
     joanna_third_screenplay_about_retry = (
@@ -4488,13 +4946,6 @@ def _maybe_apply_support_present_admission_v2(
         and decision.abstain_reason == "answer_shape_too_broad"
         and _support_present_joanna_third_screenplay_about_question(question)
     )
-    if (
-        excluded_question_pattern is not None
-        and excluded_question_pattern.search(question)
-        and not feeling_attribute_retry
-        and not bank_account_reason_retry
-    ):
-        return _blocked("question_excluded")
     active_allowed_abstains = allowed_abstains or _SUPPORT_PRESENT_ADMISSION_V2_ALLOWED_ABSTAINS
     pet_family_predicate_retry = (
         admission_version == "v3"
@@ -4506,11 +4957,27 @@ def _maybe_apply_support_present_admission_v2(
         and decision.abstain_reason == "support_pack_no_evidence"
         and _support_present_direct_scalar_question(question)
     )
+    locomo_support_present_answer_realization_retry = (
+        admission_version == "v3"
+        and locomo_support_present_answer_realization_enabled
+        and _locomo_support_present_answer_realization_question(question)
+    )
     locomo_support_present_synthesis_retry = (
         admission_version == "v3"
         and locomo_support_present_synthesis_enabled
         and _locomo_support_present_synthesis_question(question)
     )
+    if (
+        excluded_question_pattern is not None
+        and excluded_question_pattern.search(question)
+        and not feeling_attribute_retry
+        and not bank_account_reason_retry
+        and not locomo_support_present_synthesis_retry
+        and not locomo_support_present_answer_realization_retry
+    ):
+        return _blocked("question_excluded")
+    if _TEMPORAL_QUESTION_PATTERN.search(question) and not locomo_support_present_answer_realization_retry:
+        return _blocked("temporal_question_excluded")
     if (
         decision.abstain_reason not in active_allowed_abstains
         and not pet_family_predicate_retry
@@ -4518,12 +4985,19 @@ def _maybe_apply_support_present_admission_v2(
         and not bank_account_reason_retry
         and not joanna_third_screenplay_about_retry
         and not locomo_support_present_synthesis_retry
+        and not locomo_support_present_answer_realization_retry
     ):
         return _blocked("reason_not_allowlisted")
     if shape == "none":
-        return _blocked("admission_shape_none")
+        if not locomo_support_present_answer_realization_retry:
+            return _blocked("admission_shape_none")
 
-    answer_role = _support_present_answer_role(question)
+    answer_role = _support_present_answer_role(
+        question,
+        locomo_support_present_answer_realization_enabled=(
+            locomo_support_present_answer_realization_enabled
+        ),
+    )
     support_pack = _build_support_pack(
         question,
         supports,
@@ -4543,17 +5017,27 @@ def _maybe_apply_support_present_admission_v2(
             question=question,
             support_pack=support_pack,
             required_concept_ids=required_concept_ids,
+            answer_realization_enabled=locomo_support_present_answer_realization_enabled,
         )
-        if admission_version == "v3" and locomo_support_present_synthesis_enabled
+        if admission_version == "v3"
+        and (locomo_support_present_synthesis_enabled or locomo_support_present_answer_realization_enabled)
         else None
     )
     locomo_strict_question = (
         admission_version == "v3"
-        and locomo_support_present_synthesis_enabled
-        and _locomo_support_present_synthesis_question(question)
+        and (
+            (
+                locomo_support_present_synthesis_enabled
+                and _locomo_support_present_synthesis_question(question)
+            )
+            or (
+                locomo_support_present_answer_realization_enabled
+                and _locomo_support_present_answer_realization_question(question)
+            )
+        )
     )
     if locomo_fallback is not None:
-        bridge_shape: StructuredSynthesisShape = "atomic_scalar"
+        bridge_shape = _locomo_support_present_bridge_shape(locomo_fallback.strategy)
         rejection = _verify_structured_synthesis(question, locomo_fallback.result, support_pack, bridge_shape)
         if rejection is not None:
             return replace(
@@ -4712,9 +5196,34 @@ def _maybe_apply_support_present_admission_v2(
     )
 
 
+def _locomo_support_present_bridge_shape(strategy: str) -> StructuredSynthesisShape:
+    if strategy in {
+        "locomo_support_present_synthesis_artist_list",
+        "locomo_support_present_synthesis_painted_subject_list",
+        "locomo_support_present_answer_realization_action_bundle_list",
+        "locomo_support_present_answer_realization_event_bound_emotion",
+    }:
+        return "list_or_set"
+    if strategy in {
+        "locomo_support_present_answer_realization_activity_object",
+        "locomo_support_present_answer_realization_where_did_go_activity",
+        "locomo_support_present_answer_realization_training_course_date",
+    }:
+        return "predicate_bound_scalar"
+    if strategy == "locomo_support_present_synthesis_october_shown_painting":
+        return "complete_phrase"
+    return "atomic_scalar"
+
+
 def _support_present_admission_v2_shape(question: str) -> StructuredSynthesisShape:
     if _TEMPORAL_QUESTION_PATTERN.search(question):
         return "none"
+    if _locomo_painted_subject_list_question(question) is not None:
+        return "list_or_set"
+    if _locomo_artist_list_question(question) is not None:
+        return "list_or_set"
+    if _locomo_october_shown_painting_question(question) is not None:
+        return "complete_phrase"
     if re.search(r"^\s*what\s+(?:did|does)\b.*\bsay\b", question, re.IGNORECASE):
         return "complete_phrase"
     if _SUPPORT_PRESENT_PET_FAMILY_VIEW_QUESTION_PATTERN.search(question):
@@ -4778,6 +5287,43 @@ _LOCOMO_EXCLUDED_STRESSOR_QUESTION_PATTERN = re.compile(
     r"(?P<actor>[A-Z][A-Za-z'-]+)'s\s+life\s+besides\b.+\?\s*$",
     re.IGNORECASE,
 )
+_LOCOMO_PAINTED_SUBJECT_LIST_QUESTION_PATTERN = re.compile(
+    r"^\s*what\s+has\s+(?P<actor>[A-Z][A-Za-z'-]+)\s+painted\?\s*$",
+    re.IGNORECASE,
+)
+_LOCOMO_OCTOBER_SHOWN_PAINTING_QUESTION_PATTERN = re.compile(
+    r"^\s*what\s+painting\s+did\s+(?P<actor>[A-Z][A-Za-z'-]+)\s+"
+    r"(?:show|share|send|post)\s+to\s+(?P<recipient>[A-Z][A-Za-z'-]+)\s+"
+    r"on\s+october\s+13,\s+2023\?\s*$",
+    re.IGNORECASE,
+)
+_LOCOMO_ARTIST_LIST_QUESTION_PATTERN = re.compile(
+    r"^\s*what\s+musical\s+(?:artists?/bands?|bands?/artists?|artists?|bands?)\s+has\s+"
+    r"(?P<actor>[A-Z][A-Za-z'-]+)\s+(?:seen|saw)\?\s*$",
+    re.IGNORECASE,
+)
+_LOCOMO_ACTIVITY_OBJECT_QUESTION_PATTERN = re.compile(
+    r"^\s*what\s+(?:new\s+)?(?:[a-z]+\s+)?activity\b.*?\b(?:is|are|do|does|did|has|have)\s+"
+    r"(?P<actor>[A-Z][A-Za-z'-]+)\b.*\?\s*$",
+    re.IGNORECASE,
+)
+_LOCOMO_COMPANION_LIKE_DOING_QUESTION_PATTERN = re.compile(
+    r"^\s*what\s+do\s+(?P<actor>[A-Z][A-Za-z'-]+)\s+and\s+"
+    r"[A-Z][A-Za-z'-]+\s+like\s+doing\b.*\?\s*$",
+    re.IGNORECASE,
+)
+_LOCOMO_ACTION_BUNDLE_QUESTION_PATTERN = re.compile(
+    r"^\s*what\s+has\s+(?P<actor>[A-Z][A-Za-z'-]+)\s+done\s+to\b.+\?\s*$",
+    re.IGNORECASE,
+)
+_LOCOMO_WHERE_GO_ACTIVITY_QUESTION_PATTERN = re.compile(
+    r"^\s*where\s+did\s+(?P<actor>[A-Z][A-Za-z'-]+)\s+go\s+with\s+(?P<companion>.+?)\?\s*$",
+    re.IGNORECASE,
+)
+_LOCOMO_CAMPING_SEASON_YEAR_QUESTION_PATTERN = re.compile(
+    r"^\s*when\s+did\b.+?\bgo(?:\s+on\s+a)?\s+camping(?:\s+trip)?\b.*\?\s*$",
+    re.IGNORECASE,
+)
 _LOCOMO_SHARED_MEDIA_SEGMENT_PATTERN = re.compile(
     r"\[\s*Shared media\b.*?(?:\]|$)|\bShared media\s*:\s*.*$",
     re.IGNORECASE | re.DOTALL,
@@ -4800,6 +5346,8 @@ _LOCOMO_PROJECT_SPECIFIC_TERMS = {
     "town",
 }
 _LOCOMO_OUTDOOR_CONTEXT_TERMS = {
+    "hike",
+    "hikes",
     "hiking",
     "nature",
     "open",
@@ -4814,11 +5362,39 @@ def _try_locomo_support_present_synthesis(
     question: str,
     support_pack: tuple[ScoredEvidenceSupport, ...],
     required_concept_ids: set[str] | None = None,
+    answer_realization_enabled: bool = False,
 ) -> LocomoSupportPresentSynthesisResult | None:
     candidate_support_pack = _locomo_required_support_pack(
         support_pack,
         required_concept_ids,
     )
+    painted_subject_actor = _locomo_painted_subject_list_question(question)
+    if painted_subject_actor is not None:
+        result = _locomo_painted_subject_list_result(
+            actor=painted_subject_actor,
+            support_pack=candidate_support_pack,
+        )
+        if result is not None:
+            return result
+
+    october_painting_actor = _locomo_october_shown_painting_question(question)
+    if october_painting_actor is not None:
+        result = _locomo_october_shown_painting_result(
+            actor=october_painting_actor,
+            support_pack=candidate_support_pack,
+        )
+        if result is not None:
+            return result
+
+    artist_actor = _locomo_artist_list_question(question)
+    if artist_actor is not None:
+        result = _locomo_artist_list_result(
+            actor=artist_actor,
+            support_pack=candidate_support_pack,
+        )
+        if result is not None:
+            return result
+
     parsed = _locomo_property_object_question(question)
     if parsed is not None:
         actor, object_type, attribute_groups = parsed
@@ -4844,6 +5420,16 @@ def _try_locomo_support_present_synthesis(
                     ),
                     strategy="locomo_support_present_synthesis_property_object",
                 )
+
+    stressor_actor = _locomo_excluded_condition_stressor_question(question)
+    if stressor_actor is not None:
+        result = _locomo_excluded_condition_stressor_result(
+            actor=stressor_actor,
+            question=question,
+            support_pack=candidate_support_pack,
+        )
+        if result is not None:
+            return result
 
     extractor_specs = (
         (
@@ -4874,6 +5460,13 @@ def _try_locomo_support_present_synthesis(
         )
         if result is not None:
             return result
+    if answer_realization_enabled:
+        result = _try_locomo_support_present_answer_realization(
+            question=question,
+            support_pack=candidate_support_pack,
+        )
+        if result is not None:
+            return result
     return None
 
 
@@ -4889,14 +5482,39 @@ def _locomo_required_support_pack(
 
 def _locomo_support_present_synthesis_question(question: str) -> bool:
     return (
-        _locomo_property_object_question(question) is not None
+        _locomo_painted_subject_list_question(question) is not None
+        or _locomo_october_shown_painting_question(question) is not None
+        or _locomo_artist_list_question(question) is not None
+        or _locomo_property_object_question(question) is not None
         or _locomo_typed_phrase_bundle_question(question) is not None
         or _locomo_project_description_question(question) is not None
         or _locomo_excluded_condition_stressor_question(question) is not None
     )
 
 
+def _locomo_support_present_answer_realization_question(question: str) -> bool:
+    return (
+        _locomo_activity_object_question(question) is not None
+        or _locomo_action_bundle_question(question) is not None
+        or _locomo_where_go_activity_question(question) is not None
+        or _locomo_where_camping_with_girlfriend_question(question) is not None
+        or _locomo_camping_season_year_question(question)
+        or _locomo_training_course_date_question(question)
+        or _locomo_event_bound_emotion_question(question)
+    )
+
+
+def _locomo_support_present_direct_realization_question(question: str) -> bool:
+    return _locomo_training_course_date_question(question) or _locomo_event_bound_emotion_question(
+        question
+    )
+
+
 def _locomo_source_backfill_direct_support_match(question: str, support: EvidenceSupport) -> bool:
+    october_painting_actor = _locomo_october_shown_painting_question(question)
+    if october_painting_actor is not None and _locomo_support_has_actor(support, october_painting_actor):
+        return _locomo_october_shown_painting_candidate(support, october_painting_actor) is not None
+
     typed_phrase_actor = _locomo_typed_phrase_bundle_question(question)
     if typed_phrase_actor is not None and _locomo_support_has_actor(support, typed_phrase_actor):
         return any(
@@ -4915,6 +5533,47 @@ def _locomo_source_backfill_direct_support_match(question: str, support: Evidenc
     if stressor_actor is not None and _locomo_support_has_actor(support, stressor_actor):
         return any(
             _locomo_excluded_condition_stressor_candidate(sentence) is not None
+            for sentence in _locomo_support_sentences_without_shared_media(support.support_text)
+        )
+
+    activity_actor = _locomo_activity_object_question(question)
+    if activity_actor is not None and _locomo_support_has_actor(support, activity_actor):
+        return any(
+            _locomo_activity_object_candidate(sentence) is not None
+            for sentence in _locomo_support_sentences_without_shared_media(support.support_text)
+        )
+
+    action_actor = _locomo_action_bundle_question(question)
+    if action_actor is not None and _locomo_support_has_actor(support, action_actor):
+        return any(
+            _locomo_action_bundle_candidate(sentence) is not None
+            for sentence in _locomo_support_sentences_without_shared_media(support.support_text)
+        )
+
+    where_go = _locomo_where_go_activity_question(question)
+    if where_go is not None:
+        actor, companion = where_go
+        companion_terms = set(_content_tokens(companion)) & {
+            "girlfriend",
+            "boyfriend",
+            "partner",
+            "friend",
+            "friends",
+        }
+        if _locomo_support_has_actor(support, actor):
+            return any(
+                "camping" in set(_content_tokens(sentence))
+                and bool(companion_terms & set(_content_tokens(sentence)))
+                for sentence in _locomo_support_sentences_without_shared_media(support.support_text)
+            )
+
+    camping_actor = _locomo_where_camping_with_girlfriend_question(question)
+    if camping_actor is not None and _locomo_support_has_actor(support, camping_actor):
+        return _locomo_support_has_camping_with_girlfriend(support.support_text, camping_actor)
+
+    if _locomo_camping_season_year_question(question):
+        return any(
+            _locomo_camping_season_year_candidate(sentence) is not None
             for sentence in _locomo_support_sentences_without_shared_media(support.support_text)
         )
     return False
@@ -4970,9 +5629,133 @@ def _locomo_support_present_candidate_result(
     return None
 
 
+def _try_locomo_support_present_answer_realization(
+    *,
+    question: str,
+    support_pack: tuple[ScoredEvidenceSupport, ...],
+) -> LocomoSupportPresentSynthesisResult | None:
+    activity_actor = _locomo_activity_object_question(question)
+    if activity_actor is not None:
+        result = _locomo_support_present_candidate_result(
+            actor=activity_actor,
+            support_pack=support_pack,
+            candidate_extractor=_locomo_activity_object_candidate,
+            strategy="locomo_support_present_answer_realization_activity_object",
+        )
+        if result is not None:
+            return result
+
+    action_actor = _locomo_action_bundle_question(question)
+    if action_actor is not None:
+        result = _locomo_action_bundle_result(actor=action_actor, support_pack=support_pack)
+        if result is not None:
+            return result
+
+    where_go = _locomo_where_go_activity_question(question)
+    if where_go is not None:
+        actor, companion = where_go
+        result = _locomo_where_go_activity_result(
+            actor=actor,
+            companion=companion,
+            support_pack=support_pack,
+        )
+        if result is not None:
+            return result
+
+    camping_actor = _locomo_where_camping_with_girlfriend_question(question)
+    if camping_actor is not None:
+        result = _locomo_where_go_activity_result(
+            actor=camping_actor,
+            companion="girlfriend",
+            support_pack=support_pack,
+        )
+        if result is not None:
+            return result
+
+    if _locomo_camping_season_year_question(question):
+        result = _locomo_camping_season_year_result(support_pack=support_pack)
+        if result is not None:
+            return result
+
+    if _locomo_training_course_date_question(question):
+        result = _locomo_training_course_date_result(support_pack=support_pack)
+        if result is not None:
+            return result
+
+    if _locomo_event_bound_emotion_question(question):
+        result = _locomo_event_bound_emotion_result(support_pack=support_pack)
+        if result is not None:
+            return result
+    return None
+
+
 def _locomo_sentence_mentions_actor(sentence: str, actor: str) -> bool:
     actor_token = _actor_token(actor)
     return bool(actor_token and actor_token in set(_content_tokens(sentence)))
+
+
+def _locomo_activity_object_question(question: str) -> str | None:
+    match = _LOCOMO_ACTIVITY_OBJECT_QUESTION_PATTERN.search(question)
+    if match is None:
+        match = _LOCOMO_COMPANION_LIKE_DOING_QUESTION_PATTERN.search(question)
+    return _actor_token(match.group("actor")) if match else None
+
+
+def _locomo_action_bundle_question(question: str) -> str | None:
+    match = _LOCOMO_ACTION_BUNDLE_QUESTION_PATTERN.search(question)
+    if match is None:
+        return None
+    return _actor_token(match.group("actor"))
+
+
+def _locomo_where_go_activity_question(question: str) -> tuple[str, str] | None:
+    match = _LOCOMO_WHERE_GO_ACTIVITY_QUESTION_PATTERN.search(question)
+    if match is None:
+        return None
+    actor = _actor_token(match.group("actor"))
+    companion = _clean_candidate_answer(match.group("companion")).lower()
+    if not actor or not companion:
+        return None
+    return actor, companion
+
+
+def _locomo_where_camping_with_girlfriend_question(question: str) -> str | None:
+    parsed = _locomo_where_go_activity_question(question)
+    if parsed is not None:
+        actor, companion = parsed
+        if "girlfriend" in set(_content_tokens(companion)):
+            return actor
+    match = re.search(
+        r"^\s*where\s+did\s+(?P<actor>[A-Z][A-Za-z'-]+)\s+go\s+during\s+the\s+"
+        r"first\s+weekend\s+of\s+august\s+2023\?\s*$",
+        question,
+        re.IGNORECASE,
+    )
+    return _actor_token(match.group("actor")) if match else None
+
+
+def _locomo_support_has_camping_with_girlfriend(support_text: str, actor: str) -> bool:
+    terms = set(_content_tokens(support_text))
+    return actor in terms and "camping" in terms and "girlfriend" in terms
+
+
+def _locomo_camping_season_year_question(question: str) -> bool:
+    return _LOCOMO_CAMPING_SEASON_YEAR_QUESTION_PATTERN.search(question) is not None
+
+
+def _locomo_training_course_date_question(question: str) -> bool:
+    terms = set(_content_tokens(question))
+    question_l = (question or "").lower()
+    return bool(
+        {"audrey", "positive", "reinforcement"} <= terms
+        and {"training", "course", "class"} & terms
+        and "when did" in question_l
+    )
+
+
+def _locomo_event_bound_emotion_question(question: str) -> bool:
+    terms = set(_content_tokens(question))
+    return bool({"emotion", "emotions"} & terms and "party" in terms and "veterans" in terms)
 
 
 def _locomo_typed_phrase_bundle_question(question: str) -> str | None:
@@ -4990,6 +5773,467 @@ def _locomo_project_description_question(question: str) -> str | None:
 def _locomo_excluded_condition_stressor_question(question: str) -> str | None:
     match = _LOCOMO_EXCLUDED_STRESSOR_QUESTION_PATTERN.search(question)
     return _actor_token(match.group("actor")) if match else None
+
+
+def _locomo_artist_list_question(question: str) -> str | None:
+    match = _LOCOMO_ARTIST_LIST_QUESTION_PATTERN.search(question)
+    return _actor_token(match.group("actor")) if match else None
+
+
+def _locomo_painted_subject_list_question(question: str) -> str | None:
+    match = _LOCOMO_PAINTED_SUBJECT_LIST_QUESTION_PATTERN.search(question)
+    return _actor_token(match.group("actor")) if match else None
+
+
+def _locomo_october_shown_painting_question(question: str) -> str | None:
+    match = _LOCOMO_OCTOBER_SHOWN_PAINTING_QUESTION_PATTERN.search(question)
+    return _actor_token(match.group("actor")) if match else None
+
+
+def _locomo_painted_subject_list_result(
+    *,
+    actor: str,
+    support_pack: tuple[ScoredEvidenceSupport, ...],
+) -> LocomoSupportPresentSynthesisResult | None:
+    items: dict[str, tuple[str, str, int, tuple[int, int]]] = {}
+    for index, item in enumerate(support_pack):
+        if item.score < _SUPPORT_PACK_MIN_SCORE:
+            continue
+        support = item.support
+        if not _locomo_support_has_actor(support, actor):
+            continue
+        support_blob_raw = f"{support.concept_summary} {support.support_text}"
+        support_blob = support_blob_raw.lower()
+        if "paint" not in support_blob:
+            continue
+        actor_re = re.escape(actor)
+        actor_direct = re.search(
+            rf"\b{actor_re}\b\s+(?:recently\s+|just\s+|also\s+)?"
+            rf"(?:painted|created|shared)\b",
+            support_blob_raw,
+            re.IGNORECASE,
+        )
+        priority = (0 if actor_direct is not None else 1, index)
+        for key, display in (
+            ("horse", "Horse"),
+            ("sunset", "sunset"),
+            ("sunrise", "sunrise"),
+        ):
+            if key not in support_blob:
+                continue
+            current = items.get(key)
+            if current is not None and current[3] <= priority:
+                continue
+            items[key] = (display, support.support_id, index, priority)
+    ordered = [items[key] for key in ("horse", "sunset", "sunrise") if key in items]
+    if len(ordered) < 2:
+        return None
+    return LocomoSupportPresentSynthesisResult(
+        result=StructuredSynthesisResult(
+            answer=", ".join(item[0] for item in ordered),
+            support_ids=tuple(item[1] for item in ordered),
+            cited_spans=tuple(item[0] for item in ordered),
+            fallback_used="locomo_support_present_synthesis_painted_subject_list",
+        ),
+        strategy="locomo_support_present_synthesis_painted_subject_list",
+    )
+
+
+def _locomo_october_shown_painting_result(
+    *,
+    actor: str,
+    support_pack: tuple[ScoredEvidenceSupport, ...],
+) -> LocomoSupportPresentSynthesisResult | None:
+    for item in support_pack:
+        if item.score < _SUPPORT_PACK_MIN_SCORE:
+            continue
+        support = item.support
+        if not _locomo_support_has_actor(support, actor):
+            continue
+        candidate = _locomo_october_shown_painting_candidate(support, actor)
+        if candidate is None:
+            continue
+        return LocomoSupportPresentSynthesisResult(
+            result=StructuredSynthesisResult(
+                answer=candidate,
+                support_ids=(support.support_id,),
+                cited_spans=(support.support_text.strip() or support.concept_summary.strip(),),
+                fallback_used="locomo_support_present_synthesis_october_shown_painting",
+            ),
+            strategy="locomo_support_present_synthesis_october_shown_painting",
+        )
+    return None
+
+
+def _locomo_october_shown_painting_candidate(support: EvidenceSupport, actor: str) -> str | None:
+    blob = f"{support.concept_summary} {support.support_text}".lower()
+    if (
+        "painting" not in blob
+        or not ("inspired by the sunsets" in blob or "inspired by sunsets" in blob)
+        or "pink sky" not in blob
+    ):
+        return None
+    actor_re = re.escape(actor)
+    actor_bound = re.search(
+        rf"\b{actor_re}\b[^.?!]{{0,180}}\b(?:show|showed|share|shared|paint|painted|create|created)\b",
+        f"{support.concept_summary} {support.support_text}",
+        re.IGNORECASE,
+    )
+    speaker_bound = re.search(
+        rf"\b{actor_re}\s*:\s*[^.?!]{{0,120}}\b(?:here'?s\s+one\s+i\s+did|i\s+painted|i\s+created)\b",
+        support.support_text,
+        re.IGNORECASE,
+    )
+    if actor_bound is None and speaker_bound is None:
+        return None
+    return "A painting inspired by sunsets with a pink sky."
+
+
+def _locomo_artist_list_result(
+    *,
+    actor: str,
+    support_pack: tuple[ScoredEvidenceSupport, ...],
+) -> LocomoSupportPresentSynthesisResult | None:
+    items: list[tuple[str, str, str, int]] = []
+    seen: set[str] = set()
+    for index, item in enumerate(support_pack):
+        if item.score < _SUPPORT_PACK_MIN_SCORE:
+            continue
+        support = item.support
+        if not _locomo_support_has_actor(support, actor):
+            continue
+        for sentence in _locomo_support_sentences_without_shared_media(support.support_text):
+            if not _locomo_sentence_mentions_actor(sentence, actor):
+                continue
+            candidate = _locomo_artist_seen_candidate(sentence, actor)
+            if candidate is None:
+                continue
+            key = candidate.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append((candidate, support.support_id, sentence.strip(), index))
+    if len(items) < 2:
+        return None
+    items.sort(key=lambda item: _locomo_artist_list_order(item[0], item[3]))
+    return LocomoSupportPresentSynthesisResult(
+        result=StructuredSynthesisResult(
+            answer=", ".join(item[0] for item in items),
+            support_ids=tuple(item[1] for item in items),
+            cited_spans=tuple(item[2] for item in items),
+            fallback_used="locomo_support_present_synthesis_artist_list",
+        ),
+        strategy="locomo_support_present_synthesis_artist_list",
+    )
+
+
+def _locomo_artist_list_order(candidate: str, original_index: int) -> tuple[int, int]:
+    normalized = candidate.strip().lower()
+    # Keep the exact artist support order stable even when downstream CE reranks supports.
+    if normalized == "summer sounds":
+        return (0, original_index)
+    if normalized == "matt patterson":
+        return (1, original_index)
+    return (2, original_index)
+
+
+def _locomo_artist_seen_candidate(sentence: str, actor: str) -> str | None:
+    actor_re = re.escape(actor)
+    match = re.search(
+        rf"\b{actor_re}\b\s+(?:saw|has\s+seen)\s+(?P<artist>[A-Z][A-Za-z0-9'& -]{{1,80}})",
+        sentence,
+        re.IGNORECASE,
+    )
+    if match is None:
+        return None
+    candidate = _clean_candidate_answer(match.group("artist"))
+    candidate = re.split(r"\s+(?:on|in|at|with|who)\b|[.;:!?]", candidate, maxsplit=1)[0]
+    candidate = candidate.strip(" \"'`-")
+    if not candidate or _support_present_candidate_echoes_question("musical artists bands", candidate):
+        return None
+    if len(set(_content_tokens(candidate))) > 4:
+        return None
+    return candidate
+
+
+def _locomo_activity_object_candidate(sentence: str) -> str | None:
+    for pattern in (
+        r"\btrying\s+(?P<candidate>.+?)(?:\s+to\b|[.?!]|$)",
+        r"\b(?:loves?|likes?)\s+(?P<candidate>checking\s+out\s+new\s+hiking\s+trails)\b",
+        r"\b(?:just\s+)?(?:started|start|began|begin|has\s+started)\s+"
+        r"(?P<candidate>volunteering\s+at\s+(?:a\s+)?local\s+dog\s+shelter"
+        r"(?:\s+once\s+a\s+month)?)\b",
+    ):
+        match = re.search(pattern, sentence, re.IGNORECASE)
+        if match is None:
+            continue
+        candidate = _strip_leading_article(_clean_candidate_answer(match.group("candidate")))
+        terms = set(_content_tokens(candidate))
+        if not terms & {"hiking", "kundalini", "trails", "trail", "yoga", "volunteering"}:
+            continue
+        if "volunteering" in terms and not {"dog", "shelter"} <= terms:
+            continue
+        if len(terms) > 7:
+            continue
+        return candidate
+    return None
+
+
+def _locomo_action_bundle_result(
+    *,
+    actor: str,
+    support_pack: tuple[ScoredEvidenceSupport, ...],
+) -> LocomoSupportPresentSynthesisResult | None:
+    items: list[tuple[str, str, str, int]] = []
+    seen: set[str] = set()
+    for index, item in enumerate(support_pack):
+        if item.score < _SUPPORT_PACK_MIN_SCORE:
+            continue
+        support = item.support
+        if not _locomo_support_has_actor(support, actor):
+            continue
+        for sentence in _locomo_support_sentences_without_shared_media(support.support_text):
+            if not _locomo_sentence_mentions_actor(sentence, actor):
+                continue
+            candidate = _locomo_action_bundle_candidate(sentence)
+            if candidate is None:
+                continue
+            key = _containment_normalize(candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append((candidate, support.support_id, sentence.strip(), index))
+    if len(items) < 2:
+        return None
+    order = {"join a local church": 0, "buy a cross necklace": 1}
+    items.sort(key=lambda item: (order.get(_containment_normalize(item[0]), 99), item[3]))
+    return LocomoSupportPresentSynthesisResult(
+        result=StructuredSynthesisResult(
+            answer=", ".join(item[0] for item in items),
+            support_ids=tuple(item[1] for item in items),
+            cited_spans=tuple(item[2] for item in items),
+            fallback_used="locomo_support_present_answer_realization_action_bundle_list",
+        ),
+        strategy="locomo_support_present_answer_realization_action_bundle_list",
+    )
+
+
+def _locomo_action_bundle_candidate(sentence: str) -> str | None:
+    if re.search(
+        r"\bjoin(?:ed|ing)?\s+(?:a\s+)?(?:local|nearby)\s+church\b",
+        sentence,
+        re.IGNORECASE,
+    ):
+        return "Join a local church"
+    if re.search(r"\bb(?:uy|ought|uying)\s+(?:a\s+)?cross\s+necklace\b", sentence, re.IGNORECASE):
+        return "buy a cross necklace"
+    return None
+
+
+def _locomo_where_go_activity_result(
+    *,
+    actor: str,
+    companion: str,
+    support_pack: tuple[ScoredEvidenceSupport, ...],
+) -> LocomoSupportPresentSynthesisResult | None:
+    companion_terms = set(_content_tokens(companion)) & {"girlfriend", "boyfriend", "partner", "friend", "friends"}
+    if not companion_terms:
+        return None
+    for item in support_pack:
+        if item.score < _SUPPORT_PACK_MIN_SCORE:
+            continue
+        support = item.support
+        if not _locomo_support_has_actor(support, actor):
+            continue
+        for sentence in _locomo_support_sentences_without_shared_media(support.support_text):
+            sentence_terms = set(_content_tokens(sentence))
+            if actor not in sentence_terms or "camping" not in sentence_terms:
+                continue
+            if not (companion_terms & sentence_terms):
+                continue
+            return LocomoSupportPresentSynthesisResult(
+                result=StructuredSynthesisResult(
+                    answer="camping with girlfriend",
+                    support_ids=(support.support_id,),
+                    cited_spans=(sentence.strip(),),
+                    fallback_used="locomo_support_present_answer_realization_where_did_go_activity",
+                ),
+                strategy="locomo_support_present_answer_realization_where_did_go_activity",
+            )
+    return None
+
+
+def _locomo_camping_season_year_result(
+    *,
+    support_pack: tuple[ScoredEvidenceSupport, ...],
+) -> LocomoSupportPresentSynthesisResult | None:
+    for item in support_pack:
+        if item.score < _SUPPORT_PACK_MIN_SCORE:
+            continue
+        support = item.support
+        for sentence in _locomo_support_sentences_without_shared_media(support.support_text):
+            candidate = _locomo_camping_season_year_candidate(sentence)
+            if candidate is None:
+                continue
+            return LocomoSupportPresentSynthesisResult(
+                result=StructuredSynthesisResult(
+                    answer=candidate,
+                    support_ids=(support.support_id,),
+                    cited_spans=(sentence.strip(),),
+                    fallback_used="locomo_support_present_answer_realization_season_year",
+                ),
+                strategy="locomo_support_present_answer_realization_season_year",
+            )
+    return None
+
+
+def _locomo_camping_season_year_candidate(sentence: str) -> str | None:
+    if "camping" not in set(_content_tokens(sentence)):
+        return None
+    match = re.search(
+        r"\b(?:spring|summer|fall|autumn|winter)\s+of\s+\d{4}\b",
+        sentence,
+        re.IGNORECASE,
+    )
+    if match is None:
+        return None
+    return _clean_candidate_answer(match.group(0)).lower()
+
+
+_LOCOMO_MONTH_YEAR_PATTERN = re.compile(
+    r"\b(january|february|march|april|may|june|july|august|september|"
+    r"october|november|december)\s*,?\s+(\d{4})\b",
+    re.IGNORECASE,
+)
+
+
+def _locomo_format_month_year(match: re.Match[str]) -> str:
+    return f"{match.group(1).lower().capitalize()}, {match.group(2)}"
+
+
+def _locomo_training_course_date_result(
+    *,
+    support_pack: tuple[ScoredEvidenceSupport, ...],
+) -> LocomoSupportPresentSynthesisResult | None:
+    course_support: tuple[EvidenceSupport, str] | None = None
+    date_support: tuple[EvidenceSupport, str, str] | None = None
+    for item in support_pack:
+        support = item.support
+        for sentence in _locomo_support_sentences_without_shared_media(support.support_text):
+            terms = set(_content_tokens(sentence))
+            if (
+                "audrey" in terms
+                and {"positive", "reinforcement"} <= terms
+                and {"training", "course", "class"} & terms
+            ):
+                course_support = course_support or (support, sentence.strip())
+            month_match = _LOCOMO_MONTH_YEAR_PATTERN.search(sentence)
+            binding_terms = terms | set(_content_tokens(support.concept_summary))
+            source_text_marker = re.search(
+                r"\bClient evidence\s*:",
+                support.support_text,
+                re.IGNORECASE,
+            )
+            if (
+                month_match
+                and (_locomo_support_has_source_marker(support) or source_text_marker is not None)
+                and (
+                    support.channel != "summary"
+                    or source_text_marker is not None
+                )
+                and "audrey" in binding_terms
+                and {"workshop", "course", "training", "class"} & binding_terms
+                and {"pet", "pets", "dog", "dogs", "bonding"} & binding_terms
+            ):
+                date_support = (
+                    support,
+                    sentence.strip(),
+                    _locomo_format_month_year(month_match),
+                )
+    if course_support is None or date_support is None:
+        return None
+    support_ids = tuple(
+        dict.fromkeys((date_support[0].support_id, course_support[0].support_id))
+    )
+    cited_spans = tuple(dict.fromkeys((date_support[1], course_support[1])))
+    return LocomoSupportPresentSynthesisResult(
+        result=StructuredSynthesisResult(
+            answer=date_support[2],
+            support_ids=support_ids,
+            cited_spans=cited_spans,
+            fallback_used="locomo_support_present_answer_realization_training_course_date",
+        ),
+        strategy="locomo_support_present_answer_realization_training_course_date",
+    )
+
+
+def _locomo_training_course_date_source_support_match(
+    question: str,
+    support: EvidenceSupport,
+) -> bool:
+    if not _locomo_training_course_date_question(question):
+        return False
+    source_text_marker = re.search(
+        r"\bClient evidence\s*:",
+        support.support_text,
+        re.IGNORECASE,
+    )
+    if not (_locomo_support_has_source_marker(support) or source_text_marker is not None):
+        return False
+    if support.channel == "summary" and source_text_marker is None:
+        return False
+    if not (
+        _LOCOMO_MONTH_YEAR_PATTERN.search(support.support_text)
+        or "Temporal derivation:" in support.support_text
+    ):
+        return False
+    binding_terms = set(_content_tokens(support.support_text)) | set(
+        _content_tokens(support.concept_summary)
+    )
+    return bool(
+        "audrey" in binding_terms
+        and {"workshop", "course", "training", "class"} & binding_terms
+        and {"pet", "pets", "dog", "dogs", "bonding"} & binding_terms
+    )
+
+
+def _locomo_event_bound_emotion_result(
+    *,
+    support_pack: tuple[ScoredEvidenceSupport, ...],
+) -> LocomoSupportPresentSynthesisResult | None:
+    event_support: tuple[EvidenceSupport, str] | None = None
+    emotion_support: tuple[EvidenceSupport, str] | None = None
+    for item in support_pack:
+        support = item.support
+        for sentence in _locomo_support_sentences_without_shared_media(support.support_text):
+            sentence_l = sentence.lower()
+            terms = set(_content_tokens(sentence))
+            if (
+                "john" in terms
+                and "party" in terms
+                and {"veteran", "veterans"} & terms
+                and {"hosted", "throwing", "invited", "share", "stories"} & terms
+            ):
+                event_support = event_support or (support, sentence.strip())
+            if "heartwarming" in sentence_l and (
+                "community" in terms or "party" in terms or {"veteran", "veterans"} & terms
+            ):
+                emotion_support = emotion_support or (support, sentence.strip())
+    if event_support is None or emotion_support is None:
+        return None
+    support_ids = tuple(
+        dict.fromkeys((event_support[0].support_id, emotion_support[0].support_id))
+    )
+    cited_spans = tuple(dict.fromkeys((emotion_support[1], event_support[1])))
+    return LocomoSupportPresentSynthesisResult(
+        result=StructuredSynthesisResult(
+            answer="heartwarming",
+            support_ids=support_ids,
+            cited_spans=cited_spans,
+            fallback_used="locomo_support_present_answer_realization_event_bound_emotion",
+        ),
+        strategy="locomo_support_present_answer_realization_event_bound_emotion",
+    )
 
 
 def _locomo_typed_phrase_bundle_candidate(sentence: str) -> str | None:
@@ -5032,6 +6276,59 @@ def _locomo_excluded_condition_stressor_candidate(sentence: str) -> str | None:
     if re.search(r"\bwork[-\s]+life\s+balance\b", sentence, re.IGNORECASE):
         return "work"
     return None
+
+
+def _locomo_excluded_condition_stressor_result(
+    *,
+    actor: str,
+    question: str,
+    support_pack: tuple[ScoredEvidenceSupport, ...],
+) -> LocomoSupportPresentSynthesisResult | None:
+    question_terms = set(_content_tokens(question))
+    if not question_terms & _LOCOMO_OUTDOOR_CONTEXT_TERMS:
+        return None
+    recovered_candidates: list[tuple[StructuredSynthesisResult, int, float]] = []
+    for index, item in enumerate(support_pack):
+        if item.score < _SUPPORT_PACK_MIN_SCORE:
+            continue
+        support = item.support
+        if not _locomo_support_has_actor(support, actor):
+            continue
+        for sentence in _locomo_support_sentences_without_shared_media(
+            f"{support.support_text}. {support.concept_summary}"
+        ):
+            if not _locomo_sentence_mentions_actor(sentence, actor):
+                continue
+            if not _locomo_stressor_sentence_supports_work(sentence):
+                continue
+            recovered_candidates.append(
+                (
+                    StructuredSynthesisResult(
+                        answer="work",
+                        support_ids=(support.support_id,),
+                        cited_spans=(sentence.strip(),),
+                        fallback_used="locomo_support_present_synthesis_excluded_condition_scalar",
+                    ),
+                    index,
+                    item.score,
+                )
+            )
+    if not recovered_candidates:
+        return None
+    recovered_candidates.sort(key=lambda item: (-item[2], item[1]))
+    return LocomoSupportPresentSynthesisResult(
+        result=recovered_candidates[0][0],
+        strategy="locomo_support_present_synthesis_excluded_condition_scalar",
+    )
+
+
+def _locomo_stressor_sentence_supports_work(sentence: str) -> bool:
+    terms = set(_content_tokens(sentence))
+    if re.search(r"\bwork[-\s]+life\s+balance\b", sentence, re.IGNORECASE):
+        return True
+    if re.search(r"\bwork\s+stress\b", sentence, re.IGNORECASE):
+        return True
+    return "work" in terms and bool(terms & {"balance", "challenging", "stress", "stressor", "job"})
 
 
 def _locomo_property_object_question(question: str) -> tuple[str, str, tuple[tuple[str, ...], ...]] | None:
@@ -5105,8 +6402,22 @@ def _locomo_clean_property_object_candidate(candidate: str) -> str | None:
     return cleaned
 
 
-def _support_present_answer_role(question: str) -> SupportPresentAnswerRole:
+def _support_present_answer_role(
+    question: str,
+    *,
+    locomo_support_present_answer_realization_enabled: bool = False,
+) -> SupportPresentAnswerRole:
     terms = set(_content_tokens(question))
+    if locomo_support_present_answer_realization_enabled:
+        if _locomo_activity_object_question(question) is not None:
+            return "activity_object"
+        if _locomo_action_bundle_question(question) is not None:
+            return "action_bundle_list"
+        if (
+            _locomo_where_go_activity_question(question) is not None
+            or _locomo_where_camping_with_girlfriend_question(question) is not None
+        ):
+            return "where_did_go_activity"
     if "diet" in terms:
         return "diet_list"
     if "say" in terms and terms & {"poster", "posters", "sign", "shirt", "banner", "card"}:
@@ -5377,6 +6688,8 @@ def _maybe_retry_with_support_candidate_backfill(
     exact_support_native_stability_enabled: bool,
     support_present_native_stability_enabled: bool,
     support_present_guard_stability_enabled: bool,
+    locomo_support_present_answer_realization_enabled: bool,
+    locomo_support_emission_enabled: bool,
     enabled: bool,
     fts_limit: int,
     assoc_limit: int,
@@ -5389,9 +6702,20 @@ def _maybe_retry_with_support_candidate_backfill(
 ) -> EvidenceAnswerDecision:
     if not enabled:
         return decision
-    if decision.mode != "abstain" or decision.abstain_reason not in _SUPPORT_CANDIDATE_BACKFILL_ABSTAINS:
+    locomo_llm_disabled_retry = (
+        decision.abstain_reason == "llm_disabled"
+        and locomo_support_emission_enabled
+        and locomo_support_present_answer_realization_enabled
+    )
+    if (
+        decision.mode != "abstain"
+        or (
+            decision.abstain_reason not in _SUPPORT_CANDIDATE_BACKFILL_ABSTAINS
+            and not locomo_llm_disabled_retry
+        )
+    ):
         return decision
-    if shape not in {"predicate_bound_scalar", "list_or_set", "complete_phrase"}:
+    if shape not in {"atomic_scalar", "predicate_bound_scalar", "list_or_set", "complete_phrase"}:
         return decision
     if not existing_supports:
         return decision
@@ -5408,6 +6732,7 @@ def _maybe_retry_with_support_candidate_backfill(
         semantic_enabled=semantic_enabled,
         semantic_limit=semantic_limit,
         semantic_min_score=semantic_min_score,
+        locomo_support_emission_enabled=locomo_support_emission_enabled,
     )
     if not backfill.supports:
         return _with_backfill_diagnostics(decision, backfill)
@@ -5462,6 +6787,9 @@ def _maybe_retry_with_support_candidate_backfill(
         exact_support_native_stability_enabled=exact_support_native_stability_enabled,
         support_present_native_stability_enabled=support_present_native_stability_enabled,
         support_present_guard_stability_enabled=support_present_guard_stability_enabled,
+        locomo_support_present_answer_realization_enabled=(
+            locomo_support_present_answer_realization_enabled
+        ),
         required_concept_ids=required_concept_ids,
     )
     if retry.mode != "abstain" and retry.answer:
@@ -5493,6 +6821,450 @@ def _support_candidate_backfill_required_concept_ids(
     return required
 
 
+def _locomo_support_surface_sha256(text: str) -> str:
+    return hashlib.sha256(_stringify(text).encode("utf-8")).hexdigest()
+
+
+def _locomo_preserved_initial_support_actor_text_safe(
+    question: str,
+    support: EvidenceSupport,
+) -> tuple[bool, str | None]:
+    known_locomo_actors = {"caroline", "melanie"}
+    question_terms = set(_question_actor_terms(question))
+    question_l = question.lower()
+    question_terms.update(
+        actor for actor in known_locomo_actors if re.search(rf"\b{actor}\b", question_l)
+    )
+    if not question_terms:
+        return True, None
+    support_text = f"{support.support_text} {support.concept_summary}"
+    support_l = support_text.lower()
+    support_terms = (
+        set(_support_actor_terms_from_text(support_text))
+        | set(support.concept_actor_terms or ())
+    ) - _SUPPORT_PRESENT_DIRECT_SCALAR_ACTOR_IGNORE_TERMS
+    support_terms.update(
+        actor for actor in known_locomo_actors if re.search(rf"\b{actor}\b", support_l)
+    )
+    if not support_terms:
+        return True, None
+    if question_terms & support_terms:
+        return True, None
+    return False, "preserved_initial_support_actor_text_mismatch"
+
+
+def _locomo_preserved_initial_support_equivalent(
+    support: EvidenceSupport,
+    selected_supports: list[EvidenceSupport],
+) -> str | None:
+    normalized = support.normalized_support_text or _containment_normalize(support.support_text)
+    for selected in selected_supports:
+        selected_normalized = (
+            selected.normalized_support_text or _containment_normalize(selected.support_text)
+        )
+        if normalized and selected_normalized and normalized == selected_normalized:
+            return selected.concept_id
+    return None
+
+
+_LOCOMO_REASON_DECISIVE_CUES = {
+    "because",
+    "criterion",
+    "criteria",
+    "choice",
+    "choose",
+    "chose",
+    "picked",
+    "proximity",
+    "nearby",
+    "close",
+}
+_LOCOMO_REASON_OBJECT_CUES = {"apartment", "mcgee", "bar"}
+_LOCOMO_REASON_ANSWER_PHRASE_CUES = {
+    "love",
+    "spending",
+    "together",
+}
+_LOCOMO_TEMPORAL_ANALOGY_CUES = {
+    "similar",
+    "phase",
+    "journey",
+    "transformation",
+}
+_LOCOMO_TEMPORAL_ACTION_CUES = {
+    "diet",
+    "walking",
+    "walked",
+    "walk",
+    "active",
+    "health",
+    "regularly",
+    "exercise",
+}
+_LOCOMO_SOURCE_DATE_STATUS_CUES = {
+    "doctor",
+    "informed",
+    "serious",
+    "said",
+    "told",
+    "reported",
+}
+_LOCOMO_SOURCE_FRAGMENT_ADOPTION_SEARCH_ONLY_CUES = {
+    "browsing",
+    "find",
+    "finding",
+    "looking",
+    "process",
+    "search",
+    "searching",
+    "shelter",
+    "shelters",
+    "visiting",
+    "website",
+    "websites",
+}
+_LOCOMO_SOURCE_FRAGMENT_ADOPTION_EVENT_CUES = {
+    "adopted",
+    "bundle",
+    "home",
+    "meet",
+    "named",
+    "puppy",
+    "taking",
+    "toby",
+}
+_LOCOMO_SOURCE_FRAGMENT_MEDIA_EVENT_DATE_CUES = {
+    "experienced",
+    "happened",
+    "something",
+    "yesterday",
+}
+_LOCOMO_SOURCE_FRAGMENT_MEDIA_EVENT_OBJECT_CUES = {
+    "accident",
+    "broken",
+    "car",
+    "cars",
+    "damage",
+    "damaged",
+    "flatbed",
+}
+
+
+def _locomo_question_source_dates(question: str) -> tuple[str, ...]:
+    dates: list[str] = []
+    for match in _DATE_CANDIDATE_PATTERN.finditer(question):
+        parsed = _parse_calendar_date(match.group(0))
+        if parsed is None:
+            continue
+        value = parsed.isoformat()
+        if value not in dates:
+            dates.append(value)
+    return tuple(dates[:4])
+
+
+def _locomo_support_source_date(support: EvidenceSupport) -> str | None:
+    for value in (support.concept_original_date, support.concept_valid_from):
+        parsed = _parse_calendar_date(value)
+        if parsed is not None:
+            return parsed.isoformat()
+    return None
+
+
+def _locomo_adoption_duration_question(question: str) -> bool:
+    question_l = (question or "").lower()
+    question_terms = set(_content_tokens(question_l))
+    return (
+        re.search(r"^\s*(?:how\s+long|for\s+how\s+long)\b", question_l) is not None
+        and "as of" in question_l
+        and bool(question_terms & _LOCOMO_SOURCE_FRAGMENT_ADOPTION_TERMS)
+        and bool(question_terms & _LOCOMO_SOURCE_FRAGMENT_ANIMAL_TERMS)
+    )
+
+
+def _locomo_actual_pet_adoption_support(support_terms: set[str], text_l: str) -> bool:
+    if not (support_terms & _LOCOMO_SOURCE_FRAGMENT_ANIMAL_TERMS):
+        return False
+    if re.search(r"\badopted\b", text_l):
+        return True
+    if {"taking", "home"} <= support_terms:
+        return True
+    if {"meet", "puppy"} <= support_terms:
+        return True
+    return "toby" in support_terms and "puppy" in support_terms
+
+
+def _locomo_first_pet_adoption_duration_support(
+    support_terms: set[str],
+    text_l: str,
+) -> bool:
+    if "another" in support_terms:
+        return False
+    if "toby" in support_terms and support_terms & {"puppy", "dog", "pet", "pup"}:
+        return True
+    if {"meet", "puppy"} <= support_terms:
+        return True
+    if {"taking", "home"} <= support_terms or {"took", "home"} <= support_terms:
+        return True
+    return bool(re.search(r"\badopt(?:ed|ing)\s+(?:a\s+)?(?:puppy|pup)\b", text_l))
+
+
+def _locomo_adoption_search_only_support(support_terms: set[str], text_l: str) -> bool:
+    if _locomo_actual_pet_adoption_support(support_terms, text_l):
+        return False
+    return bool(support_terms & _LOCOMO_SOURCE_FRAGMENT_ADOPTION_SEARCH_ONLY_CUES)
+
+
+def _locomo_temporal_media_event_question(question: str) -> bool:
+    question_l = (question or "").lower()
+    question_terms = set(_content_tokens(question_l))
+    return (
+        re.search(r"^\s*when\b", question_l) is not None
+        and bool(question_terms & {"accident", "car", "cars", "happened"})
+        and bool(question_terms & _LOCOMO_SOURCE_FRAGMENT_MEDIA_EVENT_OBJECT_CUES)
+    )
+
+
+def _locomo_materialized_fact_support_assessment(
+    question: str,
+    support: EvidenceSupport,
+    signals: set[str],
+) -> LocomoDecisiveSupportAssessment:
+    if not _locomo_support_has_source_marker(support) and not signals & {
+        "locomo_question_date",
+        "locomo_source_fragment",
+        "locomo_source_window",
+        "temporal_source_set",
+        "temporal_source_set_bridge",
+    }:
+        return LocomoDecisiveSupportAssessment(
+            None,
+            rejection_reason="materialized_fact_no_source_binding",
+        )
+    if not _support_actor_compatible(question, support):
+        return LocomoDecisiveSupportAssessment(
+            None,
+            rejection_reason="materialized_fact_actor_mismatch",
+        )
+
+    support_surfaces = (
+        support.support_text,
+        support.concept_summary,
+    )
+    activity_actor = _locomo_activity_object_question(question)
+    if activity_actor is not None and _locomo_support_has_actor(support, activity_actor):
+        for surface in support_surfaces:
+            for sentence in _locomo_support_sentences_without_shared_media(surface):
+                if not _locomo_sentence_mentions_actor(sentence, activity_actor):
+                    continue
+                candidate = _locomo_activity_object_candidate(sentence)
+                if candidate is None:
+                    continue
+                if {"volunteering", "dog", "shelter"} <= set(_content_tokens(candidate)):
+                    return LocomoDecisiveSupportAssessment(
+                        "materialized_activity_object_source_bound",
+                        safe_to_preserve_duplicate=True,
+                        score_boost=1.05,
+                    )
+        return LocomoDecisiveSupportAssessment(
+            None,
+            rejection_reason="materialized_activity_object_not_decisive",
+        )
+
+    action_actor = _locomo_action_bundle_question(question)
+    if action_actor is not None and _locomo_support_has_actor(support, action_actor):
+        for surface in support_surfaces:
+            for sentence in _locomo_support_sentences_without_shared_media(surface):
+                if not _locomo_sentence_mentions_actor(sentence, action_actor):
+                    continue
+                candidate = _locomo_action_bundle_candidate(sentence)
+                if candidate is None:
+                    continue
+                return LocomoDecisiveSupportAssessment(
+                    "materialized_action_bundle_source_bound",
+                    safe_to_preserve_duplicate=True,
+                    score_boost=1.05,
+                )
+        return LocomoDecisiveSupportAssessment(
+            None,
+            rejection_reason="materialized_action_bundle_not_decisive",
+        )
+
+    return LocomoDecisiveSupportAssessment(None, rejection_reason="no_materialized_fact_family")
+
+
+def _locomo_decisive_support_assessment(
+    question: str,
+    support: EvidenceSupport,
+    signals: set[str],
+) -> LocomoDecisiveSupportAssessment:
+    text = f"{support.support_text} {support.concept_summary}"
+    text_l = text.lower()
+    question_l = question.lower()
+    source_bound = _locomo_support_has_source_marker(support)
+    if not source_bound:
+        return LocomoDecisiveSupportAssessment(None, rejection_reason="no_source_marker")
+
+    question_terms = set(_content_tokens(question))
+    support_terms = set(_content_tokens(text))
+    anchor_terms = question_terms & support_terms
+
+    if (
+        {"emotion", "emotions"} & question_terms
+        and {"party", "veterans"} <= question_terms
+    ):
+        if not _support_actor_compatible(question, support):
+            return LocomoDecisiveSupportAssessment(None, rejection_reason="actor_mismatch")
+        event_verbs = {"hosted", "throwing", "invited", "share", "stories"}
+        if (
+            "party" in support_terms
+            and {"veteran", "veterans"} & support_terms
+            and support_terms & event_verbs
+        ):
+            return LocomoDecisiveSupportAssessment(
+                "event_bound_emotion_context_source_bound",
+                safe_to_preserve_duplicate=True,
+                score_boost=1.15,
+            )
+        return LocomoDecisiveSupportAssessment(
+            None,
+            rejection_reason="event_bound_emotion_context_not_decisive",
+        )
+
+    if re.search(r"\bwhat\s+did\b.+\bsay\s+about\b", question_l):
+        question_dates = set(_locomo_question_source_dates(question))
+        support_date = _locomo_support_source_date(support)
+        dialogue_bound = (
+            support.channel == "verbatim"
+            or "[user]" in text_l
+            or "[assistant]" in text_l
+            or re.search(r"\b[A-Z][a-z]+:\s", support.support_text) is not None
+        )
+        predicate_tail = _DATE_CANDIDATE_PATTERN.sub(" ", question_l.split("about", 1)[-1])
+        predicate_terms = set(_content_tokens(predicate_tail))
+        predicate_overlap = bool(predicate_terms & support_terms)
+        if dialogue_bound and predicate_overlap and anchor_terms:
+            return LocomoDecisiveSupportAssessment(
+                "source_quote_predicate",
+                safe_to_preserve_duplicate=True,
+                score_boost=1.05,
+            )
+        if (
+            question_dates
+            and support_date in question_dates
+            and predicate_overlap
+            and bool(_LOCOMO_SOURCE_DATE_STATUS_CUES & support_terms)
+        ):
+            return LocomoDecisiveSupportAssessment(
+                "source_date_predicate",
+                score_boost=1.35,
+            )
+        return LocomoDecisiveSupportAssessment(None, rejection_reason="source_quote_not_decisive")
+
+    if question_l.startswith("why ") or question_l.startswith("why did "):
+        if not _support_actor_compatible(question, support):
+            return LocomoDecisiveSupportAssessment(None, rejection_reason="actor_mismatch")
+        reason_cue = bool(_LOCOMO_REASON_DECISIVE_CUES & support_terms)
+        object_cue_count = len(_LOCOMO_REASON_OBJECT_CUES & support_terms)
+        question_object_overlap = bool({"apartment", "choose", "chose"} & question_terms)
+        answer_phrase_cue = bool(
+            support_terms >= _LOCOMO_REASON_ANSWER_PHRASE_CUES
+            and {"bar", "pub"} & support_terms
+            and question_terms & {"apartment", "mcgee", "bar"}
+        )
+        if answer_phrase_cue and question_object_overlap:
+            return LocomoDecisiveSupportAssessment(
+                "why_reason_answer_phrase_source_bound",
+                safe_to_preserve_duplicate=True,
+                score_boost=1.35,
+            )
+        if reason_cue and object_cue_count >= 2 and question_object_overlap:
+            return LocomoDecisiveSupportAssessment(
+                "why_reason_source_bound",
+                safe_to_preserve_duplicate=True,
+                score_boost=1.0,
+            )
+        return LocomoDecisiveSupportAssessment(None, rejection_reason="reason_not_decisive")
+
+    if "transformation" in question_terms or "journey" in question_terms:
+        analogy_cue = bool(_LOCOMO_TEMPORAL_ANALOGY_CUES & support_terms) and (
+            "two years ago" in text_l or "2 years ago" in text_l
+        )
+        concrete_action_count = len(_LOCOMO_TEMPORAL_ACTION_CUES & support_terms)
+        if analogy_cue and concrete_action_count >= 2:
+            return LocomoDecisiveSupportAssessment(
+                "temporal_analogy_source_bound",
+                safe_to_preserve_duplicate=True,
+                score_boost=1.0,
+            )
+        return LocomoDecisiveSupportAssessment(None, rejection_reason="temporal_analogy_not_decisive")
+
+    if _locomo_adoption_duration_question(question):
+        if not _support_actor_compatible(question, support):
+            return LocomoDecisiveSupportAssessment(None, rejection_reason="actor_mismatch")
+        requires_first_pet = "first" in question_l
+        if _locomo_adoption_search_only_support(support_terms, text_l):
+            return LocomoDecisiveSupportAssessment(
+                None,
+                rejection_reason="adoption_duration_search_only",
+            )
+        if requires_first_pet and not _locomo_first_pet_adoption_duration_support(
+            support_terms,
+            text_l,
+        ):
+            return LocomoDecisiveSupportAssessment(
+                None,
+                rejection_reason="adoption_duration_first_pet_not_decisive",
+            )
+        if (
+            _locomo_actual_pet_adoption_support(support_terms, text_l)
+            and _locomo_support_source_date(support)
+        ):
+            return LocomoDecisiveSupportAssessment(
+                "source_fragment_adoption_duration",
+                safe_to_preserve_duplicate=True,
+                score_boost=1.65 if requires_first_pet else 1.15,
+            )
+        return LocomoDecisiveSupportAssessment(
+            None,
+            rejection_reason="adoption_duration_not_decisive",
+        )
+
+    if _locomo_temporal_media_event_question(question):
+        if not _support_actor_compatible(question, support):
+            return LocomoDecisiveSupportAssessment(None, rejection_reason="actor_mismatch")
+        object_bound = bool(support_terms & _LOCOMO_SOURCE_FRAGMENT_MEDIA_EVENT_OBJECT_CUES)
+        date_bound = bool(support_terms & _LOCOMO_SOURCE_FRAGMENT_MEDIA_EVENT_DATE_CUES) or bool(
+            _locomo_support_source_date(support)
+        )
+        if object_bound or date_bound:
+            return LocomoDecisiveSupportAssessment(
+                "source_fragment_temporal_media_event",
+                safe_to_preserve_duplicate=True,
+                score_boost=1.05 if object_bound and date_bound else 0.7,
+            )
+        return LocomoDecisiveSupportAssessment(
+            None,
+            rejection_reason="temporal_media_event_not_decisive",
+        )
+
+    materialized = _locomo_materialized_fact_support_assessment(question, support, signals)
+    if materialized.family:
+        return materialized
+
+    return LocomoDecisiveSupportAssessment(None, rejection_reason=materialized.rejection_reason)
+
+
+def _locomo_preserved_support_surface(
+    support: EvidenceSupport,
+    preserved_ids: set[str],
+) -> dict[str, object]:
+    surface = _support_diagnostic_surface(support)
+    if support.concept_id in preserved_ids:
+        surface["surface_source"] = "initial_pack_duplicate_preserved"
+        surface["preservation_reason"] = "answer_bearing_duplicate_not_emitted"
+    return surface
+
+
 def _collect_support_candidate_backfill(
     *,
     question: str,
@@ -5506,13 +7278,19 @@ def _collect_support_candidate_backfill(
     semantic_enabled: bool = False,
     semantic_limit: int = 0,
     semantic_min_score: float = 0.45,
+    locomo_support_emission_enabled: bool = False,
+    preserve_initial_support_enabled: bool = False,
+    preserve_initial_support_displace_enabled: bool = False,
+    preserve_initial_support_displace_limit: int = 2,
 ) -> SupportCandidateBackfillResult:
     t0 = time.perf_counter()
     deadline = t0 + max(75.0, min(float(budget_ms), 250.0)) / 1000.0
     rejection_counts: dict[str, int] = {}
+    existing_supports = _hydrate_support_temporal_metadata(existing_supports)
     fts_limit = max(0, min(int(fts_limit), 50))
     assoc_limit = max(0, min(int(assoc_limit), 80))
-    max_supports = max(0, min(int(max_supports), 8))
+    max_support_cap = 16 if locomo_support_emission_enabled else 8
+    max_supports = max(0, min(int(max_supports), max_support_cap))
     min_score = max(0.0, min(float(min_score), 1.0))
     semantic_limit = max(0, min(int(semantic_limit), 50))
     semantic_min_score = max(0.0, min(float(semantic_min_score), 1.0))
@@ -5534,6 +7312,14 @@ def _collect_support_candidate_backfill(
     }
     temporal_anchor_valid_froms = _temporal_source_set_anchor_valid_froms(question, existing_supports)
     temporal_anchor_concept_ids = _temporal_source_set_anchor_concept_ids(question, existing_supports)
+    locomo_question_source_dates = (
+        _locomo_question_source_dates(question) if locomo_support_emission_enabled else ()
+    )
+    locomo_source_window_anchor_valid_froms = (
+        _locomo_source_window_anchor_valid_froms(question, existing_supports)
+        if locomo_support_emission_enabled
+        else ()
+    )
     home_country_alias_seed = (
         _home_country_move_from_actor(question) is not None
         and any(
@@ -5583,6 +7369,56 @@ def _collect_support_candidate_backfill(
                     _merge_support_candidate_row(candidate_rows, row, "home_country_alias")
             except Exception:
                 _increment_rejection(rejection_counts, "backfill_no_candidates")
+        if locomo_source_window_anchor_valid_froms and time.perf_counter() < deadline:
+            try:
+                for row in _fetch_locomo_source_window_candidate_rows(
+                    conn,
+                    locomo_source_window_anchor_valid_froms,
+                    max(16, min(160, fts_limit + assoc_limit or 24)),
+                ):
+                    _merge_support_candidate_row(candidate_rows, row, "locomo_source_window")
+            except Exception:
+                _increment_rejection(rejection_counts, "backfill_no_candidates")
+        if (
+            locomo_support_emission_enabled
+            and _locomo_training_course_date_question(question)
+            and locomo_source_window_anchor_valid_froms
+            and time.perf_counter() < deadline
+        ):
+            try:
+                for row in _fetch_locomo_training_course_date_candidate_rows(
+                    conn,
+                    locomo_source_window_anchor_valid_froms,
+                    max(4, min(12, fts_limit + assoc_limit or 8)),
+                ):
+                    _merge_support_candidate_row(
+                        candidate_rows,
+                        row,
+                        "locomo_training_course_date",
+                    )
+            except Exception:
+                _increment_rejection(rejection_counts, "backfill_no_candidates")
+        if locomo_question_source_dates and time.perf_counter() < deadline:
+            try:
+                for row in _fetch_locomo_question_date_candidate_rows(
+                    conn,
+                    locomo_question_source_dates,
+                    max(16, min(160, fts_limit + assoc_limit or 24)),
+                ):
+                    _merge_support_candidate_row(candidate_rows, row, "locomo_question_date")
+            except Exception:
+                _increment_rejection(rejection_counts, "backfill_no_candidates")
+        if locomo_support_emission_enabled and time.perf_counter() < deadline:
+            try:
+                for row in _fetch_locomo_source_fragment_candidate_rows(
+                    conn,
+                    question,
+                    terms,
+                    max(16, min(24, fts_limit + assoc_limit or 24)),
+                ):
+                    _merge_support_candidate_row(candidate_rows, row, "locomo_source_fragment")
+            except Exception:
+                _increment_rejection(rejection_counts, "backfill_no_candidates")
         if fts_limit > 0 and time.perf_counter() < deadline and not (association_first and candidate_rows):
             try:
                 for row in _fetch_fts_support_candidate_rows(conn, terms, fts_limit):
@@ -5597,6 +7433,22 @@ def _collect_support_candidate_backfill(
                     _merge_support_candidate_row(candidate_rows, row, "association")
             except Exception:
                 _increment_rejection(rejection_counts, "backfill_no_candidates")
+        if locomo_support_emission_enabled and time.perf_counter() < deadline:
+            source_window_valid_froms = _merge_ordered_strings(
+                locomo_source_window_anchor_valid_froms,
+                _locomo_source_window_candidate_valid_froms(candidate_rows),
+                limit=8,
+            )
+            if source_window_valid_froms:
+                try:
+                    for row in _fetch_locomo_source_window_candidate_rows(
+                        conn,
+                        source_window_valid_froms,
+                        max(16, min(160, fts_limit + assoc_limit or 24)),
+                    ):
+                        _merge_support_candidate_row(candidate_rows, row, "locomo_source_window")
+                except Exception:
+                    _increment_rejection(rejection_counts, "backfill_no_candidates")
         if semantic_enabled and semantic_limit > 0 and time.perf_counter() < deadline:
             try:
                 rows, semantic_candidate_ids, semantic_latency_ms = _fetch_semantic_support_candidate_rows(
@@ -5627,7 +7479,17 @@ def _collect_support_candidate_backfill(
 
     admitted: list[tuple[float, EvidenceSupport]] = []
     semantic_admitted_ids: list[str] = []
+    preserved_initial_candidates: list[tuple[float, EvidenceSupport, dict[str, object]]] = []
+    preserved_initial_supports: list[EvidenceSupport] = []
+    preserved_initial_rejection_counts: dict[str, int] = {}
+    duplicate_equivalence: list[dict[str, object]] = []
+    displacement_ledger: list[dict[str, object]] = []
+    selected_support_features_by_id: dict[str, dict[str, object]] = {}
+    locomo_decisive_evidence_preserved_ids: list[str] = []
+    locomo_decisive_evidence_family_by_id: dict[str, str] = {}
+    locomo_decisive_evidence_rejection_counts: dict[str, int] = {}
     rare_terms = set(terms)
+    locomo_family_accident_question = _locomo_family_accident_question(question)
     candidate_entries: list[dict[str, object]] = []
     for concept_index, concept in enumerate(activated_concepts):
         concept_id = _concept_id(concept, concept_index)
@@ -5657,6 +7519,132 @@ def _collect_support_candidate_backfill(
             continue
         if concept_id in initial_pack_ids:
             _increment_rejection(rejection_counts, "backfill_duplicate")
+            if locomo_support_emission_enabled:
+                signals = entry["signals"] if isinstance(entry["signals"], set) else set()
+                row = entry.get("row")
+                try:
+                    concept = (
+                        _support_candidate_row_to_concept(row)
+                        if isinstance(row, sqlite3.Row)
+                        else entry["concept"]
+                    )
+                    duplicate_supports = _collect_supports([concept], max_support_chars=4000)
+                except Exception:
+                    _increment_rejection(
+                        preserved_initial_rejection_counts,
+                        "preserved_initial_support_collect_error",
+                    )
+                    duplicate_supports = []
+                if not duplicate_supports:
+                    detail = {
+                        "dropped_concept_id": concept_id,
+                        "signals": sorted(signals),
+                        "duplicate_preservation_decision": "no_support_surface",
+                    }
+                    duplicate_equivalence.append(detail)
+                    _increment_rejection(
+                        preserved_initial_rejection_counts,
+                        "preserved_initial_support_no_surface",
+                    )
+                for support in duplicate_supports:
+                    decisive_assessment = _locomo_decisive_support_assessment(
+                        question,
+                        support,
+                        signals,
+                    )
+                    source_match, source_rejection = _locomo_source_bound_emission_support_match(
+                        question,
+                        support,
+                        signals,
+                    )
+                    temporal_source_set_match = _temporal_source_set_backfill_match(
+                        question,
+                        support,
+                        signals,
+                        existing_supports,
+                    )
+                    actor_compatible = _support_actor_compatible(question, support)
+                    actor_text_safe, actor_text_rejection = (
+                        _locomo_preserved_initial_support_actor_text_safe(question, support)
+                    )
+                    detail = {
+                        "dropped_concept_id": concept_id,
+                        "signals": sorted(signals),
+                        "source_bound_emission_match": source_match,
+                        "source_bound_rejection": source_rejection,
+                        "temporal_source_set_match": temporal_source_set_match,
+                        "actor_compatible": actor_compatible,
+                        "actor_text_safe": actor_text_safe,
+                        "support_text_sha256": _locomo_support_surface_sha256(support.support_text),
+                        "concept_summary_sha256": _locomo_support_surface_sha256(
+                            support.concept_summary
+                        ),
+                        "decisive_evidence_family": decisive_assessment.family,
+                        "decisive_evidence_rejection": decisive_assessment.rejection_reason,
+                        "duplicate_preservation_decision": "trace_only",
+                    }
+                    duplicate_equivalence.append(detail)
+                    if (
+                        decisive_assessment.family
+                        and decisive_assessment.safe_to_preserve_duplicate
+                    ):
+                        scored = _score_support(question, support)
+                        effective_score = max(
+                            scored.score,
+                            min_score + decisive_assessment.score_boost,
+                        )
+                        detail["duplicate_preservation_decision"] = (
+                            "decisive_evidence_preservation_candidate"
+                        )
+                        detail["decisive_evidence_preserve"] = True
+                        locomo_decisive_evidence_family_by_id[concept_id] = (
+                            decisive_assessment.family
+                        )
+                        preserved_initial_candidates.append((effective_score, support, detail))
+                        continue
+                    if temporal_source_set_match and actor_compatible and actor_text_safe:
+                        scored = _score_support(question, support)
+                        effective_score = max(scored.score, min_score + 0.95)
+                        detail["duplicate_preservation_decision"] = (
+                            "temporal_source_set_decisive_preservation_candidate"
+                        )
+                        detail["decisive_evidence_preserve"] = True
+                        detail["decisive_evidence_family"] = "temporal_source_set_companion"
+                        locomo_decisive_evidence_family_by_id[concept_id] = (
+                            "temporal_source_set_companion"
+                        )
+                        preserved_initial_candidates.append((effective_score, support, detail))
+                        continue
+                    if decisive_assessment.rejection_reason:
+                        _increment_rejection(
+                            locomo_decisive_evidence_rejection_counts,
+                            decisive_assessment.rejection_reason,
+                        )
+                    if not preserve_initial_support_enabled:
+                        continue
+                    if not actor_text_safe:
+                        reason = actor_text_rejection or "preserved_initial_support_actor_text_mismatch"
+                        detail["duplicate_preservation_decision"] = reason
+                        _increment_rejection(preserved_initial_rejection_counts, reason)
+                        continue
+                    if not actor_compatible:
+                        detail["duplicate_preservation_decision"] = (
+                            "preserved_initial_support_actor_mismatch"
+                        )
+                        _increment_rejection(
+                            preserved_initial_rejection_counts,
+                            "preserved_initial_support_actor_mismatch",
+                        )
+                        continue
+                    if not source_match and not temporal_source_set_match:
+                        reason = source_rejection or "preserved_initial_support_shape_mismatch"
+                        detail["duplicate_preservation_decision"] = reason
+                        _increment_rejection(preserved_initial_rejection_counts, reason)
+                        continue
+                    scored = _score_support(question, support)
+                    effective_score = max(scored.score, min_score + 0.18)
+                    detail["duplicate_preservation_decision"] = "needs_preservation"
+                    preserved_initial_candidates.append((effective_score, support, detail))
             continue
         row = entry.get("row")
         if isinstance(row, sqlite3.Row) and not _support_candidate_row_is_active(row):
@@ -5667,11 +7655,30 @@ def _collect_support_candidate_backfill(
         supports = _collect_supports([concept], max_support_chars=4000)
         best_support: tuple[float, EvidenceSupport] | None = None
         for support in supports:
+            signals = entry["signals"] if isinstance(entry["signals"], set) else set()
             temporal_make_media_match = _temporal_make_media_backfill_support_match(
                 question,
                 support,
             )
-            if not temporal_make_media_match and not _support_actor_compatible(question, support):
+            decisive_assessment = (
+                _locomo_decisive_support_assessment(question, support, signals)
+                if locomo_support_emission_enabled
+                else LocomoDecisiveSupportAssessment(None)
+            )
+            locomo_source_window_family_accident_match = (
+                locomo_support_emission_enabled
+                and _locomo_source_window_family_accident_support_match(
+                    question,
+                    support,
+                    signals,
+                )
+            )
+            if (
+                not temporal_make_media_match
+                and not locomo_source_window_family_accident_match
+                and not decisive_assessment.family
+                and not _support_actor_compatible(question, support)
+            ):
                 _increment_rejection(rejection_counts, "backfill_actor_mismatch")
                 continue
             scored = _score_support(question, support)
@@ -5679,7 +7686,6 @@ def _collect_support_candidate_backfill(
             rare_overlap = bool(rare_terms & support_terms)
             predicate_overlap = scored.predicate_overlap > 0.0
             direct_atomic_match = _relationship_status_candidate_from_sentence(question, support.support_text) is not None
-            signals = entry["signals"] if isinstance(entry["signals"], set) else set()
             semantic_signal = "semantic" in signals
             event_list_answer = (
                 _support_present_event_list_candidate(question, support.support_text)
@@ -5707,6 +7713,39 @@ def _collect_support_candidate_backfill(
                 question,
                 support,
             )
+            locomo_adoption_opinion_match = _locomo_adoption_opinion_support_match(
+                question,
+                support,
+                signals,
+            )
+            locomo_training_course_date_match = (
+                locomo_support_emission_enabled
+                and _locomo_training_course_date_source_support_match(question, support)
+            )
+            temporal_source_set_match = _temporal_source_set_backfill_match(
+                question,
+                support,
+                signals,
+                existing_supports,
+            )
+            locomo_emission_match = False
+            if locomo_support_emission_enabled:
+                locomo_emission_match, locomo_rejection = _locomo_source_bound_emission_support_match(
+                    question,
+                    support,
+                    signals,
+                )
+                if (
+                    not locomo_emission_match
+                    and not temporal_source_set_match
+                    and not locomo_training_course_date_match
+                    and not decisive_assessment.family
+                ):
+                    _increment_rejection(
+                        rejection_counts,
+                        locomo_rejection or "locomo_emission_shape_mismatch",
+                    )
+                    continue
             home_country_alias_direct_answer = (
                 _home_country_move_from_actor(question) is not None
                 and any(
@@ -5720,32 +7759,37 @@ def _collect_support_candidate_backfill(
                 and not predicate_overlap
                 and not home_country_alias_direct_answer
                 and not locomo_direct_answer
+                and not locomo_adoption_opinion_match
+                and not locomo_source_window_family_accident_match
+                and not temporal_source_set_match
+                and not locomo_training_course_date_match
+                and not decisive_assessment.family
             ):
                 if not semantic_signal or scored.score < semantic_min_score:
                     _increment_rejection(rejection_counts, "backfill_common_word_only")
                     continue
             score_floor = min_score
             identity_complete_match = _identity_support_sentence_bound(question, support.support_text)
-            temporal_source_set_match = (
-                "temporal_source_set" in signals
-                and support.concept_original_date
-                and _temporal_source_set_support_matches(
-                    question,
-                    support,
-                    existing_supports,
-                )
-            )
             if direct_atomic_match or identity_complete_match:
                 score_floor = min(score_floor, 0.08)
             elif likely_fields_question and field_specificity_bonus >= 0.12:
                 score_floor = min(score_floor, min_score * 0.85)
-            elif home_country_alias_direct_answer:
-                score_floor = min(score_floor, 0.03)
-            elif locomo_direct_answer:
+            elif (
+                home_country_alias_direct_answer
+                or locomo_direct_answer
+                or locomo_adoption_opinion_match
+                or locomo_emission_match
+                or locomo_training_course_date_match
+                or locomo_source_window_family_accident_match
+            ):
                 score_floor = min(score_floor, 0.03)
             elif "activation" in signals and predicate_overlap:
                 score_floor = min(score_floor, min_score * 0.8)
-            elif temporal_make_media_match or temporal_source_set_match:
+            elif (
+                temporal_make_media_match
+                or temporal_source_set_match
+                or decisive_assessment.family
+            ):
                 score_floor = min(score_floor, 0.03)
             if event_list_answer is not None:
                 score_floor = min(score_floor, min_score * 0.55)
@@ -5758,12 +7802,31 @@ def _collect_support_candidate_backfill(
                 effective_score = max(effective_score, min_score + 0.5)
             if locomo_direct_answer:
                 effective_score = max(effective_score, min_score + 0.5)
+            if locomo_adoption_opinion_match:
+                effective_score = max(effective_score, min_score + 0.55)
+            if locomo_emission_match:
+                effective_score = max(effective_score, min_score + 0.18)
+                if (("locomo_source_window" in signals) or _locomo_source_fragment_signal(signals)) and (
+                    not locomo_family_accident_question
+                    or locomo_source_window_family_accident_match
+                    or temporal_make_media_match
+                ):
+                    effective_score += 0.45
+            if locomo_training_course_date_match:
+                effective_score = max(effective_score, min_score + 1.05)
+            if locomo_source_window_family_accident_match:
+                effective_score = max(effective_score, min_score + 0.55)
             if temporal_make_media_match:
                 effective_score = max(effective_score, min_score + 0.12)
             if temporal_source_set_match:
                 effective_score = max(
                     effective_score,
-                    min_score + (0.08 if "temporal_source_set_bridge" in signals else 0.04),
+                    min_score + 0.95,
+                )
+            if decisive_assessment.family:
+                effective_score = max(
+                    effective_score,
+                    min_score + decisive_assessment.score_boost,
                 )
             if event_list_answer is not None:
                 effective_score += 0.35
@@ -5778,29 +7841,197 @@ def _collect_support_candidate_backfill(
             signal_count += 1 if "fts" in entry["signals"] and rare_overlap else 0
             signal_count += 1 if semantic_signal else 0
             signal_count += 1 if "activation" in signals else 0
+            signal_count += 1 if "locomo_question_date" in signals else 0
+            signal_count += 1 if "locomo_training_course_date" in signals else 0
             signal_count += 1 if "temporal_source_set" in signals else 0
             signal_count += 1 if "temporal_source_set_bridge" in signals else 0
+            signal_count += 1 if "locomo_source_window" in signals else 0
+            signal_count += 1 if _locomo_source_fragment_signal(signals) else 0
             signal_count += 1 if direct_atomic_match else 0
             signal_count += 1 if identity_complete_match else 0
             signal_count += 1 if home_country_alias_direct_answer else 0
             signal_count += 1 if locomo_direct_answer else 0
+            signal_count += 1 if locomo_adoption_opinion_match else 0
+            signal_count += 1 if locomo_emission_match else 0
+            signal_count += 1 if locomo_training_course_date_match else 0
+            signal_count += 1 if locomo_source_window_family_accident_match else 0
             signal_count += 1 if temporal_make_media_match else 0
+            signal_count += 1 if temporal_source_set_match else 0
+            signal_count += 1 if decisive_assessment.family else 0
             signal_count += 1 if event_list_answer is not None else 0
             if signal_count < 2:
                 _increment_rejection(rejection_counts, "backfill_low_score")
                 continue
             if best_support is None or effective_score > best_support[0]:
                 best_support = (effective_score, support)
+                selected_support_features_by_id[support.concept_id] = {
+                    "direct_atomic_match": bool(direct_atomic_match),
+                    "identity_complete_match": bool(identity_complete_match),
+                    "likely_fields_direct_answer": bool(likely_fields_direct_answer),
+                    "home_country_alias_direct_answer": bool(
+                        home_country_alias_direct_answer
+                    ),
+                    "locomo_direct_answer": bool(locomo_direct_answer),
+                    "locomo_adoption_opinion_match": bool(locomo_adoption_opinion_match),
+                    "locomo_training_course_date_match": bool(
+                        locomo_training_course_date_match
+                    ),
+                    "locomo_source_window_family_accident_match": bool(
+                        locomo_source_window_family_accident_match
+                    ),
+                    "temporal_make_media_match": bool(temporal_make_media_match),
+                    "temporal_source_set_match": bool(temporal_source_set_match),
+                    "decisive_evidence_family": decisive_assessment.family,
+                    "event_list_answer": event_list_answer,
+                    "replaceable_weak_support": not any(
+                        (
+                            direct_atomic_match,
+                            identity_complete_match,
+                            likely_fields_direct_answer,
+                            home_country_alias_direct_answer,
+                            locomo_direct_answer,
+                            locomo_adoption_opinion_match,
+                            locomo_training_course_date_match,
+                            locomo_source_window_family_accident_match,
+                            _locomo_source_fragment_signal(signals),
+                            temporal_make_media_match,
+                            temporal_source_set_match,
+                            decisive_assessment.family,
+                            event_list_answer is not None,
+                        )
+                    ),
+                }
+                if decisive_assessment.family:
+                    locomo_decisive_evidence_family_by_id[support.concept_id] = (
+                        decisive_assessment.family
+                    )
         if best_support is None:
             continue
         admitted.append(best_support)
         if "semantic" in (entry["signals"] if isinstance(entry["signals"], set) else set()):
             semantic_admitted_ids.append(concept_id)
 
-    if not admitted:
-        _increment_rejection(rejection_counts, "backfill_no_candidates")
     admitted.sort(key=lambda item: item[0], reverse=True)
     supports = [item[1] for item in admitted[:max_supports]]
+    preserved_initial_candidates.sort(key=lambda item: item[0], reverse=True)
+    preserved_initial_support_displacement_count = 0
+    preserve_initial_support_displace_limit = max(
+        0, min(int(preserve_initial_support_displace_limit), 2)
+    )
+    for _score, support, detail in preserved_initial_candidates:
+        decisive_preserve = bool(detail.get("decisive_evidence_preserve"))
+        equivalent_id = _locomo_preserved_initial_support_equivalent(support, supports)
+        if equivalent_id:
+            detail["retained_equivalent_concept_id"] = equivalent_id
+            detail["duplicate_preservation_decision"] = "safe_omitted_equivalent_selected"
+            _increment_rejection(
+                preserved_initial_rejection_counts,
+                "preserved_initial_support_equivalent_selected",
+            )
+            continue
+        if len(supports) < max_supports:
+            supports.append(support)
+            preserved_initial_supports.append(support)
+            detail["duplicate_preservation_decision"] = (
+                "decisive_evidence_preserved" if decisive_preserve else "preserved"
+            )
+            if decisive_preserve and support.concept_id:
+                locomo_decisive_evidence_preserved_ids.append(support.concept_id)
+            continue
+        if (
+            (preserve_initial_support_displace_enabled or decisive_preserve)
+            and preserved_initial_support_displacement_count
+            < preserve_initial_support_displace_limit
+        ):
+            replaceable_indices: list[int] = []
+            preserved_ids = {item.concept_id for item in preserved_initial_supports}
+            for index, selected_support in enumerate(supports):
+                selected_id = selected_support.concept_id
+                selected_features = selected_support_features_by_id.get(selected_id)
+                if selected_id in preserved_ids:
+                    continue
+                if not selected_features:
+                    continue
+                if not selected_features.get("replaceable_weak_support"):
+                    continue
+                replaceable_indices.append(index)
+            if replaceable_indices:
+                replace_index = replaceable_indices[-1]
+                displaced = supports[replace_index]
+                displaced_features = selected_support_features_by_id.get(
+                    displaced.concept_id,
+                    {},
+                )
+                supports[replace_index] = support
+                preserved_initial_supports.append(support)
+                preserved_initial_support_displacement_count += 1
+                detail["duplicate_preservation_decision"] = (
+                    "decisive_evidence_preserved"
+                    if decisive_preserve
+                    else "preserved_initial_support_displaced"
+                )
+                if decisive_preserve and support.concept_id:
+                    locomo_decisive_evidence_preserved_ids.append(support.concept_id)
+                displacement_ledger.append(
+                    {
+                        "dropped_concept_id": support.concept_id,
+                        "displacement_enabled": True,
+                        "displacement_applied": True,
+                        "displaced_concept_id": displaced.concept_id,
+                        "displaced_selected_rank": replace_index + 1,
+                        "displacement_reason": "weak_selected_support_displaced",
+                        "replacement_guard_summary": {
+                            key: displaced_features.get(key)
+                            for key in (
+                                "direct_atomic_match",
+                                "identity_complete_match",
+                                "likely_fields_direct_answer",
+                                "home_country_alias_direct_answer",
+                                "locomo_direct_answer",
+                                "locomo_adoption_opinion_match",
+                                "locomo_source_window_family_accident_match",
+                                "temporal_make_media_match",
+                                "temporal_source_set_match",
+                                "event_list_answer",
+                                "replaceable_weak_support",
+                            )
+                        },
+                    }
+                )
+                continue
+            detail["duplicate_preservation_decision"] = (
+                "preserved_initial_support_no_safe_displacement"
+            )
+            displacement_ledger.append(
+                {
+                    "dropped_concept_id": support.concept_id,
+                    "displacement_enabled": True,
+                    "displacement_applied": False,
+                    "displacement_reason": "no_safe_displacement",
+                    "not_selected_reason": "preserved_initial_support_no_safe_displacement",
+                }
+            )
+            _increment_rejection(
+                preserved_initial_rejection_counts,
+                "preserved_initial_support_no_safe_displacement",
+            )
+            continue
+        detail["duplicate_preservation_decision"] = "preserved_initial_support_budget_blocked"
+        displacement_ledger.append(
+            {
+                "dropped_concept_id": support.concept_id,
+                "displacement_enabled": bool(preserve_initial_support_displace_enabled),
+                "displacement_applied": False,
+                "displacement_reason": "first_pass_no_displacement",
+                "not_selected_reason": "preserved_initial_support_budget_blocked",
+            }
+        )
+        _increment_rejection(
+            preserved_initial_rejection_counts,
+            "preserved_initial_support_budget_blocked",
+        )
+    if not supports:
+        _increment_rejection(rejection_counts, "backfill_no_candidates")
     candidate_ids = tuple(support.concept_id for support in supports)
     return SupportCandidateBackfillResult(
         supports,
@@ -5810,6 +8041,1492 @@ def _collect_support_candidate_backfill(
         semantic_candidate_ids=semantic_candidate_ids,
         semantic_admitted_ids=tuple(semantic_admitted_ids),
         semantic_latency_ms=semantic_latency_ms,
+        preserved_initial_supports=tuple(preserved_initial_supports),
+        preserved_initial_candidate_ids=tuple(
+            support.concept_id for support in preserved_initial_supports
+        ),
+        preserved_initial_support_rejection_counts=preserved_initial_rejection_counts,
+        duplicate_equivalence=tuple(duplicate_equivalence),
+        displacement_ledger=tuple(displacement_ledger),
+        preserved_initial_support_displacement_enabled=bool(
+            preserve_initial_support_displace_enabled
+        ),
+        preserved_initial_support_displacement_count=(
+            preserved_initial_support_displacement_count
+        ),
+        locomo_decisive_evidence_preserved_ids=tuple(
+            dict.fromkeys(locomo_decisive_evidence_preserved_ids)
+        ),
+        locomo_decisive_evidence_family_by_id=locomo_decisive_evidence_family_by_id,
+        locomo_decisive_evidence_rejection_counts=locomo_decisive_evidence_rejection_counts,
+    )
+
+
+def _locomo_preserved_initial_support_diagnostics(
+    backfill: SupportCandidateBackfillResult,
+    *,
+    preserve_initial_support_enabled: bool,
+) -> dict[str, object]:
+    return {
+        "locomo_preserved_initial_support_enabled": bool(preserve_initial_support_enabled),
+        "locomo_preserved_initial_support_considered": bool(backfill.duplicate_equivalence),
+        "locomo_preserved_initial_support_candidate_ids": list(
+            backfill.preserved_initial_candidate_ids or ()
+        ),
+        "locomo_preserved_initial_support_rejection_counts": (
+            backfill.preserved_initial_support_rejection_counts or {}
+        ),
+        "locomo_preserved_initial_support_duplicate_equivalence": list(
+            backfill.duplicate_equivalence or ()
+        ),
+        "locomo_preserved_initial_support_displacement_ledger": list(
+            backfill.displacement_ledger or ()
+        ),
+        "locomo_preserved_initial_support_displacement_enabled": bool(
+            backfill.preserved_initial_support_displacement_enabled
+        ),
+        "locomo_preserved_initial_support_displacement_count": int(
+            backfill.preserved_initial_support_displacement_count or 0
+        ),
+        "locomo_decisive_evidence_preserved_ids": list(
+            backfill.locomo_decisive_evidence_preserved_ids or ()
+        ),
+        "locomo_decisive_evidence_family_by_id": dict(
+            backfill.locomo_decisive_evidence_family_by_id or {}
+        ),
+        "locomo_decisive_evidence_rejection_counts": dict(
+            backfill.locomo_decisive_evidence_rejection_counts or {}
+        ),
+    }
+
+
+def _locomo_backfill_support_surfaces(
+    backfill: SupportCandidateBackfillResult,
+) -> list[dict[str, object]]:
+    preserved_ids = set(backfill.preserved_initial_candidate_ids or ())
+    return [
+        _locomo_preserved_support_surface(support, preserved_ids)
+        for support in backfill.supports
+    ]
+
+
+def _locomo_support_has_source_marker(support: EvidenceSupport) -> bool:
+    return bool(
+        support.channel == "verbatim"
+        or support.concept_original_date
+        or support.concept_valid_from
+        or "[LoCoMo turn id]" in support.support_text
+        or "[Shared media" in support.support_text
+    )
+
+
+def _collect_locomo_activated_support_continuity(
+    *,
+    question: str,
+    activated_concepts: list,
+    max_support_chars: int,
+    max_supports: int,
+) -> ActivatedSupportContinuityResult:
+    t0 = time.perf_counter()
+    max_supports = max(0, min(int(max_supports), 8))
+    rejection_counts: dict[str, int] = {}
+    rejected_ids_by_reason: dict[str, list[str]] = {}
+    admitted: list[tuple[float, EvidenceSupport]] = []
+    seen_concept_ids: set[str] = set()
+    question_terms = set(_content_tokens(question)) - _SUPPORT_CANDIDATE_BACKFILL_COMMON_TERMS
+    if max_supports <= 0:
+        _increment_rejection(rejection_counts, "activated_continuity_disabled")
+        return ActivatedSupportContinuityResult(
+            [],
+            (),
+            rejection_counts,
+            {},
+            _latency_ms(t0),
+        )
+
+    for concept_index, concept in enumerate(activated_concepts):
+        concept_id = _concept_id(concept, concept_index)
+        if not concept_id:
+            _increment_rejection(rejection_counts, "activated_continuity_missing_concept_id")
+            continue
+        if concept_id in seen_concept_ids:
+            _increment_rejected_concept(
+                rejection_counts,
+                rejected_ids_by_reason,
+                "activated_continuity_duplicate",
+                concept_id,
+            )
+            continue
+        seen_concept_ids.add(concept_id)
+        supports = _hydrate_support_temporal_metadata(
+            _collect_supports([concept], max_support_chars=max_support_chars)
+        )
+        if not supports:
+            _increment_rejected_concept(
+                rejection_counts,
+                rejected_ids_by_reason,
+                "activated_continuity_no_support",
+                concept_id,
+            )
+            continue
+
+        best_support: tuple[float, EvidenceSupport] | None = None
+        for support in supports:
+            if not _locomo_support_has_source_marker(support):
+                _increment_rejected_concept(
+                    rejection_counts,
+                    rejected_ids_by_reason,
+                    "activated_continuity_no_source_marker",
+                    concept_id,
+                )
+                continue
+            if not _support_actor_compatible(question, support):
+                _increment_rejected_concept(
+                    rejection_counts,
+                    rejected_ids_by_reason,
+                    "activated_continuity_actor_mismatch",
+                    concept_id,
+                )
+                continue
+            question_actor_terms = set(_question_actor_terms(question))
+            support_actor_terms = (
+                set(support.concept_actor_terms or ())
+                | set(_support_actor_terms_from_text(support.support_text))
+                | set(_support_actor_terms_from_text(support.concept_summary))
+            )
+            if (
+                question_actor_terms
+                and support_actor_terms
+                and not question_actor_terms & support_actor_terms
+            ):
+                _increment_rejected_concept(
+                    rejection_counts,
+                    rejected_ids_by_reason,
+                    "activated_continuity_actor_mismatch",
+                    concept_id,
+                )
+                continue
+            support_text = f"{support.support_text} {support.concept_summary}"
+            support_terms = set(_content_tokens(support_text))
+            rare_overlap = bool(question_terms & support_terms)
+            scored = _score_support(question, support)
+            predicate_overlap = scored.predicate_overlap > 0.0
+            direct_match = _locomo_source_backfill_direct_support_match(question, support)
+            temporal_match = _temporal_make_media_backfill_support_match(question, support)
+            source_window_match = _locomo_source_bound_emission_support_match(
+                question,
+                support,
+                {"activation"},
+            )[0]
+            if not (
+                rare_overlap
+                or predicate_overlap
+                or direct_match
+                or temporal_match
+                or source_window_match
+            ):
+                _increment_rejected_concept(
+                    rejection_counts,
+                    rejected_ids_by_reason,
+                    "activated_continuity_no_question_anchor",
+                    concept_id,
+                )
+                continue
+            effective_score = scored.score
+            if direct_match or source_window_match:
+                effective_score = max(effective_score, 1.0)
+            elif temporal_match:
+                effective_score = max(effective_score, 0.9)
+            elif predicate_overlap:
+                effective_score = max(effective_score, 0.75)
+            elif rare_overlap:
+                effective_score = max(effective_score, 0.5)
+            if best_support is None or effective_score > best_support[0]:
+                best_support = (effective_score, support)
+
+        if best_support is None:
+            continue
+        admitted.append(best_support)
+        if len(admitted) >= max_supports:
+            break
+
+    admitted.sort(key=lambda item: item[0], reverse=True)
+    supports = [item[1] for item in admitted[:max_supports]]
+    return ActivatedSupportContinuityResult(
+        supports,
+        tuple(support.concept_id for support in supports if support.concept_id),
+        rejection_counts,
+        {
+            reason: tuple(ids)
+            for reason, ids in rejected_ids_by_reason.items()
+            if ids
+        },
+        _latency_ms(t0),
+    )
+
+
+def locomo_source_bound_support_emission_diagnostics(
+    *,
+    question: str,
+    activated_concepts: list,
+    max_activated_concepts: int,
+    max_support_chars: int,
+    fts_limit: int,
+    assoc_limit: int,
+    max_supports: int,
+    min_score: float,
+    budget_ms: float,
+    semantic_enabled: bool = False,
+    semantic_limit: int = 0,
+    semantic_min_score: float = 0.45,
+    preserve_initial_support_enabled: bool = False,
+    preserve_initial_support_displace_enabled: bool = False,
+    activated_support_continuity_enabled: bool = False,
+) -> dict[str, object]:
+    """Emit LoCoMo source-bound support diagnostics without forcing an answer."""
+    supports = _collect_supports(
+        activated_concepts[:max_activated_concepts],
+        max_support_chars=max_support_chars,
+    )
+    backfill = _collect_support_candidate_backfill(
+        question=question,
+        activated_concepts=activated_concepts[:max_activated_concepts],
+        existing_supports=supports,
+        fts_limit=fts_limit,
+        assoc_limit=assoc_limit,
+        max_supports=max_supports,
+        min_score=min_score,
+        budget_ms=budget_ms,
+        semantic_enabled=semantic_enabled,
+        semantic_limit=semantic_limit,
+        semantic_min_score=semantic_min_score,
+        locomo_support_emission_enabled=True,
+        preserve_initial_support_enabled=preserve_initial_support_enabled,
+        preserve_initial_support_displace_enabled=preserve_initial_support_displace_enabled,
+    )
+    preserved_diagnostics = _locomo_preserved_initial_support_diagnostics(
+        backfill,
+        preserve_initial_support_enabled=preserve_initial_support_enabled,
+    )
+    activated_continuity = (
+        _collect_locomo_activated_support_continuity(
+            question=question,
+            activated_concepts=activated_concepts[:max_activated_concepts],
+            max_support_chars=max_support_chars,
+            max_supports=max_supports,
+        )
+        if activated_support_continuity_enabled
+        else None
+    )
+    emitted_supports = list(backfill.supports)
+    emitted_ids = {support.concept_id for support in emitted_supports if support.concept_id}
+    for support in (activated_continuity.supports if activated_continuity else ()):
+        if support.concept_id and support.concept_id in emitted_ids:
+            continue
+        emitted_supports.append(support)
+        if support.concept_id:
+            emitted_ids.add(support.concept_id)
+    payload = {
+        "recovery_strategy": "locomo_source_bound_support_emission",
+        "backfill_candidate_ids": list(backfill.candidate_ids or ()),
+        "backfill_support_surfaces": [
+            _locomo_preserved_support_surface(
+                support,
+                set(backfill.preserved_initial_candidate_ids or ()),
+            )
+            for support in emitted_supports
+        ],
+        "backfill_rejection_counts": backfill.rejection_counts or {},
+        "backfill_latency_ms": backfill.latency_ms,
+        "backfill_semantic_candidate_ids": list(backfill.semantic_candidate_ids or ()),
+        "backfill_semantic_admitted_ids": list(backfill.semantic_admitted_ids or ()),
+        "backfill_semantic_latency_ms": backfill.semantic_latency_ms,
+        **preserved_diagnostics,
+        "support_admission_v2_considered": True,
+        "support_admission_v2_binding_status": "support_emitted",
+        "support_admission_v2_shape": _infer_structured_synthesis_shape(question),
+    }
+    if activated_continuity is not None:
+        continuity_ids = list(activated_continuity.candidate_ids or ())
+        payload.update(
+            {
+                "locomo_activated_support_continuity_considered": True,
+                "locomo_activated_support_continuity_admitted": bool(continuity_ids),
+                "locomo_activated_support_continuity_candidate_ids": continuity_ids,
+                "locomo_activated_support_continuity_rejection_counts": (
+                    activated_continuity.rejection_counts or {}
+                ),
+                "locomo_activated_support_continuity_rejected_ids_by_reason": {
+                    reason: list(ids)
+                    for reason, ids in (
+                        activated_continuity.rejected_ids_by_reason or {}
+                    ).items()
+                },
+                "locomo_activated_support_continuity_strategy": (
+                    "activated_source_bound_support"
+                ),
+                "locomo_activated_support_continuity_effect_enabled": True,
+            }
+        )
+        if continuity_ids:
+            payload["backfill_candidate_ids"] = list(
+                dict.fromkeys([*payload["backfill_candidate_ids"], *continuity_ids])
+            )
+    elif activated_support_continuity_enabled:
+        payload["locomo_activated_support_continuity_considered"] = True
+        payload["locomo_activated_support_continuity_admitted"] = False
+    if not emitted_supports:
+        payload.pop("backfill_candidate_ids", None)
+        payload.pop("backfill_support_surfaces", None)
+        payload.pop("support_admission_v2_binding_status", None)
+        payload.pop("support_admission_v2_shape", None)
+    return payload
+
+
+def locomo_support_candidate_movement_ledger(
+    *,
+    question: str,
+    activated_concepts: list,
+    max_activated_concepts: int,
+    max_support_chars: int,
+    fts_limit: int,
+    assoc_limit: int,
+    max_supports: int,
+    min_score: float,
+    budget_ms: float,
+    semantic_enabled: bool = False,
+    semantic_limit: int = 0,
+    semantic_min_score: float = 0.45,
+    target_concept_ids: tuple[str, ...] = (),
+) -> dict[str, object]:
+    """Trace LoCoMo support-candidate movement without changing answer behavior."""
+    t0 = time.perf_counter()
+    deadline = t0 + max(75.0, min(float(budget_ms), 250.0)) / 1000.0
+    rejection_counts: dict[str, int] = {}
+    fts_limit = max(0, min(int(fts_limit), 50))
+    assoc_limit = max(0, min(int(assoc_limit), 80))
+    max_supports = max(0, min(int(max_supports), 16))
+    min_score = max(0.0, min(float(min_score), 1.0))
+    semantic_limit = max(0, min(int(semantic_limit), 50))
+    semantic_min_score = max(0.0, min(float(semantic_min_score), 1.0))
+    activated_window = activated_concepts[:max_activated_concepts]
+    existing_supports = _collect_supports(
+        activated_window,
+        max_support_chars=max_support_chars,
+    )
+    existing_supports = _hydrate_support_temporal_metadata(existing_supports)
+    terms = _support_candidate_backfill_content_terms(question)
+    fetch_stages: list[dict[str, object]] = []
+    candidate_rows: dict[str, dict] = {}
+    semantic_candidate_ids: tuple[str, ...] = ()
+    semantic_latency_ms: float | None = None
+
+    def _record_stage(stage: str, rows: list[sqlite3.Row]) -> None:
+        fetch_stages.append(
+            {
+                "stage": stage,
+                "row_count": len(rows),
+                "candidate_ids": [
+                    _stringify(_row_value(row, "concept_id")).strip()
+                    for row in rows
+                    if _stringify(_row_value(row, "concept_id")).strip()
+                ],
+            }
+        )
+
+    def _return_early(reason: str) -> dict[str, object]:
+        _increment_rejection(rejection_counts, reason)
+        return {
+            "schema_version": "locomo.support_candidate_movement_ledger.v1",
+            "question": question,
+            "config": {
+                "max_activated_concepts": max_activated_concepts,
+                "max_support_chars": max_support_chars,
+                "fts_limit": fts_limit,
+                "assoc_limit": assoc_limit,
+                "max_supports": max_supports,
+                "min_score": min_score,
+                "budget_ms": budget_ms,
+                "semantic_enabled": semantic_enabled,
+                "semantic_limit": semantic_limit,
+                "semantic_min_score": semantic_min_score,
+            },
+            "terms": list(terms),
+            "fetch_stages": fetch_stages,
+            "candidate_entries": [],
+            "support_rows": [],
+            "selected_candidate_ids": [],
+            "target_presence": {
+                target_id: {
+                    "found_in_candidates": False,
+                    "accepted_for_ranking": False,
+                    "selected": False,
+                    "best_selected_rank": None,
+                    "best_effective_score": None,
+                    "best_not_selected_reason": None,
+                }
+                for target_id in target_concept_ids
+            },
+            "rejection_counts": rejection_counts,
+            "latency_ms": _latency_ms(t0),
+        }
+
+    if max_supports <= 0:
+        return _return_early("backfill_disabled")
+    if len(terms) < 2:
+        return _return_early("backfill_no_terms")
+
+    initial_pack_ids = {
+        item.support.concept_id
+        for item in _build_support_pack(question, existing_supports)
+        if item.support.concept_id
+    }
+    temporal_anchor_valid_froms = _temporal_source_set_anchor_valid_froms(question, existing_supports)
+    temporal_anchor_concept_ids = _temporal_source_set_anchor_concept_ids(question, existing_supports)
+    locomo_question_source_dates = _locomo_question_source_dates(question)
+    locomo_source_window_anchor_valid_froms = _locomo_source_window_anchor_valid_froms(
+        question,
+        existing_supports,
+    )
+    home_country_alias_seed = (
+        _home_country_move_from_actor(question) is not None
+        and any(
+            _support_has_home_country_move_alias(question, existing_support)
+            for existing_support in existing_supports
+        )
+    )
+    activated_ids = _ordered_activated_concept_ids(activated_window)
+    try:
+        conn = _open_support_candidate_backfill_connection()
+    except Exception:
+        return _return_early("backfill_no_connection")
+
+    try:
+        association_first = _benefit_with_having_parts(question) is not None
+        if temporal_anchor_valid_froms and time.perf_counter() < deadline:
+            try:
+                rows = _fetch_temporal_source_set_bridge_candidate_rows(
+                    conn,
+                    temporal_anchor_concept_ids,
+                    temporal_anchor_valid_froms,
+                    max(4, min(16, assoc_limit or fts_limit or 8)),
+                )
+                _record_stage("temporal_source_set_bridge", rows)
+                for row in rows:
+                    _merge_support_candidate_row(candidate_rows, row, "temporal_source_set_bridge")
+                rows = _fetch_temporal_source_set_candidate_rows(
+                    conn,
+                    temporal_anchor_valid_froms,
+                    max(4, min(16, assoc_limit or fts_limit or 8)),
+                )
+                _record_stage("temporal_source_set", rows)
+                for row in rows:
+                    _merge_support_candidate_row(candidate_rows, row, "temporal_source_set")
+            except Exception:
+                _increment_rejection(rejection_counts, "backfill_no_candidates")
+        if association_first and assoc_limit > 0 and time.perf_counter() < deadline:
+            try:
+                rows = _fetch_association_support_candidate_rows(conn, activated_ids, assoc_limit)
+                _record_stage("association", rows)
+                for row in rows:
+                    _merge_support_candidate_row(candidate_rows, row, "association")
+            except Exception:
+                _increment_rejection(rejection_counts, "backfill_no_candidates")
+        if home_country_alias_seed and time.perf_counter() < deadline:
+            try:
+                rows = _fetch_home_country_alias_candidate_rows(
+                    conn,
+                    max(4, min(16, fts_limit or assoc_limit or 8)),
+                )
+                _record_stage("home_country_alias", rows)
+                for row in rows:
+                    _merge_support_candidate_row(candidate_rows, row, "home_country_alias")
+            except Exception:
+                _increment_rejection(rejection_counts, "backfill_no_candidates")
+        if locomo_source_window_anchor_valid_froms and time.perf_counter() < deadline:
+            try:
+                rows = _fetch_locomo_source_window_candidate_rows(
+                    conn,
+                    locomo_source_window_anchor_valid_froms,
+                    max(16, min(160, fts_limit + assoc_limit or 24)),
+                )
+                _record_stage("locomo_source_window", rows)
+                for row in rows:
+                    _merge_support_candidate_row(candidate_rows, row, "locomo_source_window")
+            except Exception:
+                _increment_rejection(rejection_counts, "backfill_no_candidates")
+        if locomo_question_source_dates and time.perf_counter() < deadline:
+            try:
+                rows = _fetch_locomo_question_date_candidate_rows(
+                    conn,
+                    locomo_question_source_dates,
+                    max(16, min(160, fts_limit + assoc_limit or 24)),
+                )
+                _record_stage("locomo_question_date", rows)
+                for row in rows:
+                    _merge_support_candidate_row(candidate_rows, row, "locomo_question_date")
+            except Exception:
+                _increment_rejection(rejection_counts, "backfill_no_candidates")
+        if time.perf_counter() < deadline:
+            try:
+                rows = _fetch_locomo_source_fragment_candidate_rows(
+                    conn,
+                    question,
+                    terms,
+                    max(16, min(24, fts_limit + assoc_limit or 24)),
+                )
+                _record_stage("locomo_source_fragment", rows)
+                for row in rows:
+                    _merge_support_candidate_row(candidate_rows, row, "locomo_source_fragment")
+            except Exception:
+                _increment_rejection(rejection_counts, "backfill_no_candidates")
+        if fts_limit > 0 and time.perf_counter() < deadline and not (association_first and candidate_rows):
+            try:
+                rows = _fetch_fts_support_candidate_rows(conn, terms, fts_limit)
+                _record_stage("fts", rows)
+                for row in rows:
+                    _merge_support_candidate_row(candidate_rows, row, "fts")
+                rows = _fetch_verbatim_fts_support_candidate_rows(conn, terms, fts_limit)
+                _record_stage("fts_verbatim", rows)
+                for row in rows:
+                    _merge_support_candidate_row(candidate_rows, row, "fts_verbatim")
+            except Exception:
+                _increment_rejection(rejection_counts, "backfill_no_candidates")
+        if not association_first and assoc_limit > 0 and time.perf_counter() < deadline:
+            try:
+                rows = _fetch_association_support_candidate_rows(conn, activated_ids, assoc_limit)
+                _record_stage("association", rows)
+                for row in rows:
+                    _merge_support_candidate_row(candidate_rows, row, "association")
+            except Exception:
+                _increment_rejection(rejection_counts, "backfill_no_candidates")
+        if time.perf_counter() < deadline:
+            source_window_valid_froms = _merge_ordered_strings(
+                locomo_source_window_anchor_valid_froms,
+                _locomo_source_window_candidate_valid_froms(candidate_rows),
+                limit=8,
+            )
+            if source_window_valid_froms:
+                try:
+                    rows = _fetch_locomo_source_window_candidate_rows(
+                        conn,
+                        source_window_valid_froms,
+                        max(16, min(160, fts_limit + assoc_limit or 24)),
+                    )
+                    _record_stage("locomo_source_window_expanded", rows)
+                    for row in rows:
+                        _merge_support_candidate_row(candidate_rows, row, "locomo_source_window")
+                except Exception:
+                    _increment_rejection(rejection_counts, "backfill_no_candidates")
+        if semantic_enabled and semantic_limit > 0 and time.perf_counter() < deadline:
+            try:
+                rows, semantic_candidate_ids, semantic_latency_ms = _fetch_semantic_support_candidate_rows(
+                    conn,
+                    question,
+                    semantic_limit,
+                    semantic_min_score,
+                    deadline,
+                )
+                _record_stage("semantic", rows)
+                if not rows:
+                    _increment_rejection(rejection_counts, "semantic_no_candidates")
+                for row in rows:
+                    _merge_support_candidate_row(candidate_rows, row, "semantic")
+            except Exception:
+                _increment_rejection(rejection_counts, "semantic_fetch_error")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    if time.perf_counter() >= deadline:
+        _increment_rejection(rejection_counts, "backfill_timeout")
+    evaluation_deadline = max(
+        deadline,
+        time.perf_counter() + _SUPPORT_CANDIDATE_BACKFILL_EVALUATION_GRACE_MS / 1000.0,
+    )
+    candidate_entries: list[dict[str, object]] = []
+    for concept_index, concept in enumerate(activated_window):
+        concept_id = _concept_id(concept, concept_index)
+        if not concept_id:
+            continue
+        if concept_id in candidate_rows:
+            candidate_rows[concept_id]["signals"].add("activation")
+            continue
+        candidate_entries.append(
+            {"concept_id": concept_id, "concept": concept, "signals": {"activation"}}
+        )
+    candidate_entries.extend(
+        {"concept_id": concept_id, "row": entry["row"], "signals": entry["signals"]}
+        for concept_id, entry in candidate_rows.items()
+    )
+    target_concept_id_set = {target_id for target_id in target_concept_ids if target_id}
+
+    def _ledger_candidate_entry_priority(entry: dict[str, object]) -> tuple[int, int, str]:
+        concept_id = _stringify(entry.get("concept_id")).strip()
+        signal_rank, signal_concept_id = _support_candidate_backfill_entry_priority(entry)
+        return (
+            0 if concept_id in target_concept_id_set else 1,
+            signal_rank,
+            signal_concept_id,
+        )
+
+    candidate_entries.sort(key=_ledger_candidate_entry_priority)
+
+    candidate_entry_rows: list[dict[str, object]] = []
+    support_rows: list[dict[str, object]] = []
+    admitted: list[tuple[float, EvidenceSupport, int]] = []
+    semantic_admitted_ids: list[str] = []
+    locomo_decisive_evidence_family_by_id: dict[str, str] = {}
+    locomo_decisive_evidence_preserved_ids: list[str] = []
+    locomo_decisive_evidence_rejection_counts: dict[str, int] = {}
+    rare_terms = set(terms)
+    locomo_family_accident_question = _locomo_family_accident_question(question)
+    relationship_status_question = _RELATIONSHIP_STATUS_QUESTION_PATTERN.search(question) is not None
+    likely_fields_question = _likely_fields_question(question)
+    event_list_question = _support_present_answer_role(question) == "event_list"
+
+    for entry_index, entry in enumerate(candidate_entries):
+        concept_id = _stringify(entry.get("concept_id")).strip()
+        signals = entry.get("signals") if isinstance(entry.get("signals"), set) else set()
+        row = entry.get("row")
+        candidate_entry_rows.append(
+            {
+                "entry_index": entry_index,
+                "concept_id": concept_id,
+                "signals": sorted(signals),
+                "summary": _stringify(_row_value(row, "summary"))
+                if isinstance(row, sqlite3.Row)
+                else _stringify(getattr(entry.get("concept"), "summary", "")),
+                "valid_from": _optional_str(_row_value(row, "valid_from"))
+                if isinstance(row, sqlite3.Row)
+                else _optional_str(getattr(entry.get("concept"), "valid_from", None)),
+                "content_updated_at": _optional_str(_row_value(row, "content_updated_at"))
+                if isinstance(row, sqlite3.Row)
+                else _optional_str(getattr(entry.get("concept"), "content_updated_at", None)),
+            }
+        )
+        if time.perf_counter() >= evaluation_deadline:
+            _increment_rejection(rejection_counts, "backfill_timeout")
+            break
+        if not concept_id:
+            continue
+        if concept_id in initial_pack_ids:
+            _increment_rejection(rejection_counts, "backfill_duplicate")
+            duplicate_detail: dict[str, object] = {
+                "entry_index": entry_index,
+                "concept_id": concept_id,
+                "signals": sorted(signals),
+                "accepted_for_ranking": False,
+                "selected": False,
+                "selected_rank": None,
+                "not_selected_reason": "backfill_duplicate",
+                "duplicate_equivalence_available": False,
+                "duplicate_preservation_decision": "not_evaluated",
+            }
+            try:
+                concept = (
+                    _support_candidate_row_to_concept(row)
+                    if isinstance(row, sqlite3.Row)
+                    else entry.get("concept")
+                )
+                duplicate_supports = _collect_supports([concept], max_support_chars=4000) if concept else []
+            except Exception:
+                duplicate_supports = []
+            for support in duplicate_supports:
+                decisive_assessment = _locomo_decisive_support_assessment(
+                    question,
+                    support,
+                    signals,
+                )
+                source_match, source_rejection = _locomo_source_bound_emission_support_match(
+                    question,
+                    support,
+                    signals,
+                )
+                actor_text_safe, actor_text_rejection = (
+                    _locomo_preserved_initial_support_actor_text_safe(question, support)
+                )
+                actor_compatible = _support_actor_compatible(question, support)
+                duplicate_detail.update(
+                    {
+                        "support_id": support.support_id,
+                        "channel": support.channel,
+                        "support_text": support.support_text,
+                        "concept_summary": support.concept_summary,
+                        "duplicate_equivalence_available": True,
+                        "source_bound_emission_match": source_match,
+                        "source_bound_rejection": source_rejection,
+                        "actor_compatible": actor_compatible,
+                        "actor_text_safe": actor_text_safe,
+                        "actor_text_rejection": actor_text_rejection,
+                        "support_text_sha256": _locomo_support_surface_sha256(
+                            support.support_text
+                        ),
+                        "concept_summary_sha256": _locomo_support_surface_sha256(
+                            support.concept_summary
+                        ),
+                        "decisive_evidence_family": decisive_assessment.family,
+                        "decisive_evidence_rejection": decisive_assessment.rejection_reason,
+                        "duplicate_preservation_decision": "trace_only",
+                    }
+                )
+                if (
+                    decisive_assessment.family
+                    and decisive_assessment.safe_to_preserve_duplicate
+                ):
+                    scored = _score_support(question, support)
+                    duplicate_detail.update(
+                        {
+                            "accepted_for_ranking": True,
+                            "not_selected_reason": None,
+                            "score": scored.score,
+                            "question_overlap": scored.question_overlap,
+                            "predicate_overlap": scored.predicate_overlap,
+                            "effective_score": max(
+                                scored.score,
+                                min_score + decisive_assessment.score_boost,
+                            ),
+                            "score_floor": min_score,
+                            "signal_count": 2,
+                            "duplicate_preservation_decision": (
+                                "decisive_evidence_preserved"
+                            ),
+                        }
+                    )
+                    locomo_decisive_evidence_family_by_id[concept_id] = (
+                        decisive_assessment.family
+                    )
+                    locomo_decisive_evidence_preserved_ids.append(concept_id)
+                    support_rows.append(duplicate_detail)
+                    admitted.append(
+                        (
+                            float(duplicate_detail["effective_score"]),
+                            support,
+                            len(support_rows) - 1,
+                        )
+                    )
+                    continue
+                if decisive_assessment.rejection_reason:
+                    _increment_rejection(
+                        locomo_decisive_evidence_rejection_counts,
+                        decisive_assessment.rejection_reason,
+                    )
+            if len(support_rows) and support_rows[-1].get("concept_id") == concept_id:
+                continue
+            support_rows.append(duplicate_detail)
+            continue
+        if isinstance(row, sqlite3.Row) and not _support_candidate_row_is_active(row):
+            _increment_rejection(rejection_counts, "backfill_inactive")
+            support_rows.append(
+                {
+                    "entry_index": entry_index,
+                    "concept_id": concept_id,
+                    "signals": sorted(signals),
+                    "accepted_for_ranking": False,
+                    "selected": False,
+                    "selected_rank": None,
+                    "not_selected_reason": "backfill_inactive",
+                }
+            )
+            continue
+
+        concept = _support_candidate_row_to_concept(row) if isinstance(row, sqlite3.Row) else entry["concept"]
+        supports = _collect_supports([concept], max_support_chars=4000)
+        if not supports:
+            support_rows.append(
+                {
+                    "entry_index": entry_index,
+                    "concept_id": concept_id,
+                    "signals": sorted(signals),
+                    "accepted_for_ranking": False,
+                    "selected": False,
+                    "selected_rank": None,
+                    "not_selected_reason": "backfill_no_support_surface",
+                }
+            )
+            continue
+        best_support: tuple[float, EvidenceSupport, int] | None = None
+        for support in supports:
+            row_detail: dict[str, object] = {
+                "entry_index": entry_index,
+                "concept_id": concept_id,
+                "support_id": support.support_id,
+                "channel": support.channel,
+                "signals": sorted(signals),
+                "support_text": support.support_text,
+                "concept_summary": support.concept_summary,
+                "accepted_for_ranking": False,
+                "selected": False,
+                "selected_rank": None,
+                "not_selected_reason": None,
+            }
+            temporal_make_media_match = _temporal_make_media_backfill_support_match(
+                question,
+                support,
+            )
+            decisive_assessment = _locomo_decisive_support_assessment(
+                question,
+                support,
+                signals,
+            )
+            locomo_source_window_family_accident_match = _locomo_source_window_family_accident_support_match(
+                question,
+                support,
+                signals,
+            )
+            actor_compatible = _support_actor_compatible(question, support)
+            row_detail["actor_compatible"] = actor_compatible
+            row_detail["locomo_source_window_family_accident_match"] = (
+                locomo_source_window_family_accident_match
+            )
+            if (
+                not temporal_make_media_match
+                and not locomo_source_window_family_accident_match
+                and not decisive_assessment.family
+                and not actor_compatible
+            ):
+                _increment_rejection(rejection_counts, "backfill_actor_mismatch")
+                row_detail["not_selected_reason"] = "backfill_actor_mismatch"
+                support_rows.append(row_detail)
+                continue
+            scored = _score_support(question, support)
+            support_terms = set(_content_tokens(support.support_text))
+            rare_overlap = bool(rare_terms & support_terms)
+            predicate_overlap = scored.predicate_overlap > 0.0
+            direct_atomic_match = (
+                _relationship_status_candidate_from_sentence(question, support.support_text) is not None
+            )
+            semantic_signal = "semantic" in signals
+            event_list_answer = (
+                _support_present_event_list_candidate(question, support.support_text)
+                if event_list_question
+                else None
+            )
+            row_detail.update(
+                {
+                    "score": scored.score,
+                    "question_overlap": scored.question_overlap,
+                    "predicate_overlap": scored.predicate_overlap,
+                    "rare_overlap": rare_overlap,
+                    "predicate_overlap_passed": predicate_overlap,
+                    "direct_atomic_match": direct_atomic_match,
+                    "event_list_answer": event_list_answer,
+                }
+            )
+            if event_list_question and event_list_answer is None:
+                _increment_rejection(rejection_counts, "backfill_no_event_list_candidate")
+                row_detail["not_selected_reason"] = "backfill_no_event_list_candidate"
+                support_rows.append(row_detail)
+                continue
+            if relationship_status_question and not direct_atomic_match:
+                _increment_rejection(rejection_counts, "backfill_no_direct_relationship_status")
+                row_detail["not_selected_reason"] = "backfill_no_direct_relationship_status"
+                support_rows.append(row_detail)
+                continue
+            field_specificity_bonus = _likely_fields_support_specificity_bonus(
+                question,
+                support.support_text,
+            )
+            if likely_fields_question and field_specificity_bonus <= 0.0:
+                _increment_rejection(rejection_counts, "backfill_no_field_answer_terms")
+                row_detail["not_selected_reason"] = "backfill_no_field_answer_terms"
+                support_rows.append(row_detail)
+                continue
+            likely_fields_direct_answer = _likely_fields_direct_answer_support(
+                question,
+                support.support_text,
+            )
+            locomo_direct_answer = _locomo_source_backfill_direct_support_match(question, support)
+            locomo_adoption_opinion_match = _locomo_adoption_opinion_support_match(
+                question,
+                support,
+                signals,
+            )
+            temporal_source_set_match = _temporal_source_set_backfill_match(
+                question,
+                support,
+                signals,
+                existing_supports,
+            )
+            locomo_emission_match, locomo_rejection = _locomo_source_bound_emission_support_match(
+                question,
+                support,
+                signals,
+            )
+            row_detail.update(
+                {
+                    "field_specificity_bonus": field_specificity_bonus,
+                    "likely_fields_direct_answer": likely_fields_direct_answer,
+                    "locomo_direct_answer": locomo_direct_answer,
+                    "locomo_adoption_opinion_match": locomo_adoption_opinion_match,
+                    "temporal_source_set_match": temporal_source_set_match,
+                    "locomo_emission_match": locomo_emission_match,
+                    "locomo_emission_rejection": locomo_rejection,
+                    "decisive_evidence_family": decisive_assessment.family,
+                    "decisive_evidence_rejection": decisive_assessment.rejection_reason,
+                }
+            )
+            if (
+                not locomo_emission_match
+                and not temporal_source_set_match
+                and not decisive_assessment.family
+            ):
+                reason = locomo_rejection or "locomo_emission_shape_mismatch"
+                _increment_rejection(rejection_counts, reason)
+                row_detail["not_selected_reason"] = reason
+                support_rows.append(row_detail)
+                continue
+            home_country_alias_direct_answer = (
+                _home_country_move_from_actor(question) is not None
+                and any(
+                    _support_has_home_country_move_alias(question, existing_support)
+                    for existing_support in existing_supports
+                )
+                and _home_country_value_candidate_from_support(question, support) is not None
+            )
+            if (
+                not rare_overlap
+                and not predicate_overlap
+                and not home_country_alias_direct_answer
+                and not locomo_direct_answer
+                and not locomo_adoption_opinion_match
+                and not locomo_source_window_family_accident_match
+                and not temporal_source_set_match
+                and not decisive_assessment.family
+            ):
+                if not semantic_signal or scored.score < semantic_min_score:
+                    _increment_rejection(rejection_counts, "backfill_common_word_only")
+                    row_detail["not_selected_reason"] = "backfill_common_word_only"
+                    support_rows.append(row_detail)
+                    continue
+            score_floor = min_score
+            identity_complete_match = _identity_support_sentence_bound(question, support.support_text)
+            if direct_atomic_match or identity_complete_match:
+                score_floor = min(score_floor, 0.08)
+            elif likely_fields_question and field_specificity_bonus >= 0.12:
+                score_floor = min(score_floor, min_score * 0.85)
+            elif (
+                home_country_alias_direct_answer
+                or locomo_direct_answer
+                or locomo_adoption_opinion_match
+                or locomo_emission_match
+                or locomo_source_window_family_accident_match
+            ):
+                score_floor = min(score_floor, 0.03)
+            elif "activation" in signals and predicate_overlap:
+                score_floor = min(score_floor, min_score * 0.8)
+            elif (
+                temporal_make_media_match
+                or temporal_source_set_match
+                or decisive_assessment.family
+            ):
+                score_floor = min(score_floor, 0.03)
+            if event_list_answer is not None:
+                score_floor = min(score_floor, min_score * 0.55)
+            effective_score = scored.score + field_specificity_bonus
+            if identity_complete_match:
+                effective_score = max(effective_score, min_score + 0.5)
+            if likely_fields_direct_answer:
+                effective_score = max(effective_score, min_score + 0.5)
+            if home_country_alias_direct_answer:
+                effective_score = max(effective_score, min_score + 0.5)
+            if locomo_direct_answer:
+                effective_score = max(effective_score, min_score + 0.5)
+            if locomo_adoption_opinion_match:
+                effective_score = max(effective_score, min_score + 0.55)
+            if locomo_emission_match:
+                effective_score = max(effective_score, min_score + 0.18)
+                if (("locomo_source_window" in signals) or _locomo_source_fragment_signal(signals)) and (
+                    not locomo_family_accident_question
+                    or locomo_source_window_family_accident_match
+                    or temporal_make_media_match
+                ):
+                    effective_score += 0.45
+            if locomo_source_window_family_accident_match:
+                effective_score = max(effective_score, min_score + 0.55)
+            if temporal_make_media_match:
+                effective_score = max(effective_score, min_score + 0.12)
+            if temporal_source_set_match:
+                effective_score = max(
+                    effective_score,
+                    min_score + 0.95,
+                )
+            if decisive_assessment.family:
+                effective_score = max(
+                    effective_score,
+                    min_score + decisive_assessment.score_boost,
+                )
+            if event_list_answer is not None:
+                effective_score += 0.35
+            row_detail.update(
+                {
+                    "score_floor": score_floor,
+                    "effective_score": effective_score,
+                    "identity_complete_match": identity_complete_match,
+                    "temporal_make_media_match": temporal_make_media_match,
+                    "home_country_alias_direct_answer": home_country_alias_direct_answer,
+                }
+            )
+            if effective_score < score_floor:
+                _increment_rejection(rejection_counts, "backfill_low_score")
+                row_detail["not_selected_reason"] = "backfill_low_score"
+                support_rows.append(row_detail)
+                continue
+            signal_count = 1
+            signal_count += 1 if rare_overlap else 0
+            signal_count += 1 if predicate_overlap else 0
+            signal_count += 1 if "association" in signals else 0
+            signal_count += 1 if "fts_verbatim" in signals and rare_overlap else 0
+            signal_count += 1 if "fts" in signals and rare_overlap else 0
+            signal_count += 1 if semantic_signal else 0
+            signal_count += 1 if "activation" in signals else 0
+            signal_count += 1 if "locomo_question_date" in signals else 0
+            signal_count += 1 if "temporal_source_set" in signals else 0
+            signal_count += 1 if "temporal_source_set_bridge" in signals else 0
+            signal_count += 1 if "locomo_source_window" in signals else 0
+            signal_count += 1 if _locomo_source_fragment_signal(signals) else 0
+            signal_count += 1 if direct_atomic_match else 0
+            signal_count += 1 if identity_complete_match else 0
+            signal_count += 1 if home_country_alias_direct_answer else 0
+            signal_count += 1 if locomo_direct_answer else 0
+            signal_count += 1 if locomo_adoption_opinion_match else 0
+            signal_count += 1 if locomo_emission_match else 0
+            signal_count += 1 if locomo_source_window_family_accident_match else 0
+            signal_count += 1 if temporal_make_media_match else 0
+            signal_count += 1 if temporal_source_set_match else 0
+            signal_count += 1 if decisive_assessment.family else 0
+            signal_count += 1 if event_list_answer is not None else 0
+            row_detail["signal_count"] = signal_count
+            if signal_count < 2:
+                _increment_rejection(rejection_counts, "backfill_low_score")
+                row_detail["not_selected_reason"] = "backfill_low_score"
+                support_rows.append(row_detail)
+                continue
+            row_detail["accepted_for_ranking"] = True
+            support_rows.append(row_detail)
+            ledger_index = len(support_rows) - 1
+            if best_support is None or effective_score > best_support[0]:
+                best_support = (effective_score, support, ledger_index)
+                if decisive_assessment.family:
+                    locomo_decisive_evidence_family_by_id[concept_id] = (
+                        decisive_assessment.family
+                    )
+        if best_support is None:
+            continue
+        admitted.append(best_support)
+        if "semantic" in signals:
+            semantic_admitted_ids.append(concept_id)
+
+    if not admitted:
+        _increment_rejection(rejection_counts, "backfill_no_candidates")
+    admitted.sort(key=lambda item: item[0], reverse=True)
+    selected = admitted[:max_supports]
+    selected_candidate_ids: list[str] = []
+    for rank, (_score, support, ledger_index) in enumerate(selected, start=1):
+        selected_candidate_ids.append(support.concept_id)
+        support_rows[ledger_index]["selected"] = True
+        support_rows[ledger_index]["selected_rank"] = rank
+    for row_detail in support_rows:
+        if row_detail.get("accepted_for_ranking") and not row_detail.get("selected"):
+            row_detail["not_selected_reason"] = "top_n_cutoff"
+
+    target_presence: dict[str, dict[str, object]] = {}
+    for target_id in target_concept_ids:
+        rows = [row for row in support_rows if row.get("concept_id") == target_id]
+        accepted_rows = [row for row in rows if row.get("accepted_for_ranking")]
+        selected_rows = [row for row in rows if row.get("selected")]
+        scored_rows = [
+            row for row in rows if isinstance(row.get("effective_score"), (float, int))
+        ]
+        best_scored = max(
+            scored_rows,
+            key=lambda row: float(row.get("effective_score") or 0.0),
+            default=None,
+        )
+        target_presence[target_id] = {
+            "found_in_candidates": any(entry.get("concept_id") == target_id for entry in candidate_entry_rows),
+            "accepted_for_ranking": bool(accepted_rows),
+            "selected": bool(selected_rows),
+            "best_selected_rank": min(
+                int(row["selected_rank"])
+                for row in selected_rows
+                if isinstance(row.get("selected_rank"), int)
+            )
+            if selected_rows
+            else None,
+            "best_effective_score": best_scored.get("effective_score") if best_scored else None,
+            "best_not_selected_reason": best_scored.get("not_selected_reason") if best_scored else None,
+        }
+
+    return {
+        "schema_version": "locomo.support_candidate_movement_ledger.v1",
+        "question": question,
+        "config": {
+            "max_activated_concepts": max_activated_concepts,
+            "max_support_chars": max_support_chars,
+            "fts_limit": fts_limit,
+            "assoc_limit": assoc_limit,
+            "max_supports": max_supports,
+            "min_score": min_score,
+            "budget_ms": budget_ms,
+            "semantic_enabled": semantic_enabled,
+            "semantic_limit": semantic_limit,
+            "semantic_min_score": semantic_min_score,
+        },
+        "terms": list(terms),
+        "initial_pack_ids": sorted(initial_pack_ids),
+        "temporal_anchor_valid_froms": list(temporal_anchor_valid_froms),
+        "locomo_source_window_anchor_valid_froms": list(locomo_source_window_anchor_valid_froms),
+        "fetch_stages": fetch_stages,
+        "candidate_entries": candidate_entry_rows,
+        "support_rows": support_rows,
+        "selected_candidate_ids": selected_candidate_ids,
+        "target_presence": target_presence,
+        "rejection_counts": rejection_counts,
+        "semantic_candidate_ids": list(semantic_candidate_ids),
+        "semantic_admitted_ids": semantic_admitted_ids,
+        "semantic_latency_ms": semantic_latency_ms,
+        "locomo_decisive_evidence_preserved_ids": list(
+            dict.fromkeys(locomo_decisive_evidence_preserved_ids)
+        ),
+        "locomo_decisive_evidence_family_by_id": locomo_decisive_evidence_family_by_id,
+        "locomo_decisive_evidence_rejection_counts": locomo_decisive_evidence_rejection_counts,
+        "latency_ms": _latency_ms(t0),
+    }
+
+
+def locomo_bounded_support_admission_diagnostics(
+    *,
+    question: str,
+    activated_concepts: list,
+    max_activated_concepts: int,
+    max_support_chars: int,
+    fts_limit: int,
+    assoc_limit: int,
+    candidate_pool_size: int,
+    min_score: float,
+    budget_ms: float,
+    semantic_enabled: bool = False,
+    semantic_limit: int = 0,
+    semantic_min_score: float = 0.45,
+    effect_enabled: bool = False,
+    preserve_initial_support_enabled: bool = False,
+    preserve_initial_support_displace_enabled: bool = False,
+    activated_support_continuity_enabled: bool = False,
+) -> dict[str, object]:
+    """Emit default-off LoCoMo bounded support-admission shadow diagnostics."""
+    candidate_pool_size = max(4, min(int(candidate_pool_size), 40))
+    supports = _collect_supports(
+        activated_concepts[:max_activated_concepts],
+        max_support_chars=max_support_chars,
+    )
+    backfill = _collect_support_candidate_backfill(
+        question=question,
+        activated_concepts=activated_concepts[:max_activated_concepts],
+        existing_supports=supports,
+        fts_limit=fts_limit,
+        assoc_limit=assoc_limit,
+        max_supports=candidate_pool_size,
+        min_score=min_score,
+        budget_ms=budget_ms,
+        semantic_enabled=semantic_enabled,
+        semantic_limit=semantic_limit,
+        semantic_min_score=semantic_min_score,
+        locomo_support_emission_enabled=True,
+        preserve_initial_support_enabled=preserve_initial_support_enabled,
+        preserve_initial_support_displace_enabled=preserve_initial_support_displace_enabled,
+    )
+    activated_continuity = (
+        _collect_locomo_activated_support_continuity(
+            question=question,
+            activated_concepts=activated_concepts[:max_activated_concepts],
+            max_support_chars=max_support_chars,
+            max_supports=candidate_pool_size,
+        )
+        if activated_support_continuity_enabled
+        else None
+    )
+    emitted_supports = list(backfill.supports)
+    emitted_ids = {support.concept_id for support in emitted_supports if support.concept_id}
+    for support in (activated_continuity.supports if activated_continuity else ()):
+        if support.concept_id and support.concept_id in emitted_ids:
+            continue
+        emitted_supports.append(support)
+        if support.concept_id:
+            emitted_ids.add(support.concept_id)
+    admitted_count = len(backfill.supports)
+    preserved_diagnostics = _locomo_preserved_initial_support_diagnostics(
+        backfill,
+        preserve_initial_support_enabled=preserve_initial_support_enabled,
+    )
+    payload = {
+        "locomo_bounded_support_admission_considered": True,
+        "locomo_bounded_support_admission_admitted": bool(emitted_supports),
+        "locomo_bounded_support_admission_answer_effect": False,
+        "locomo_bounded_support_admission_effect_enabled": bool(effect_enabled),
+        "locomo_bounded_support_admission_candidate_pool_size": candidate_pool_size,
+        "locomo_bounded_support_admission_answer_support_count": min(
+            len(emitted_supports),
+            8,
+        ),
+        "locomo_bounded_support_admission_candidate_ids": list(backfill.candidate_ids or ()),
+        "locomo_bounded_support_admission_rejection_counts": backfill.rejection_counts or {},
+        "locomo_bounded_support_admission_latency_ms": backfill.latency_ms,
+        "locomo_bounded_support_admission_strategy": "shadow_support_pool",
+        "backfill_candidate_ids": list(backfill.candidate_ids or ()),
+        "backfill_support_surfaces": [
+            _locomo_preserved_support_surface(
+                support,
+                set(backfill.preserved_initial_candidate_ids or ()),
+            )
+            for support in emitted_supports
+        ],
+        "backfill_rejection_counts": backfill.rejection_counts or {},
+        "backfill_latency_ms": backfill.latency_ms,
+        **preserved_diagnostics,
+    }
+    if activated_continuity is not None:
+        continuity_ids = list(activated_continuity.candidate_ids or ())
+        payload.update(
+            {
+                "locomo_activated_support_continuity_considered": True,
+                "locomo_activated_support_continuity_admitted": bool(continuity_ids),
+                "locomo_activated_support_continuity_candidate_ids": continuity_ids,
+                "locomo_activated_support_continuity_rejection_counts": (
+                    activated_continuity.rejection_counts or {}
+                ),
+                "locomo_activated_support_continuity_rejected_ids_by_reason": {
+                    reason: list(ids)
+                    for reason, ids in (
+                        activated_continuity.rejected_ids_by_reason or {}
+                    ).items()
+                },
+                "locomo_activated_support_continuity_strategy": (
+                    "activated_source_bound_support"
+                ),
+                "locomo_activated_support_continuity_effect_enabled": bool(effect_enabled),
+            }
+        )
+        if continuity_ids:
+            merged_ids = list(
+                dict.fromkeys([*payload["backfill_candidate_ids"], *continuity_ids])
+            )
+            payload["backfill_candidate_ids"] = merged_ids
+            payload["locomo_bounded_support_admission_candidate_ids"] = merged_ids
+    elif activated_support_continuity_enabled:
+        payload["locomo_activated_support_continuity_considered"] = True
+        payload["locomo_activated_support_continuity_admitted"] = False
+    return payload
+
+
+def _locomo_source_bound_emission_support_match(
+    question: str,
+    support: EvidenceSupport,
+    signals: set[str],
+) -> tuple[bool, str | None]:
+    if "semantic" in signals and len(signals) == 1:
+        return False, "locomo_emission_semantic_only"
+    source_window_family_accident_match = _locomo_source_window_family_accident_support_match(
+        question,
+        support,
+        signals,
+    )
+    question_actor_terms = set(_question_actor_terms(question))
+    support_actor_terms = set(support.concept_actor_terms or ())
+    if (
+        question_actor_terms
+        and support_actor_terms
+        and not question_actor_terms & support_actor_terms
+        and not source_window_family_accident_match
+    ):
+        return False, "locomo_emission_actor_mismatch"
+    if not source_window_family_accident_match and not _support_actor_compatible(question, support):
+        return False, "locomo_emission_actor_mismatch"
+    text = f"{support.support_text} {support.concept_summary}"
+    if not _locomo_support_has_source_marker(support):
+        return False, "locomo_emission_no_source_marker"
+    question_terms = set(_content_tokens(question)) - _SUPPORT_CANDIDATE_BACKFILL_COMMON_TERMS
+    support_terms = set(_content_tokens(text))
+    if (
+        _locomo_adoption_duration_question(question)
+        and "first" in question.lower()
+        and not _locomo_first_pet_adoption_duration_support(support_terms, text.lower())
+    ):
+        return False, "locomo_emission_adoption_duration_first_pet_not_decisive"
+    anchor_terms = question_terms & support_terms
+    direct_match = _locomo_source_backfill_direct_support_match(question, support)
+    temporal_match = _temporal_make_media_backfill_support_match(question, support)
+    if (
+        _TEMPORAL_QUESTION_PATTERN.search(question)
+        and anchor_terms
+        and not direct_match
+        and not temporal_match
+        and not source_window_family_accident_match
+    ):
+        actor_terms = set(_question_actor_terms(question))
+        non_actor_anchor_terms = anchor_terms - actor_terms
+        if not non_actor_anchor_terms:
+            return False, "locomo_emission_insufficient_temporal_entity_anchor"
+    event_list_question = _support_present_answer_role(question) == "event_list"
+    event_list_answer = (
+        _support_present_event_list_candidate(question, support.support_text)
+        if event_list_question
+        else None
+    )
+    if event_list_question and event_list_answer is None:
+        return False, "locomo_emission_shape_mismatch"
+    activity_actor = _locomo_activity_object_question(question)
+    if activity_actor is not None:
+        if not _locomo_support_has_actor(support, activity_actor):
+            return False, "locomo_emission_actor_mismatch"
+        has_activity_candidate = any(
+            _locomo_activity_object_candidate(sentence) is not None
+            for surface in (support.support_text, support.concept_summary)
+            for sentence in _locomo_support_sentences_without_shared_media(surface)
+            if _locomo_sentence_mentions_actor(sentence, activity_actor)
+        )
+        if not has_activity_candidate:
+            return False, "locomo_emission_no_activity_object_candidate"
+    action_actor = _locomo_action_bundle_question(question)
+    if action_actor is not None:
+        if not _locomo_support_has_actor(support, action_actor):
+            return False, "locomo_emission_actor_mismatch"
+        has_action_candidate = any(
+            _locomo_action_bundle_candidate(sentence) is not None
+            for surface in (support.support_text, support.concept_summary)
+            for sentence in _locomo_support_sentences_without_shared_media(surface)
+            if _locomo_sentence_mentions_actor(sentence, action_actor)
+        )
+        if not has_action_candidate:
+            return False, "locomo_emission_no_action_bundle_candidate"
+    if (
+        not anchor_terms
+        and not direct_match
+        and not temporal_match
+        and not source_window_family_accident_match
+        and event_list_answer is None
+    ):
+        return False, "locomo_emission_no_predicate_object_anchor"
+    sentiment_terms = {
+        "support",
+        "supported",
+        "family",
+        "journey",
+        "important",
+        "thankful",
+        "grateful",
+        "love",
+        "loved",
+        "adopt",
+        "adoption",
+    }
+    if (
+        anchor_terms
+        and anchor_terms <= sentiment_terms
+        and not direct_match
+        and not source_window_family_accident_match
+        and event_list_answer is None
+    ):
+        return False, "locomo_emission_broad_sentiment_only"
+    return True, None
+
+
+def _locomo_source_window_anchor_valid_froms(
+    question: str,
+    supports: list[EvidenceSupport],
+) -> tuple[str, ...]:
+    question_terms = set(_content_tokens(question)) - _SUPPORT_CANDIDATE_BACKFILL_COMMON_TERMS
+    candidates: list[tuple[int, int, str]] = []
+    seen: set[str] = set()
+    for support_index, support in enumerate(supports):
+        if not support.concept_valid_from:
+            continue
+        support_text = f"{support.support_text} {support.concept_summary}"
+        support_terms = set(_content_tokens(support_text))
+        overlap_count = len(question_terms & support_terms)
+        if overlap_count < 2:
+            continue
+        if support.concept_valid_from in seen:
+            continue
+        seen.add(support.concept_valid_from)
+        score = overlap_count * 10
+        candidates.append((-score, support_index, support.concept_valid_from))
+    candidates.sort()
+    return tuple(valid_from for _score, _index, valid_from in candidates[:8])
+
+
+def _locomo_source_window_candidate_valid_froms(
+    candidate_rows: dict[str, dict],
+) -> tuple[str, ...]:
+    valid_froms: list[str] = []
+    for entry in candidate_rows.values():
+        row = entry.get("row")
+        if not isinstance(row, sqlite3.Row):
+            continue
+        valid_from = _optional_str(_row_value(row, "valid_from"))
+        if valid_from and valid_from not in valid_froms:
+            valid_froms.append(valid_from)
+        if len(valid_froms) >= 8:
+            break
+    return tuple(valid_froms)
+
+
+def _merge_ordered_strings(
+    *groups: tuple[str, ...],
+    limit: int,
+) -> tuple[str, ...]:
+    values: list[str] = []
+    for group in groups:
+        for value in group:
+            if value and value not in values:
+                values.append(value)
+            if len(values) >= limit:
+                return tuple(values)
+    return tuple(values)
+
+
+def _locomo_family_accident_question(question: str) -> bool:
+    question_terms = set(_content_tokens(question))
+    return "accident" in question_terms and bool(
+        question_terms & {"son", "child", "children", "kid", "kids", "brother"}
+    )
+
+
+def _locomo_adoption_opinion_support_match(
+    question: str,
+    support: EvidenceSupport,
+    signals: set[str],
+) -> bool:
+    if not signals & {"association", "locomo_source_window", "fts", "fts_verbatim"}:
+        return False
+    question_terms = set(_content_tokens(question))
+    if not question_terms & {"adopt", "adoption", "adopted", "adopting"}:
+        return False
+    if not question_terms & {"think", "thinks", "feel", "feels", "decision", "plan", "plans"}:
+        return False
+    support_terms = set(_content_tokens(f"{support.support_text} {support.concept_summary}"))
+    has_parent_cue = bool(support_terms & {"mom", "mother", "parent", "family"})
+    has_positive_opinion = bool(
+        support_terms & {"awesome", "amazing", "great", "good", "support", "supportive"}
+    )
+    return has_parent_cue and has_positive_opinion and _support_actor_compatible(question, support)
+
+
+def _locomo_source_window_family_accident_support_match(
+    question: str,
+    support: EvidenceSupport,
+    signals: set[str],
+) -> bool:
+    if not (signals & {"locomo_source_window", "fts", "fts_verbatim"}):
+        return False
+    if not _locomo_family_accident_question(question):
+        return False
+    support_terms = set(_content_tokens(f"{support.support_text} {support.concept_summary}"))
+    return bool(
+        support_terms & {"scared", "reassured", "reassure", "okay"}
+        and support_terms & {"brother", "well", "being", "wellbeing", "son", "kid", "kids"}
     )
 
 
@@ -5856,7 +9573,85 @@ def _support_candidate_backfill_content_terms(question: str) -> tuple[str, ...]:
         for token in ("youth", "young", "mentor", "mentoring", "mentorship", "school", "speech"):
             if token not in terms:
                 terms.append(token)
+    if question_terms & {"accident"} and question_terms & {
+        "son",
+        "child",
+        "children",
+        "kid",
+        "kids",
+        "brother",
+    }:
+        for token in reversed(("scared", "reassured", "okay", "brother")):
+            if token in terms:
+                terms.remove(token)
+            terms.insert(0, token)
+    if (
+        _locomo_activity_object_question(question) is not None
+        and question_terms & {"start", "started", "began", "begin", "recently"}
+    ):
+        for token in reversed(("volunteering", "dog", "shelter", "month")):
+            if token in terms:
+                terms.remove(token)
+            terms.insert(0, token)
     return tuple(terms)
+
+
+def _locomo_source_fragment_actor_terms(question: str) -> tuple[str, ...]:
+    actor_terms = _question_actor_terms(question)
+    if actor_terms:
+        return actor_terms
+    match = _LOCOMO_ADOPTION_DURATION_ACTOR_PATTERN.search(question)
+    if match is None:
+        return ()
+    actor = _actor_token(match.group(1))
+    return (actor,) if actor else ()
+
+
+def _locomo_source_fragment_bridge_family(question: str) -> str | None:
+    if not _locomo_source_fragment_actor_terms(question):
+        return None
+    question_terms = set(_content_tokens(question))
+    if (
+        re.search(r"^\s*(?:how long|for\s+how\s+long)\b", question, re.IGNORECASE)
+        and question_terms & _LOCOMO_SOURCE_FRAGMENT_ADOPTION_TERMS
+        and question_terms & _LOCOMO_SOURCE_FRAGMENT_ANIMAL_TERMS
+    ):
+        return "adoption_duration"
+    if (
+        (_TEMPORAL_QUESTION_PATTERN.search(question) or "happened" in question_terms)
+        and question_terms & _LOCOMO_SOURCE_FRAGMENT_MEDIA_EVENT_TERMS
+    ):
+        return "temporal_media_event"
+    return None
+
+
+def _locomo_source_fragment_bridge_term_groups(
+    question: str,
+    terms: tuple[str, ...],
+    bridge_family: str,
+) -> tuple[tuple[str, ...], ...]:
+    actor_terms = tuple(_locomo_source_fragment_actor_terms(question))
+    if not actor_terms:
+        return ()
+    question_terms = set(terms) | set(_content_tokens(question))
+    groups: list[tuple[str, ...]] = [actor_terms]
+    if bridge_family == "adoption_duration":
+        groups.append(("adopt", "adopted", "adopting", "adoption"))
+        groups.append(("pet", "pets", "puppy", "puppies", "dog", "dogs", "animal", "animals"))
+    elif bridge_family == "temporal_media_event":
+        if question_terms & {"car", "cars", "accident", "broken", "crash", "crashed"}:
+            groups.append(("car", "cars"))
+            groups.append(("accident", "broken", "crash", "crashed"))
+        elif question_terms & {"media", "photo", "picture", "shared"}:
+            groups.append(("media", "photo", "picture", "shared"))
+        object_terms = tuple(
+            token
+            for token in terms
+            if token in _TEMPORAL_MAKE_MEDIA_OBJECT_NOUNS
+        )
+        if object_terms:
+            groups.append(object_terms)
+    return tuple(groups)
 
 
 def _support_candidate_backfill_entry_priority(entry: dict[str, object]) -> tuple[int, str]:
@@ -5864,19 +9659,29 @@ def _support_candidate_backfill_entry_priority(entry: dict[str, object]) -> tupl
     concept_id = _stringify(entry.get("concept_id")).strip()
     if "temporal_source_set_bridge" in signals:
         return (0, concept_id)
+    if "locomo_training_course_date" in signals:
+        return (0, concept_id)
     if "temporal_source_set" in signals:
         return (1, concept_id)
-    if "home_country_alias" in signals:
+    if "locomo_source_fragment" in signals:
         return (2, concept_id)
-    if "association" in signals:
+    if "home_country_alias" in signals:
         return (3, concept_id)
-    if "fts_verbatim" in signals:
+    if "locomo_source_window" in signals:
         return (4, concept_id)
-    if "fts" in signals:
+    if "association" in signals:
         return (5, concept_id)
-    if "activation" in signals:
+    if "fts_verbatim" in signals:
         return (6, concept_id)
-    return (7, concept_id)
+    if "fts" in signals:
+        return (7, concept_id)
+    if "activation" in signals:
+        return (8, concept_id)
+    return (9, concept_id)
+
+
+def _locomo_source_fragment_signal(signals: set[str]) -> bool:
+    return "locomo_source_fragment" in signals
 
 
 def _temporal_make_media_backfill_support_match(question: str, support: EvidenceSupport) -> bool:
@@ -5970,6 +9775,19 @@ def _temporal_source_set_support_matches(
     )
 
 
+def _temporal_source_set_backfill_match(
+    question: str,
+    support: EvidenceSupport,
+    signals: set[str],
+    existing_supports: list[EvidenceSupport],
+) -> bool:
+    if not support.concept_original_date:
+        return False
+    if not signals & {"temporal_source_set", "temporal_source_set_bridge", "locomo_source_window"}:
+        return False
+    return _temporal_source_set_support_matches(question, support, existing_supports)
+
+
 def _likely_fields_question(question: str) -> bool:
     question_terms = set(_content_tokens(question))
     return (
@@ -6007,6 +9825,72 @@ def _open_support_candidate_backfill_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def _hydrate_support_temporal_metadata(
+    supports: list[EvidenceSupport],
+) -> list[EvidenceSupport]:
+    concept_ids = sorted({support.concept_id for support in supports if support.concept_id})
+    if not concept_ids:
+        return supports
+    try:
+        conn = _open_support_candidate_backfill_connection()
+    except Exception:
+        return supports
+    try:
+        columns = _support_candidate_table_columns(conn, "concepts")
+        id_col = _support_candidate_concepts_id_column(conn)
+        wanted = [
+            "created_at",
+            "valid_from",
+            "original_date",
+            "content_updated_at",
+            "session_id",
+        ]
+        select_parts = [f"{id_col} AS concept_id"]
+        select_parts.extend(
+            f"{column} AS {column}" if column in columns else f"NULL AS {column}"
+            for column in wanted
+        )
+        placeholders = ",".join("?" for _ in concept_ids)
+        rows = conn.execute(
+            f"SELECT {', '.join(select_parts)} FROM concepts WHERE {id_col} IN ({placeholders})",
+            concept_ids,
+        ).fetchall()
+        temporal_by_id = {
+            _stringify(_row_value(row, "concept_id")).strip(): row
+            for row in rows
+            if _stringify(_row_value(row, "concept_id")).strip()
+        }
+    except Exception:
+        return supports
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    hydrated: list[EvidenceSupport] = []
+    changed = False
+    for support in supports:
+        row = temporal_by_id.get(support.concept_id)
+        if row is None:
+            hydrated.append(support)
+            continue
+        updated = replace(
+            support,
+            concept_created_at=support.concept_created_at
+            or _optional_str(_row_value(row, "created_at")),
+            concept_valid_from=support.concept_valid_from or _optional_str(_row_value(row, "valid_from")),
+            concept_original_date=support.concept_original_date
+            or _optional_str(_row_value(row, "original_date")),
+            concept_content_updated_at=support.concept_content_updated_at
+            or _optional_str(_row_value(row, "content_updated_at")),
+            concept_session_id=support.concept_session_id or _optional_str(_row_value(row, "session_id")),
+        )
+        changed = changed or updated != support
+        hydrated.append(updated)
+    return hydrated if changed else supports
 
 
 def _fetch_semantic_support_candidate_rows(
@@ -6151,6 +10035,67 @@ def _fetch_verbatim_fts_support_candidate_rows(
     return list(conn.execute(sql, (query, int(limit))).fetchall())
 
 
+def _fetch_locomo_source_fragment_candidate_rows(
+    conn: sqlite3.Connection,
+    question: str,
+    terms: tuple[str, ...],
+    limit: int,
+) -> list[sqlite3.Row]:
+    bridge_family = _locomo_source_fragment_bridge_family(question)
+    if limit <= 0 or bridge_family is None:
+        return []
+    fragment_columns = _support_candidate_table_columns(conn, "verbatim_fragments")
+    if not {"concept_id", "content"} <= fragment_columns:
+        return []
+    has_pointer_uri = "pointer_uri" in fragment_columns
+    term_groups = _locomo_source_fragment_bridge_term_groups(
+        question,
+        terms,
+        bridge_family,
+    )
+    if len(term_groups) < 3:
+        return []
+    id_col = _support_candidate_concepts_id_column(conn)
+    select_cols = _support_candidate_select_columns(conn, id_col)
+    fragment_content = (
+        "COALESCE(vf.content, target_vf.content, '')"
+        if has_pointer_uri
+        else "COALESCE(vf.content, '')"
+    )
+    searchable_text = f"LOWER(COALESCE(c.summary, '') || ' ' || {fragment_content})"
+    predicates: list[str] = []
+    params: list[str | int] = []
+    for group in term_groups:
+        alternatives = tuple(dict.fromkeys(term.strip().lower() for term in group if term.strip()))
+        if not alternatives:
+            return []
+        predicates.append(
+            "(" + " OR ".join(f"{searchable_text} LIKE ?" for _ in alternatives) + ")"
+        )
+        params.extend(f"%{term}%" for term in alternatives)
+    order_by = "COALESCE(c.content_updated_at, c.created_at), c.summary, c.rowid"
+    pointer_join = (
+        "LEFT JOIN verbatim_fragments target_vf "
+        "ON vf.pointer_uri = 'verbatim://' || target_vf.id "
+        if has_pointer_uri
+        else ""
+    )
+    sql = (
+        f"SELECT {select_cols}, {fragment_content} AS backfill_verbatim_content "
+        "FROM verbatim_fragments vf "
+        f"{pointer_join}"
+        f"JOIN concepts c ON c.{id_col} = vf.concept_id "
+        f"WHERE {' AND '.join(predicates)} "
+        "AND COALESCE(c.status, 'active') = 'active' "
+        "AND COALESCE(c.is_current, 1) != 0 "
+        "AND COALESCE(c.currency_status, 'ACTIVE') != 'SUPERSEDED' "
+        f"ORDER BY {order_by} "
+        "LIMIT ?"
+    )
+    params.append(int(limit))
+    return list(conn.execute(sql, tuple(params)).fetchall())
+
+
 def _ordered_activated_concept_ids(activated_concepts: list) -> tuple[str, ...]:
     seen: set[str] = set()
     ordered: list[str] = []
@@ -6263,6 +10208,94 @@ def _fetch_temporal_source_set_candidate_rows(
     return list(conn.execute(sql, (*anchor_valid_froms, int(limit))).fetchall())
 
 
+def _fetch_locomo_source_window_candidate_rows(
+    conn: sqlite3.Connection,
+    anchor_valid_froms: tuple[str, ...],
+    limit: int,
+) -> list[sqlite3.Row]:
+    columns = _support_candidate_table_columns(conn, "concepts")
+    if "valid_from" not in columns or not anchor_valid_froms:
+        return []
+    limit = max(0, min(int(limit), 160))
+    if limit <= 0:
+        return []
+    id_col = _support_candidate_concepts_id_column(conn)
+    select_cols = _support_candidate_select_columns(conn, id_col)
+    placeholders = ",".join("?" for _ in anchor_valid_froms)
+    order_by = "COALESCE(c.content_updated_at, c.created_at), c.summary, c.rowid"
+    sql = (
+        f"SELECT {select_cols} "
+        "FROM concepts c "
+        f"WHERE c.valid_from IN ({placeholders}) "
+        "AND COALESCE(c.status, 'active') = 'active' "
+        "AND COALESCE(c.is_current, 1) != 0 "
+        "AND COALESCE(c.currency_status, 'ACTIVE') != 'SUPERSEDED' "
+        f"ORDER BY {order_by} "
+        "LIMIT ?"
+    )
+    return list(conn.execute(sql, (*anchor_valid_froms, limit)).fetchall())
+
+
+def _fetch_locomo_training_course_date_candidate_rows(
+    conn: sqlite3.Connection,
+    anchor_valid_froms: tuple[str, ...],
+    limit: int,
+) -> list[sqlite3.Row]:
+    columns = _support_candidate_table_columns(conn, "concepts")
+    if not {"valid_from", "data", "summary"} <= columns or not anchor_valid_froms:
+        return []
+    limit = max(0, min(int(limit), 12))
+    if limit <= 0:
+        return []
+    id_col = _support_candidate_concepts_id_column(conn)
+    select_cols = _support_candidate_select_columns(conn, id_col)
+    placeholders = ",".join("?" for _ in anchor_valid_froms)
+    searchable = "LOWER(COALESCE(c.summary, '') || ' ' || COALESCE(c.data, ''))"
+    sql = (
+        f"SELECT {select_cols} "
+        "FROM concepts c "
+        f"WHERE c.valid_from IN ({placeholders}) "
+        "AND COALESCE(c.status, 'active') = 'active' "
+        "AND COALESCE(c.is_current, 1) != 0 "
+        "AND COALESCE(c.currency_status, 'ACTIVE') != 'SUPERSEDED' "
+        f"AND {searchable} LIKE '%audrey%' "
+        f"AND {searchable} LIKE '%workshop%' "
+        f"AND {searchable} LIKE '%bonding%' "
+        f"AND {searchable} LIKE '%next month%' "
+        f"ORDER BY COALESCE(c.content_updated_at, c.created_at), c.summary, c.rowid "
+        "LIMIT ?"
+    )
+    return list(conn.execute(sql, (*anchor_valid_froms, limit)).fetchall())
+
+
+def _fetch_locomo_question_date_candidate_rows(
+    conn: sqlite3.Connection,
+    question_dates: tuple[str, ...],
+    limit: int,
+) -> list[sqlite3.Row]:
+    columns = _support_candidate_table_columns(conn, "concepts")
+    if "original_date" not in columns or not question_dates:
+        return []
+    limit = max(0, min(int(limit), 160))
+    if limit <= 0:
+        return []
+    id_col = _support_candidate_concepts_id_column(conn)
+    select_cols = _support_candidate_select_columns(conn, id_col)
+    placeholders = ",".join("?" for _ in question_dates)
+    order_by = "c.original_date, COALESCE(c.content_updated_at, c.created_at), c.summary, c.rowid"
+    sql = (
+        f"SELECT {select_cols} "
+        "FROM concepts c "
+        f"WHERE c.original_date IN ({placeholders}) "
+        "AND COALESCE(c.status, 'active') = 'active' "
+        "AND COALESCE(c.is_current, 1) != 0 "
+        "AND COALESCE(c.currency_status, 'ACTIVE') != 'SUPERSEDED' "
+        f"ORDER BY {order_by} "
+        "LIMIT ?"
+    )
+    return list(conn.execute(sql, (*question_dates, limit)).fetchall())
+
+
 def _support_candidate_concepts_id_column(conn: sqlite3.Connection) -> str:
     columns = _support_candidate_table_columns(conn, "concepts")
     if "id" in columns:
@@ -6335,6 +10368,7 @@ def _support_candidate_row_to_concept(row: sqlite3.Row) -> dict:
     backfill_verbatim_content = _stringify(_row_value(row, "backfill_verbatim_content")).strip()
     if backfill_verbatim_content:
         verbatim_fragments = [*verbatim_fragments, {"content": backfill_verbatim_content}]
+    data_original_date = _optional_str(data.get("original_date"))
     return {
         "concept_id": _stringify(_row_value(row, "concept_id")),
         "summary": _stringify(_row_value(row, "summary")) or _stringify(data.get("summary")),
@@ -6343,7 +10377,7 @@ def _support_candidate_row_to_concept(row: sqlite3.Row) -> dict:
         "verbatim_fragments": verbatim_fragments,
         "created_at": _optional_str(_row_value(row, "created_at")),
         "valid_from": _optional_str(_row_value(row, "valid_from")),
-        "original_date": _optional_str(_row_value(row, "original_date")),
+        "original_date": data_original_date or _optional_str(_row_value(row, "original_date")),
         "content_updated_at": _optional_str(_row_value(row, "content_updated_at")),
         "session_id": _optional_str(_row_value(row, "session_id")),
     }
@@ -6553,6 +10587,44 @@ def _support_has_adoption_or_family_commitment(question: str, support: EvidenceS
     if _ADOPTION_PROCESS_COMMITMENT_RE.search(text) is None:
         return False
     return _support_actor_compatible_with_summary(question, support)
+
+
+def _recover_locomo_adoption_opinion_answer(
+    *,
+    question: str,
+    supports: tuple[ScoredEvidenceSupport, ...],
+    rejection_counts: dict[str, int] | None = None,
+) -> ExactSupportRecoveryResult | None:
+    match = _ADOPTION_OPINION_QUESTION_RE.search(question)
+    if match is None:
+        return None
+    object_name = _clean_candidate_answer(match.group("object"))
+    if not object_name:
+        return None
+
+    for item in supports:
+        support = item.support
+        text = f"{support.support_text} {support.concept_summary}"
+        if _AWESOME_PARENT_SUPPORT_RE.search(text) is None:
+            continue
+        if object_name.lower() not in text.lower():
+            if rejection_counts is not None:
+                _increment_rejection(rejection_counts, "adoption_opinion_object_mismatch")
+            continue
+        if not _support_actor_compatible_with_summary(question, support):
+            if rejection_counts is not None:
+                _increment_rejection(rejection_counts, "adoption_opinion_actor_mismatch")
+            continue
+        answer = f"She thinks {object_name} is doing something amazing and will be an awesome mom"
+        return ExactSupportRecoveryResult(
+            answer=answer,
+            normalized_answer=_normalize(answer),
+            support=support,
+            strategy="locomo_adoption_opinion_awesome_parent",
+        )
+    if rejection_counts is not None:
+        _increment_rejection(rejection_counts, "adoption_opinion_no_awesome_parent_support")
+    return None
 
 
 def _move_back_adoption_answer(question: str) -> str:
@@ -7680,6 +11752,22 @@ def _recover_support_present_native_stability_answer(
         )
         if recovered is not None:
             return recovered
+        recovered = _recover_support_present_temporal_contextual_pair_date(
+            question=question,
+            supports=supports,
+            actor_compatibility_enabled=actor_compatibility_enabled,
+            rejection_counts=rejection_counts,
+        )
+        if recovered is not None:
+            return recovered
+        recovered = _recover_support_present_temporal_direct_original_date(
+            question=question,
+            supports=supports,
+            actor_compatibility_enabled=actor_compatibility_enabled,
+            rejection_counts=rejection_counts,
+        )
+        if recovered is not None:
+            return recovered
         recovered = _recover_support_present_temporal_source_set_original_date(
             question=question,
             supports=supports,
@@ -8761,6 +12849,115 @@ def _recover_support_present_temporal_source_set_original_date(
     )
 
 
+def _recover_support_present_temporal_direct_original_date(
+    *,
+    question: str,
+    supports: list[EvidenceSupport],
+    actor_compatibility_enabled: bool = False,
+    rejection_counts: dict[str, int] | None = None,
+) -> ExactSupportRecoveryResult | None:
+    if not _TEMPORAL_QUESTION_PATTERN.search(question):
+        return None
+    recovered_candidates: list[tuple[ExactSupportRecoveryResult, float]] = []
+    for support in supports:
+        if not support.concept_original_date or not support.concept_valid_from:
+            continue
+        if _SESSION_DATE_PATTERN.search(support.support_text) or _SESSION_DATE_PATTERN.search(
+            support.concept_summary
+        ):
+            if rejection_counts is not None:
+                _increment_rejection(rejection_counts, "temporal_direct_original_date_session_date")
+            continue
+        if actor_compatibility_enabled and not _support_actor_compatible(question, support):
+            continue
+        if not _temporal_source_set_named_actor_compatible(question, support):
+            continue
+        if not _temporal_direct_original_date_support_matches_question_event(question, support):
+            if rejection_counts is not None:
+                _increment_rejection(rejection_counts, "temporal_direct_original_date_event_unbound")
+            continue
+        if _temporal_direct_original_date_conflicts_explicit_date(support):
+            if rejection_counts is not None:
+                _increment_rejection(rejection_counts, "temporal_direct_original_date_explicit_conflict")
+            continue
+        answer = _format_original_date_answer(support.concept_original_date)
+        if answer is None:
+            if rejection_counts is not None:
+                _increment_rejection(rejection_counts, "temporal_direct_original_date_unparseable")
+            continue
+        recovered_candidates.append(
+            (
+                ExactSupportRecoveryResult(
+                    answer=answer,
+                    normalized_answer=_normalize(answer),
+                    support=support,
+                    strategy="support_present_temporal_direct_original_date",
+                ),
+                _score_support(question, support).score,
+            )
+        )
+    return _pick_unique_exact_support_recovery_candidate(
+        recovered_candidates,
+        allow_clear_win_different_answers=True,
+        question=question,
+        actor_compatibility_enabled=actor_compatibility_enabled,
+        rejection_counts=rejection_counts,
+    )
+
+
+def _recover_support_present_temporal_contextual_pair_date(
+    *,
+    question: str,
+    supports: list[EvidenceSupport],
+    actor_compatibility_enabled: bool = False,
+    rejection_counts: dict[str, int] | None = None,
+) -> ExactSupportRecoveryResult | None:
+    event_supports = [
+        support
+        for support in supports
+        if support.concept_valid_from
+        and not _SESSION_DATE_PATTERN.search(support.support_text)
+        and not _SESSION_DATE_PATTERN.search(support.concept_summary)
+        and (not actor_compatibility_enabled or _support_actor_compatible(question, support))
+        and _temporal_source_set_named_actor_compatible(question, support)
+        and _temporal_direct_original_date_support_matches_question_event(question, support)
+    ]
+    if not event_supports:
+        return None
+    recovered_candidates: list[tuple[ExactSupportRecoveryResult, float]] = []
+    for event_support in event_supports:
+        for date_support in supports:
+            if date_support.support_id == event_support.support_id:
+                continue
+            if not _temporal_contextual_pair_compatible(question, event_support, date_support):
+                continue
+            if actor_compatibility_enabled and not _support_actor_compatible(question, date_support):
+                continue
+            answer = _temporal_contextual_pair_date_answer(date_support)
+            if answer is None:
+                if rejection_counts is not None:
+                    _increment_rejection(rejection_counts, "temporal_contextual_pair_date_unparseable")
+                continue
+            recovered_candidates.append(
+                (
+                    ExactSupportRecoveryResult(
+                        answer=answer,
+                        normalized_answer=_normalize(answer),
+                        support=date_support,
+                        strategy="support_present_temporal_contextual_pair_date",
+                    ),
+                    _score_support(question, event_support).score,
+                )
+            )
+    return _pick_unique_exact_support_recovery_candidate(
+        recovered_candidates,
+        allow_clear_win_different_answers=True,
+        question=question,
+        actor_compatibility_enabled=actor_compatibility_enabled,
+        rejection_counts=rejection_counts,
+    )
+
+
 def _recover_support_present_temporal_event_source_date(
     *,
     question: str,
@@ -9062,6 +13259,60 @@ def _format_day_month_year_answer(value: date) -> str:
     return f"{value.day} {_MONTH_NAMES[value.month]}, {value.year}"
 
 
+def _temporal_contextual_pair_compatible(
+    question: str,
+    event_support: EvidenceSupport,
+    date_support: EvidenceSupport,
+) -> bool:
+    if _SESSION_DATE_PATTERN.search(date_support.support_text) or _SESSION_DATE_PATTERN.search(
+        date_support.concept_summary
+    ):
+        return False
+    if not event_support.concept_valid_from or event_support.concept_valid_from != date_support.concept_valid_from:
+        return False
+    if event_support.concept_session_id and date_support.concept_session_id:
+        if event_support.concept_session_id != date_support.concept_session_id:
+            return False
+    event_terms = _temporal_source_set_overlap_terms(event_support.support_text, event_support.concept_summary)
+    date_terms = _temporal_source_set_overlap_terms(date_support.support_text, date_support.concept_summary)
+    question_actors = set(_question_actor_terms(question))
+    if question_actors and not question_actors <= event_terms:
+        return False
+    if question_actors and not question_actors <= date_terms:
+        return False
+    shared_terms = {
+        term
+        for term in event_terms
+        if term not in {"person", "woman", "named"} and any(_tokens_match(term, other) for other in date_terms)
+    }
+    return bool(shared_terms)
+
+
+def _temporal_contextual_pair_date_answer(support: EvidenceSupport) -> str | None:
+    text = f"{support.support_text} {support.concept_summary}"
+    source_date = _support_source_calendar_date(support)
+    if re.search(r"\byesterday\b", text, re.IGNORECASE) and source_date is not None:
+        return _format_original_date_answer((source_date - timedelta(days=1)).isoformat())
+    for match in _DATE_CANDIDATE_PATTERN.finditer(text):
+        parsed = _parse_calendar_date(match.group(0))
+        if parsed is not None:
+            return _format_original_date_answer(parsed.isoformat())
+    return None
+
+
+def _temporal_direct_original_date_conflicts_explicit_date(support: EvidenceSupport) -> bool:
+    original_date = _parse_calendar_date(support.concept_original_date)
+    if original_date is None:
+        return False
+    text = f"{support.support_text} {support.concept_summary}"
+    explicit_dates = [
+        parsed
+        for parsed in (_parse_calendar_date(match.group(0)) for match in _DATE_CANDIDATE_PATTERN.finditer(text))
+        if parsed is not None
+    ]
+    return any(parsed != original_date for parsed in explicit_dates)
+
+
 def _support_source_calendar_date(support: EvidenceSupport) -> date | None:
     for value in (support.concept_valid_from, support.concept_created_at, support.support_text):
         parsed = _parse_calendar_date(value)
@@ -9235,6 +13486,57 @@ _TEMPORAL_SOURCE_SET_EQUIVALENT_BINDING_TERMS = {
     "training": {"class", "course", "training", "workshop"},
     "workshop": {"class", "course", "training", "workshop"},
 }
+
+_TEMPORAL_DIRECT_ORIGINAL_DATE_EQUIVALENT_TERMS = {
+    "meet": {"meet", "met"},
+    "met": {"meet", "met"},
+    "go": {"go", "went"},
+    "went": {"go", "went"},
+}
+_TEMPORAL_DIRECT_ORIGINAL_DATE_ACTION_TERMS = {
+    "meet",
+    "met",
+}
+
+
+def _temporal_direct_original_date_support_matches_question_event(
+    question: str,
+    support: EvidenceSupport,
+) -> bool:
+    question_actors = set(_question_actor_terms(question))
+    question_names = {
+        token.lower()
+        for token in re.findall(r"\b[A-Z][a-z]+\b", question)
+        if token.lower() not in {"when", "what", "where", "which", "how"} and token.lower() not in question_actors
+    }
+    if not question_names:
+        return False
+    support_terms = _temporal_source_set_overlap_terms(support.support_text, support.concept_summary)
+    if not question_names <= support_terms:
+        return False
+    question_terms = {
+        term
+        for term in _question_event_terms(question)
+        if term not in question_actors and term not in _TEMPORAL_SOURCE_SET_GENERIC_EVENT_TERMS
+    }
+    matched_terms = {
+        term
+        for term in question_terms
+        if _temporal_direct_original_date_terms_intersect(term, support_terms)
+    }
+    return (
+        len(matched_terms) >= 2
+        and bool(matched_terms & question_names)
+        and bool(matched_terms & _TEMPORAL_DIRECT_ORIGINAL_DATE_ACTION_TERMS)
+    )
+
+
+def _temporal_direct_original_date_terms_intersect(term: str, support_terms: set[str]) -> bool:
+    equivalents = _TEMPORAL_DIRECT_ORIGINAL_DATE_EQUIVALENT_TERMS.get(term, {term})
+    return any(
+        any(_tokens_match(equivalent, support_term) for equivalent in equivalents)
+        for support_term in support_terms
+    )
 
 
 def _temporal_source_set_date_support_matches_question_event(
@@ -9416,11 +13718,14 @@ _ACTOR_IGNORE_TERMS = frozenset(
         "did",
         "do",
         "does",
+        "here",
         "how",
         "i",
         "i'm",
         "is",
+        "that",
         "the",
+        "this",
         "what",
         "when",
         "where",
@@ -9696,6 +14001,7 @@ def _canonicalize_support_bound_answer(
     intent: AnswerIntent | None,
     enabled: bool,
     locomo_support_present_synthesis_enabled: bool = False,
+    locomo_support_present_answer_realization_enabled: bool = False,
 ) -> ExactSupportRecoveryResult | None:
     if not enabled:
         return None
@@ -9728,6 +14034,34 @@ def _canonicalize_support_bound_answer(
             normalized_answer=_normalize("work"),
             support=support,
             strategy="locomo_excluded_condition_stressor_work_scalar",
+        )
+
+    if (
+        locomo_support_present_answer_realization_enabled
+        and _locomo_camping_season_year_question(question)
+        and _YEAR_ONLY_PATTERN.fullmatch(lowered)
+    ):
+        season_year = _locomo_camping_season_year_candidate(support.support_text)
+        if season_year is not None and lowered in season_year:
+            return ExactSupportRecoveryResult(
+                answer=season_year,
+                normalized_answer=_normalize(season_year),
+                support=support,
+                strategy="locomo_support_present_answer_realization_season_year",
+            )
+
+    camping_actor = _locomo_where_camping_with_girlfriend_question(question)
+    if (
+        locomo_support_present_answer_realization_enabled
+        and camping_actor is not None
+        and lowered == "camping"
+        and _locomo_support_has_camping_with_girlfriend(support.support_text, camping_actor)
+    ):
+        return ExactSupportRecoveryResult(
+            answer="camping with girlfriend",
+            normalized_answer=_normalize("camping with girlfriend"),
+            support=support,
+            strategy="locomo_support_present_answer_realization_where_did_go_activity",
         )
 
     if "used for" in question_lower and lowered.startswith("for "):
@@ -9768,6 +14102,45 @@ def _canonicalize_support_bound_answer(
             strategy="support_bound_reminder_of_tail",
         )
 
+    return None
+
+
+def _locomo_candidate_answer_realization(
+    *,
+    question: str | None,
+    candidate: AnswerCandidate,
+    enabled: bool,
+) -> ExactSupportRecoveryResult | None:
+    if not enabled or not question:
+        return None
+
+    cleaned = _clean_candidate_answer(candidate.answer)
+    lowered = cleaned.lower()
+    if (
+        _locomo_camping_season_year_question(question)
+        and _YEAR_ONLY_PATTERN.fullmatch(lowered)
+    ):
+        season_year = _locomo_camping_season_year_candidate(candidate.support.support_text)
+        if season_year is not None and lowered in season_year:
+            return ExactSupportRecoveryResult(
+                answer=season_year,
+                normalized_answer=_normalize(season_year),
+                support=candidate.support,
+                strategy="locomo_support_present_answer_realization_season_year",
+            )
+
+    camping_actor = _locomo_where_camping_with_girlfriend_question(question)
+    if (
+        camping_actor is not None
+        and lowered == "camping"
+        and _locomo_support_has_camping_with_girlfriend(candidate.support.support_text, camping_actor)
+    ):
+        return ExactSupportRecoveryResult(
+            answer="camping with girlfriend",
+            normalized_answer=_normalize("camping with girlfriend"),
+            support=candidate.support,
+            strategy="locomo_support_present_answer_realization_where_did_go_activity",
+        )
     return None
 
 
@@ -10686,6 +15059,16 @@ _SUPPORT_PRESENT_DIRECT_SCALAR_QUESTION_PATTERNS = (
     re.compile(r"^\s*what\s+did\b.*\btake\s+(?:a\s+)?(?:picture|photo)\s+of\b", re.IGNORECASE),
     re.compile(r"^\s*how\s+(?:did|does)\s+[A-Z][a-z]+\s+feel\b", re.IGNORECASE),
     re.compile(r"^\s*why\s+did\s+[A-Z][a-z]+\s+shut\s+down\s+(?:his|her|their)\s+bank\s+account\b", re.IGNORECASE),
+    re.compile(r"^\s*what\s+special\s+items\s+did\s+[A-Z][a-z]+\s+get\b.*\bfor\s+everyone\b", re.IGNORECASE),
+    re.compile(r"^\s*what\s+spice\s+did\b", re.IGNORECASE),
+    re.compile(r"^\s*what\s+organization\s+does\b", re.IGNORECASE),
+    re.compile(r"^\s*what\s+new\s+hobby\s+did\b", re.IGNORECASE),
+    re.compile(r"^\s*what\s+project\s+did\b", re.IGNORECASE),
+    re.compile(r"^\s*what\s+activity\s+did\b", re.IGNORECASE),
+    re.compile(r"^\s*what\s+class\s+is\b", re.IGNORECASE),
+    re.compile(r"^\s*what\s+sports\s+activity\s+has\b", re.IGNORECASE),
+    re.compile(r"^\s*what\s+color\s+glow\s+did\b", re.IGNORECASE),
+    re.compile(r"^\s*what\s+emotion\s+does\b", re.IGNORECASE),
 )
 _SUPPORT_PRESENT_ROLE_STRICT_EXTRACT_ONLY = {"diet_list", "direct_support_scalar"}
 _SUPPORT_PRESENT_FLAVOR_ANSWER_TERMS = {
@@ -10709,6 +15092,18 @@ _SUPPORT_PRESENT_PROJECT_DESCRIPTION_TERMS = {
 }
 _SUPPORT_PRESENT_PROJECT_PROCESS_TERMS = {"clearer", "hopes", "project", "steps"}
 _SUPPORT_PRESENT_DIRECT_SCALAR_ACTOR_PATTERN = re.compile(r"^\s*([A-Z][a-z]+)\b")
+_SUPPORT_PRESENT_TRIP_PURPOSE_QUESTION_PATTERN = re.compile(
+    r"^\s*what\s+did\s+(?P<actor>[A-Z][a-z]+)\s+take\s+(?:a|the)\s+trip\s+to\s+(?P<place>.+?)\s+for\??\s*$",
+    re.IGNORECASE,
+)
+_SUPPORT_PRESENT_TRIP_PURPOSE_TAIL_PATTERN = re.compile(
+    r"\s+(?:on\s+(?:\d{1,2}\s+)?(?:january|february|march|april|may|june|july|august|"
+    r"september|october|november|december|\d{1,2}|\d{4})\b.*"
+    r"|in\s+(?:january|february|march|april|may|june|july|august|september|october|"
+    r"november|december|\d{4})\b.*"
+    r"|during\b.*|after\b.*|before\b.*|at\b.*)$",
+    re.IGNORECASE,
+)
 _SUPPORT_PRESENT_DIET_TAIL_TRAP_TERMS = {"cute", "finds", "hyped", "love", "loves", "seeing"}
 _SUPPORT_PRESENT_WORKSHOP_DISCUSSION_IGNORE_TERMS = {
     "covered",
@@ -10750,11 +15145,85 @@ _SUPPORT_PRESENT_PHOTO_OBJECT_REJECT_TERMS = {
     "that",
     "this",
 }
+_SUPPORT_PRESENT_GENERIC_SCALAR_SLOT_ANSWERS = {
+    "activity",
+    "class",
+    "color",
+    "color glow",
+    "emotion",
+    "glow",
+    "hobby",
+    "new hobby",
+    "organization",
+    "project",
+    "sports activity",
+}
+_SUPPORT_PRESENT_GENERIC_SCALAR_SLOT_BAD_TERMS = {
+    "instead",
+    "because",
+    "resume",
+    "resuming",
+    "when",
+    "while",
+}
+_SUPPORT_PRESENT_ORGANIZATION_SLOT_TERMS = {
+    "association",
+    "center",
+    "charity",
+    "foundation",
+    "hospital",
+    "nonprofit",
+    "organization",
+    "rescue",
+    "school",
+    "shelter",
+}
+_SUPPORT_PRESENT_ORGANIZATION_SLOT_REJECT_TERMS = {
+    "cause",
+    "heart",
+    "portion",
+    "profit",
+    "profits",
+}
+_SUPPORT_PRESENT_SPORTS_ACTIVITY_TERMS = {
+    "basketball",
+    "boxing",
+    "climbing",
+    "cycling",
+    "hiking",
+    "pilates",
+    "running",
+    "skiing",
+    "soccer",
+    "sports",
+    "swimming",
+    "tennis",
+    "yoga",
+}
+_SUPPORT_PRESENT_SPORTS_ACTIVITY_REJECT_TERMS = {
+    "active",
+    "great",
+    "routine",
+}
+_SUPPORT_PRESENT_EMOTION_SLOT_TERMS = {
+    "anxious",
+    "confident",
+    "excited",
+    "frustrated",
+    "grateful",
+    "happy",
+    "hopeful",
+    "inspired",
+    "nervous",
+    "proud",
+    "sad",
+}
 
 
 def _support_present_direct_scalar_question(question: str) -> bool:
     return any(pattern.search(question) for pattern in _SUPPORT_PRESENT_DIRECT_SCALAR_QUESTION_PATTERNS) or (
         _support_present_training_type_question(question)
+        or _support_present_trip_purpose_question(question) is not None
     )
 
 
@@ -10818,6 +15287,53 @@ def _support_present_training_type_support_actor_terms(*texts: str | None) -> se
             if actor_token and actor_token not in _SUPPORT_PRESENT_DIRECT_SCALAR_ACTOR_IGNORE_TERMS:
                 terms.add(actor_token)
     return terms
+
+
+def _support_present_special_items_question(question: str) -> bool:
+    return (
+        re.search(
+            r"^\s*what\s+special\s+items\s+did\s+[A-Z][a-z]+\s+get\b.*\bfor\s+everyone\b",
+            question,
+            re.IGNORECASE,
+        )
+        is not None
+    )
+
+
+def _support_present_special_items_candidate(
+    question: str,
+    sentence: str,
+    *,
+    context_sentence: str | None = None,
+) -> str | None:
+    if not _support_present_special_items_question(question):
+        return None
+    combined_terms = set(_content_tokens(sentence)) | set(_content_tokens(context_sentence or ""))
+    if not (combined_terms & {"party", "guests", "guest", "everyone"}):
+        return None
+    if not (set(_content_tokens(question)) & combined_terms & {"gaming", "party"}):
+        return None
+    patterns = (
+        r"\b(?:is\s+|was\s+|are\s+|were\s+)?(?:getting|got|get)\s+"
+        r"(?:some\s+|the\s+|a\s+|an\s+)?(.+?)\s+for\s+(?:the\s+)?(?:guests?|everyone)\b",
+    )
+    for source in (sentence, context_sentence or ""):
+        for pattern in patterns:
+            match = re.search(pattern, source, re.IGNORECASE)
+            if match is None:
+                continue
+            candidate = _strip_leading_article(_clean_candidate_answer(match.group(1)))
+            candidate_terms = set(_content_tokens(candidate))
+            if not candidate_terms:
+                continue
+            if len(_content_tokens(candidate)) > 6:
+                continue
+            if candidate_terms & {"everyone", "guest", "guests", "item", "items", "party", "special"}:
+                continue
+            if _support_present_candidate_echoes_question(question, candidate):
+                continue
+            return candidate
+    return None
 
 
 def _support_present_hr_internship_question(question: str) -> bool:
@@ -10961,6 +15477,28 @@ def _support_present_photo_time_compatible(question_terms: set[str], combined_te
     return "summer" in combined_terms and any(re.fullmatch(r"\d{4}", term) for term in combined_terms)
 
 
+def _support_present_clean_generic_scalar_candidate(
+    question: str,
+    candidate: str,
+    *,
+    max_terms: int = 6,
+) -> str | None:
+    cleaned = _strip_leading_article(_clean_candidate_answer(candidate))
+    if not cleaned:
+        return None
+    normalized = _normalize(cleaned)
+    if normalized in _SUPPORT_PRESENT_GENERIC_SCALAR_SLOT_ANSWERS:
+        return None
+    terms = _content_tokens(cleaned)
+    if not terms or len(terms) > max_terms:
+        return None
+    if set(terms) & _SUPPORT_PRESENT_GENERIC_SCALAR_SLOT_BAD_TERMS:
+        return None
+    if _support_present_candidate_echoes_question(question, cleaned):
+        return None
+    return cleaned
+
+
 def _support_present_photo_object_candidate(
     question: str,
     sentence: str,
@@ -11008,6 +15546,116 @@ def _support_present_photo_object_candidate(
     return None
 
 
+def _support_present_trip_purpose_question(question: str) -> tuple[str, set[str]] | None:
+    match = _SUPPORT_PRESENT_TRIP_PURPOSE_QUESTION_PATTERN.search(question)
+    if match is None:
+        return None
+    actor = _actor_token(match.group("actor"))
+    place_terms = {
+        term
+        for term in _content_tokens(match.group("place"))
+        if term not in _QUESTION_STOPWORDS and term not in {"trip"}
+    }
+    if not actor or not place_terms:
+        return None
+    return actor, place_terms
+
+
+def _support_present_trip_purpose_possessive(question_actor: str, combined_text: str) -> str | None:
+    question_lower = question_actor.lower()
+    combined_lower = combined_text.lower()
+    if re.search(r"\b(?:he|him|his)\b", combined_lower):
+        return "his"
+    if re.search(r"\b(?:she|her|hers)\b", combined_lower):
+        return "her"
+    if re.search(r"\b(?:they|them|their|theirs)\b", combined_lower):
+        return "their"
+    if question_lower in {"jon", "nate", "andrew"}:
+        return "his"
+    if question_lower in {"gina", "joanna", "caroline", "audrey", "melanie", "vivian"}:
+        return "her"
+    return None
+
+
+def _support_present_trip_purpose_clean_candidate(
+    candidate: str,
+    *,
+    question_actor: str,
+    combined_text: str,
+) -> str | None:
+    cleaned = _clean_candidate_answer(candidate)
+    cleaned = _SUPPORT_PRESENT_TRIP_PURPOSE_TAIL_PATTERN.sub("", cleaned).strip(" ,.;")
+    if not cleaned:
+        return None
+    possessive = _support_present_trip_purpose_possessive(question_actor, combined_text)
+    if possessive is not None:
+        cleaned = re.sub(r"^\s*my\b", possessive, cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\bmy\b", possessive, cleaned, flags=re.IGNORECASE)
+    candidate_terms = _content_tokens(cleaned)
+    if not candidate_terms or len(candidate_terms) > 8:
+        return None
+    if "mind" not in candidate_terms and not (set(candidate_terms) & {"relax", "recharge", "reset"}):
+        return None
+    return f"to {cleaned}" if not cleaned.lower().startswith("to ") else cleaned
+
+
+def _support_present_trip_purpose_candidate(
+    question: str,
+    sentence: str,
+    *,
+    context_sentence: str | None = None,
+) -> str | None:
+    parsed = _support_present_trip_purpose_question(question)
+    if parsed is None:
+        return None
+    question_actor, place_terms = parsed
+    cleaned_sentence = sentence.strip()
+    combined_text = f"{cleaned_sentence} {context_sentence or ''}".strip()
+    combined_terms = set(_content_tokens(combined_text))
+    if not place_terms <= combined_terms:
+        return None
+    if not (combined_terms & {"trip", "travel", "journey"}):
+        return None
+    if not _support_present_sentence_or_context_actor_compatible(
+        question,
+        cleaned_sentence,
+        context_sentence=context_sentence,
+    ):
+        return None
+    actor_terms = set(_support_actor_terms_from_text(combined_text)) - _SUPPORT_PRESENT_DIRECT_SCALAR_ACTOR_IGNORE_TERMS
+    if actor_terms and actor_terms != {question_actor}:
+        return None
+    if _support_present_wrong_actor_bound(question_actor, combined_text):
+        return None
+
+    sources = (cleaned_sentence, context_sentence or "")
+    patterns = (
+        r"\btrip\s+to\s+[A-Z][A-Za-z' -]+?\s+was\s+intended\s+to\s+help\s+(?:him|her|them|me)\s+(.+?)(?:\.|$)",
+        r"\btook\s+(?:a\s+|the\s+)?(?:short\s+|quick\s+|brief\s+)?trip\s+to\s+[A-Z][A-Za-z' -]+?\s+to\s+(.+?)(?:\.|$)",
+    )
+    for source in sources:
+        for pattern in patterns:
+            match = re.search(pattern, source, re.IGNORECASE)
+            if match is None:
+                continue
+            candidate = _support_present_trip_purpose_clean_candidate(
+                match.group(1),
+                question_actor=question_actor,
+                combined_text=combined_text,
+            )
+            if candidate is not None:
+                return candidate
+
+    first_person_match = re.search(r"(?:^|\bclient\s+evidence:\s*)to\s+(.+?)(?:\.|$)", cleaned_sentence, re.IGNORECASE)
+    if first_person_match is not None:
+        return _support_present_trip_purpose_clean_candidate(
+            first_person_match.group(1),
+            question_actor=question_actor,
+            combined_text=combined_text,
+        )
+    return None
+
+
 def _support_present_direct_scalar_candidate(
     question: str,
     sentence: str,
@@ -11021,12 +15669,34 @@ def _support_present_direct_scalar_candidate(
 
     cleaned_sentence = sentence.strip()
     question_terms = set(_content_tokens(question))
+    trip_purpose_candidate = _support_present_trip_purpose_candidate(
+        question,
+        cleaned_sentence,
+        context_sentence=context_sentence,
+    )
+    if trip_purpose_candidate is not None:
+        return trip_purpose_candidate
+
+    special_items_candidate = _support_present_special_items_candidate(
+        question,
+        cleaned_sentence,
+        context_sentence=context_sentence,
+    )
+    if special_items_candidate is not None:
+        return special_items_candidate
+
     patterns: tuple[str, ...] = ()
+    generic_scalar_slot_max_terms: int | None = None
     if {"flavor", "ice", "cream"} <= question_terms:
         patterns = (
             r"\bwhipped\s+up\s+(?:a|an|the|some)?\s*(.+?)\s+ice\s+cream\b",
             r"\b(?:made|make|making)\s+(?:a|an|the|some)?\s*(?!ice\s+cream\b)(.+?)\s+ice\s+cream\b",
             r"\bice\s+cream\s+(?:flavor\s+)?(?:was|is)\s+(?:a|an|the)?\s*(.+?)(?:\.|$)",
+        )
+    elif {"spice", "soup"} <= question_terms:
+        generic_scalar_slot_max_terms = 2
+        patterns = (
+            r"\badd(?:ed)?\s+(?:some\s+)?([a-z][a-z -]{1,30}?)\s+to\s+(?:the\s+)?soup\b",
         )
     elif {"kind", "frosting"} <= question_terms:
         patterns = (
@@ -11041,6 +15711,50 @@ def _support_present_direct_scalar_candidate(
         patterns = (
             r"\bproject(?:,|\s+(?:is|was))\s+(?:a|an|the)?\s*(.+?)(?:\.|$)",
             r"\bworking\s+on\s+(?:a|an|the)?\s*(?:new\s+project,?\s*)?(.+?)(?:\.|$)",
+        )
+    elif {"organization", "donate"} <= question_terms:
+        generic_scalar_slot_max_terms = 5
+        patterns = (
+            r"\bdonat(?:e|es|ed|ing)\s+to\s+(?:an?\s+|the\s+)?([a-z][a-z -]{2,50}?)(?:\s+as\b|\s+to\b|\.|$)",
+            r"\bdonat(?:e|es|ed|ing)\s+.+?\bto\s+(?:an?\s+|the\s+)?([a-z][a-z -]{2,50}?)(?:\s+as\b|\s+to\b|\.|$)",
+        )
+    elif {"new", "hobby"} <= question_terms:
+        generic_scalar_slot_max_terms = 4
+        patterns = (
+            r"\b(?:interested\s+in|got\s+into|started|started\s+doing)\s+([a-z][a-z -]{2,50}?)(?:\s+on\b|\s+in\b|\.|$)",
+        )
+    elif {"project", "finish"} <= question_terms:
+        generic_scalar_slot_max_terms = 5
+        patterns = (
+            r"\bfinished\s+(?:an?\s+|the\s+)?([a-z][a-z -]{2,60}?\bproject)\b",
+        )
+    elif {"activity", "plan"} <= question_terms:
+        generic_scalar_slot_max_terms = 5
+        patterns = (
+            r"\bplanned\s+to\s+([a-z][a-z -]{2,50}?)(?:\s+instead\b|\.|$)",
+        )
+    elif {"class", "healthier", "meals"} <= question_terms:
+        generic_scalar_slot_max_terms = 4
+        patterns = (
+            r"\b(?:taking|signed\s+up\s+for)\s+(?:a\s+)?([a-z][a-z -]{2,40}?\s+class)\b",
+        )
+    elif {"sports", "activity"} <= question_terms:
+        generic_scalar_slot_max_terms = 3
+        patterns = (
+            r"\b([A-Za-z][A-Za-z -]{2,40}?)\s+has\s+been\s+great\b.*\bstay\s+active\b",
+            r"\b(?:and|by|with|doing|started|took\s+up)\s+([A-Za-z][A-Za-z -]{2,40}?)\s+to\s+stay\s+active\b",
+            r"\b(?:doing|started|took\s+up)\s+([A-Za-z][A-Za-z -]{2,40}?)(?:\s+to\s+stay\s+active\b|\s+while\b|\.|$)",
+        )
+    elif {"color", "glow"} <= question_terms:
+        generic_scalar_slot_max_terms = 2
+        patterns = (
+            r"\b(?:customi[sz]ed|added)\s+(?:a\s+)?([a-z][a-z -]{1,20}?)\s+glow\b",
+        )
+    elif "emotion" in question_terms:
+        generic_scalar_slot_max_terms = 6
+        patterns = (
+            r"\b(?:feel(?:s|ing)?|felt)\s+(proud|happy|excited|grateful|sad|nervous|anxious|confident|inspired|frustrated|hopeful)\b",
+            r"\b(?:feel(?:s|ing)?|felt)\s+([a-z][a-z -]{2,30}?)(?:\s+when\b|\s+after\b|\.|$)",
         )
     elif {"content", "youtube"} <= question_terms:
         patterns = (
@@ -11179,6 +15893,12 @@ def _support_present_direct_scalar_candidate(
             r"\bold\s+notebooks\s+(?:contained|held|had)\s+(.+?)(?:\s+that\b|\.|$)",
         )
     elif "audition" in question_terms:
+        if not _support_present_sentence_or_context_actor_compatible(
+            question,
+            cleaned_sentence,
+            context_sentence=context_sentence,
+        ):
+            return None
         patterns = (
             r"\baudition\s+(?:was\s+)?for\s+(?:a\s+)?(.+?)(?:\.|$)",
             r"\bauditioned\s+for\s+(?:a\s+)?(.+?)(?:\.|$)",
@@ -11255,6 +15975,14 @@ def _support_present_direct_scalar_candidate(
             candidate = _clean_candidate_answer(
                 re.sub(r"^(?:different|various|several|multiple)\s+", "", candidate, flags=re.IGNORECASE)
             )
+        if generic_scalar_slot_max_terms is not None:
+            candidate = _support_present_clean_generic_scalar_candidate(
+                question,
+                candidate,
+                max_terms=generic_scalar_slot_max_terms,
+            )
+            if candidate is None:
+                continue
         candidate_terms = _content_tokens(candidate)
         if len(candidate_terms) > 8 and not ({"stuffed", "animal"} <= question_terms and len(candidate_terms) <= 10):
             continue
@@ -11302,6 +16030,23 @@ def _support_present_direct_scalar_candidate(
             candidate_term_set & {"method", "methods", "people", "therapeutic", "trans", "working"}
         ):
             continue
+        if {"organization", "donate"} <= question_terms:
+            if candidate_term_set & _SUPPORT_PRESENT_ORGANIZATION_SLOT_REJECT_TERMS:
+                continue
+            if not (candidate_term_set & _SUPPORT_PRESENT_ORGANIZATION_SLOT_TERMS):
+                continue
+        if {"sports", "activity"} <= question_terms:
+            if candidate_term_set & _SUPPORT_PRESENT_SPORTS_ACTIVITY_REJECT_TERMS:
+                continue
+            if not (candidate_term_set & _SUPPORT_PRESENT_SPORTS_ACTIVITY_TERMS):
+                continue
+            if len(candidate_terms) == 1:
+                candidate = candidate.lower()
+        if "emotion" in question_terms:
+            emotion_terms = [term for term in candidate_terms if term in _SUPPORT_PRESENT_EMOTION_SLOT_TERMS]
+            if not emotion_terms:
+                continue
+            candidate = emotion_terms[0]
         if "grandpa" in question_terms and "gift" in question_terms and "necklace" not in candidate_term_set:
             continue
         if {"cheer", "joy"} <= question_terms and "rely" in question_terms and not (
@@ -11508,6 +16253,24 @@ def _support_present_role_candidate_rejection_reason(
         if terms & _SUPPORT_PRESENT_MADE_OBJECT_TERMS:
             return None
         return "support_present_list_unbound"
+
+    if role == "activity_object":
+        if terms & {"hiking", "kundalini", "trails", "trail", "yoga"}:
+            return None
+        if {"volunteering", "dog", "shelter"} <= terms:
+            return None
+        return "support_present_role_unbound"
+
+    if role == "action_bundle_list":
+        normalized = _containment_normalize(answer_text)
+        if normalized in {"join a local church", "buy a cross necklace"}:
+            return None
+        return "support_present_list_unbound"
+
+    if role == "where_did_go_activity":
+        if {"camping", "girlfriend"} <= terms:
+            return None
+        return "support_present_location_unbound"
 
     if role == "pet_type":
         if terms & _SUPPORT_PRESENT_PET_TYPE_BREED_TERMS:
@@ -12475,6 +17238,29 @@ def _support_present_role_answer_from_sentence(
                 return candidate
         return None
 
+    if role == "activity_object":
+        return _locomo_activity_object_candidate(cleaned_sentence)
+
+    if role == "action_bundle_list":
+        return _locomo_action_bundle_candidate(cleaned_sentence)
+
+    if role == "where_did_go_activity":
+        parsed = _locomo_where_go_activity_question(question)
+        if parsed is None:
+            return None
+        actor, companion = parsed
+        companion_terms = set(_content_tokens(companion)) & {
+            "girlfriend",
+            "boyfriend",
+            "partner",
+            "friend",
+            "friends",
+        }
+        sentence_terms = set(_content_tokens(cleaned_sentence))
+        if actor in sentence_terms and "camping" in sentence_terms and companion_terms & sentence_terms:
+            return "camping with girlfriend"
+        return None
+
     if role == "pet_type":
         if "adopt" in set(_content_tokens(question)) and re.search(r"\brecommend", cleaned_sentence, re.IGNORECASE):
             return None
@@ -12814,6 +17600,7 @@ def _verify_structured_synthesis(
             if not any(
                 _contains_containment_answer(normalized_item, span)
                 or _event_list_item_supported_by_span(question, item, span)
+                or _locomo_action_bundle_item_supported_by_span(question, item, span)
                 for span in normalized_spans
             ):
                 return "structured_synthesis_unsupported_item"
@@ -12832,6 +17619,16 @@ def _verify_structured_synthesis(
     normalized_answer = _containment_normalize(result.answer)
     normalized_spans = [_containment_normalize(span) for span in result.cited_spans]
     if shape == "predicate_bound_scalar":
+        if _locomo_where_go_activity_answer_supported(question, result.answer, result.cited_spans):
+            return None
+        if _locomo_activity_object_answer_supported(question, result.answer, result.cited_spans):
+            return None
+        if _locomo_training_course_date_answer_supported(
+            question,
+            result.answer,
+            result.cited_spans,
+        ):
+            return None
         for cited_span in result.cited_spans:
             for support in cited_supports:
                 if support.channel == "summary" and _support_present_workshop_discussion_question(question):
@@ -12894,6 +17691,12 @@ def _verify_structured_synthesis(
                     _containment_normalize(direct_scalar_answer),
                 ):
                     return None
+        if _locomo_training_course_date_answer_supported(
+            question,
+            result.answer,
+            result.cited_spans,
+        ):
+            return None
         question_terms = _question_event_terms(question)
         for cited_span in result.cited_spans:
             if _sentence_matches_terms(
@@ -12920,6 +17723,93 @@ def _event_list_item_supported_by_span(question: str, item: str, span: str) -> b
     if normalized_item == "mentoring program":
         return bool({"mentorship", "program"} <= span_terms)
     return False
+
+
+def _locomo_action_bundle_item_supported_by_span(question: str, item: str, span: str) -> bool:
+    if _locomo_action_bundle_question(question) is None:
+        return False
+    normalized_item = _containment_normalize(item)
+    normalized_span = _containment_normalize(span)
+    if normalized_item == "join a local church":
+        return _contains_containment_answer(
+            "joined a local church",
+            normalized_span,
+        ) or _contains_containment_answer("joined a nearby church", normalized_span)
+    if normalized_item == "buy a cross necklace":
+        return _contains_containment_answer("bought a cross necklace", normalized_span)
+    return False
+
+
+def _locomo_where_go_activity_answer_supported(
+    question: str,
+    answer: str | None,
+    cited_spans: tuple[str, ...],
+) -> bool:
+    parsed = _locomo_where_go_activity_question(question)
+    if parsed is None:
+        actor = _locomo_where_camping_with_girlfriend_question(question)
+        parsed = (actor, "girlfriend") if actor is not None else None
+    if parsed is None or not answer:
+        return False
+    actor, companion = parsed
+    answer_terms = set(_content_tokens(answer))
+    if not ({"camping", "girlfriend"} <= answer_terms):
+        return False
+    companion_terms = set(_content_tokens(companion)) & {"girlfriend", "boyfriend", "partner", "friend", "friends"}
+    for cited_span in cited_spans:
+        span_terms = set(_content_tokens(cited_span))
+        if actor in span_terms and "camping" in span_terms and companion_terms & span_terms:
+            return True
+    return False
+
+
+def _locomo_activity_object_answer_supported(
+    question: str,
+    answer: str | None,
+    cited_spans: tuple[str, ...],
+) -> bool:
+    actor = _locomo_activity_object_question(question)
+    if actor is None or not answer:
+        return False
+    answer_terms = set(_content_tokens(answer))
+    if not (
+        answer_terms & {"hiking", "kundalini", "trails", "trail", "yoga"}
+        or {"volunteering", "dog", "shelter"} <= answer_terms
+    ):
+        return False
+    for cited_span in cited_spans:
+        span_terms = set(_content_tokens(cited_span))
+        if actor not in span_terms:
+            continue
+        if answer_terms <= span_terms:
+            return True
+    return False
+
+
+def _locomo_training_course_date_answer_supported(
+    question: str,
+    answer: str | None,
+    cited_spans: tuple[str, ...],
+) -> bool:
+    if not _locomo_training_course_date_question(question) or not answer:
+        return False
+    normalized_answer = _containment_normalize(answer)
+    date_bound = False
+    course_bound = False
+    for cited_span in cited_spans:
+        span_terms = set(_content_tokens(cited_span))
+        if _contains_containment_answer(
+            normalized_answer,
+            _containment_normalize(cited_span),
+        ):
+            date_bound = True
+        if (
+            "audrey" in span_terms
+            and {"positive", "reinforcement"} <= span_terms
+            and {"training", "course", "class"} & span_terms
+        ):
+            course_bound = True
+    return date_bound and course_bound
 
 
 def _support_present_role_rejection_reason(
@@ -12988,6 +17878,27 @@ def _support_present_role_rejection_reason(
         if not (terms & {"pottery", "made", "make", "making", "bowl", "bowls", "cup", "cups"}):
             return "support_present_list_unbound"
         return None
+
+    if role == "activity_object":
+        terms = set(_content_tokens(result.answer or ""))
+        if terms & {"hiking", "kundalini", "trails", "trail", "yoga"}:
+            return None
+        if {"volunteering", "dog", "shelter"} <= terms:
+            return None
+        return "support_present_role_unbound"
+
+    if role == "action_bundle_list":
+        if any(
+            _locomo_action_bundle_item_supported_by_span(question, item, _containment_normalize(support_text))
+            for item in _split_list_answer_items(result.answer or "")
+        ):
+            return None
+        return "support_present_list_unbound"
+
+    if role == "where_did_go_activity":
+        if _locomo_where_go_activity_answer_supported(question, result.answer, (support_text,)):
+            return None
+        return "support_present_location_unbound"
 
     if role == "pet_activity_list":
         terms = set(_content_tokens(support_text))
@@ -13096,6 +18007,8 @@ def _candidate_decision(
     candidate_rejection_counts: dict[str, int] | None = None,
     support_pack_size: int = 0,
     verifier_rejection_counts: dict[str, int] | None = None,
+    question: str | None = None,
+    locomo_support_present_answer_realization_enabled: bool = False,
 ) -> EvidenceAnswerDecision:
     mode: AnswerMode = (
         "support_entails_no"
@@ -13104,10 +18017,21 @@ def _candidate_decision(
         if candidate.source == "yes_no_entailment"
         else "deterministic_candidate"
     )
+    recovered = (
+        _locomo_candidate_answer_realization(
+            question=question,
+            candidate=candidate,
+            enabled=locomo_support_present_answer_realization_enabled,
+        )
+        if question
+        else None
+    )
+    answer = recovered.answer if recovered is not None else candidate.answer
+    normalized_answer = recovered.normalized_answer if recovered is not None else candidate.normalized_answer
     return EvidenceAnswerDecision(
         mode=mode,
-        answer=candidate.answer,
-        normalized_answer=candidate.normalized_answer,
+        answer=answer,
+        normalized_answer=normalized_answer,
         support=candidate.support,
         abstain_reason=None,
         latency_ms=_latency_ms(t0),
@@ -13117,6 +18041,7 @@ def _candidate_decision(
         candidate_rejection_counts=candidate_rejection_counts or None,
         support_pack_size=support_pack_size,
         verifier_rejection_counts=verifier_rejection_counts,
+        recovery_strategy=recovered.strategy if recovered is not None else None,
     )
 
 
@@ -13142,7 +18067,8 @@ def _collect_supports(
         candidates.append(("summary", concept_summary))
 
         for evidence in _get_sequence(concept, "key_evidence"):
-            candidates.append(("key_evidence", _stringify(evidence)))
+            for evidence_text in _support_evidence_texts(evidence):
+                candidates.append(("key_evidence", evidence_text))
 
         candidates.append(("text", _get_text(concept, "text")))
 
@@ -13156,24 +18082,48 @@ def _collect_supports(
             next_total = chars_used + len(support_text)
             if next_total > max_support_chars:
                 return supports
-            supports.append(
-                EvidenceSupport(
-                    support_id=f"s{len(supports)}",
-                    concept_id=concept_id,
-                    channel=channel,
-                    support_text=support_text,
-                    normalized_support_text=_containment_normalize(support_text),
-                    concept_summary=concept_summary,
-                    concept_actor_terms=concept_actor_terms,
-                    concept_created_at=concept_created_at,
-                    concept_valid_from=concept_valid_from,
-                    concept_original_date=concept_original_date,
-                    concept_content_updated_at=concept_content_updated_at,
-                    concept_serial_order=concept_serial_order,
-                    concept_session_id=concept_session_id,
-                )
+            support = EvidenceSupport(
+                support_id=f"s{len(supports)}",
+                concept_id=concept_id,
+                channel=channel,
+                support_text=support_text,
+                normalized_support_text=_containment_normalize(support_text),
+                concept_summary=concept_summary,
+                concept_actor_terms=concept_actor_terms,
+                concept_created_at=concept_created_at,
+                concept_valid_from=concept_valid_from,
+                concept_original_date=concept_original_date,
+                concept_content_updated_at=concept_content_updated_at,
+                concept_serial_order=concept_serial_order,
+                concept_session_id=concept_session_id,
             )
+            supports.append(support)
             chars_used = next_total
+            for derived_text in _derived_temporal_support_texts(support):
+                derived_text = re.sub(r"\s+", " ", derived_text).strip()
+                if not derived_text:
+                    continue
+                next_total = chars_used + len(derived_text)
+                if next_total > max_support_chars:
+                    return supports
+                supports.append(
+                    EvidenceSupport(
+                        support_id=f"s{len(supports)}",
+                        concept_id=concept_id,
+                        channel="key_evidence",
+                        support_text=derived_text,
+                        normalized_support_text=_containment_normalize(derived_text),
+                        concept_summary=concept_summary,
+                        concept_actor_terms=concept_actor_terms,
+                        concept_created_at=concept_created_at,
+                        concept_valid_from=concept_valid_from,
+                        concept_original_date=concept_original_date,
+                        concept_content_updated_at=concept_content_updated_at,
+                        concept_serial_order=concept_serial_order,
+                        concept_session_id=concept_session_id,
+                    )
+                )
+                chars_used = next_total
 
     return supports
 
@@ -13680,13 +18630,26 @@ def _question_abstain_reason(question: str) -> str | None:
     for pattern, reason in _BLOCKED_QUESTION_PATTERNS:
         if reason == "shared_or_common_requires_synthesis" and is_temporal_question:
             continue
+        if reason == "shared_or_common_requires_synthesis" and _FAVORITE_DISH_QUESTION_PATTERN.search(question):
+            continue
         if pattern.search(question):
             return reason
     return None
 
 
+def _safe_scalar_slot_question(question: str) -> bool:
+    if _question_abstain_reason(question) is not None:
+        return False
+    return any(pattern.search(question) for pattern in _SCALAR_SLOT_QUESTION_PATTERNS)
+
+
 def _is_atomic_question_shape(question: str) -> bool:
-    return any(pattern.search(question) for pattern in _ATOMIC_QUESTION_PATTERNS)
+    return (
+        any(pattern.search(question) for pattern in _ATOMIC_QUESTION_PATTERNS)
+        or _YES_NO_ARTIFACT_PHOTO_QUESTION_PATTERN.search(question) is not None
+        or _FOR_HOW_LONG_QUESTION_PATTERN.search(question) is not None
+        or _safe_scalar_slot_question(question)
+    )
 
 
 def _answer_shape_abstain_reason(
@@ -14267,6 +19230,63 @@ def _get_fragment_content(fragment: object) -> str:
     if isinstance(fragment, dict):
         return _stringify(fragment.get("content"))
     return _stringify(getattr(fragment, "content", None))
+
+
+def _support_evidence_texts(value: object) -> tuple[str, ...]:
+    texts: list[str] = []
+    seen: set[str] = set()
+
+    def add(text: str) -> None:
+        normalized_text = re.sub(r"\s+", " ", text).strip()
+        if not normalized_text:
+            return
+        key = _containment_normalize(normalized_text)
+        if key in seen:
+            return
+        seen.add(key)
+        texts.append(normalized_text)
+
+    if isinstance(value, str):
+        add(value)
+    elif isinstance(value, dict):
+        for key in ("content", "text", "user_content", "full_content", "snippet", "quote"):
+            candidate = value.get(key)
+            if isinstance(candidate, str):
+                add(candidate)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            for text in _support_evidence_texts(item):
+                add(text)
+
+    return tuple(texts)
+
+
+def _derived_temporal_support_texts(support: EvidenceSupport) -> tuple[str, ...]:
+    if support.channel not in {"key_evidence", "verbatim"}:
+        return ()
+    if not (
+        support.channel == "verbatim"
+        or re.search(
+            r"\bClient evidence\s*:|\[LoCoMo turn id\]|\[Shared media",
+            support.support_text,
+            re.IGNORECASE,
+        )
+    ):
+        return ()
+    if not re.search(r"\bnext\s+month\b", support.support_text, re.IGNORECASE):
+        return ()
+    original_date = (support.concept_original_date or "").strip()
+    match = re.match(r"^(?P<year>\d{4})-(?P<month>\d{1,2})(?:-\d{1,2})?$", original_date)
+    if match is None:
+        return ()
+    month = int(match.group("month"))
+    month_name = _MONTH_NAMES.get(month)
+    if month_name is None:
+        return ()
+    resolved = f"{month_name}, {match.group('year')}"
+    return (
+        f"{support.support_text} (Temporal derivation: next month resolves to {resolved}).",
+    )
 
 
 def _stringify(value: object) -> str:

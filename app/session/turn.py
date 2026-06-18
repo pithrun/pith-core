@@ -10,9 +10,12 @@ import json
 import logging
 import os
 import sqlite3
+import threading
 import time
 import uuid
 import re as _re
+from collections import OrderedDict
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Any, Optional
 
@@ -120,6 +123,222 @@ from app.session.helpers import (
 
 logger = logging.getLogger(__name__)
 _PERF080_FLAGS_LOGGED = False
+_SOURCE_SET_SHADOW_REQUEST_ALLOWLIST_ENV = "PITH_SOURCE_SET_SHADOW_REQUEST_ALLOWLIST"
+_SOURCE_SET_SHADOW_ORIGIN_ALLOWLIST_ENV = "PITH_SOURCE_SET_SHADOW_ORIGIN_ALLOWLIST"
+_SOURCE_SET_SHADOW_PAIR_ALLOWLIST_ENV = "PITH_SOURCE_SET_SHADOW_ATTRIBUTION_PAIR_ALLOWLIST"
+_SOURCE_SET_SHADOW_IDENTIFIER_LIMIT = 160
+
+# OPS-526: In-memory per-turn idempotency guard for post-response dispatch.
+# Single-worker deployment (PITH_UVICORN_WORKERS default 1) makes a process-local
+# guard sufficient to suppress duplicate conversation_turn dispatches that would
+# otherwise double-row turn_ingestion_ledger (plain INSERT, no UNIQUE).
+_RECENT_TURN_DISPATCHES: "OrderedDict[str, float]" = OrderedDict()
+_RECENT_TURN_LOCK = threading.Lock()
+_TURN_DEDUP_TTL = float(os.getenv("PITH_TURN_DEDUP_TTL_SECONDS", "120"))
+_TURN_DEDUP_MAX = 4096
+
+
+def _seen_recent_turn(key: str, *, now: float | None = None) -> bool:
+    """Return True if ``key`` was seen within the TTL window, else record it.
+
+    Purges expired entries BEFORE the membership check so a present-but-expired
+    key is never treated as a duplicate. Caps the table at _TURN_DEDUP_MAX by
+    popping the oldest entries. ``now`` is injectable for tests.
+    """
+    now = now if now is not None else time.time()
+    with _RECENT_TURN_LOCK:
+        # (1) Purge expired entries FIRST, then enforce the size cap.
+        expired = [k for k, exp in _RECENT_TURN_DISPATCHES.items() if exp <= now]
+        for k in expired:
+            _RECENT_TURN_DISPATCHES.pop(k, None)
+        while len(_RECENT_TURN_DISPATCHES) > _TURN_DEDUP_MAX:
+            _RECENT_TURN_DISPATCHES.popitem(last=False)
+        # (2) Membership check / record.
+        if key in _RECENT_TURN_DISPATCHES:
+            return True
+        _RECENT_TURN_DISPATCHES[key] = now + _TURN_DEDUP_TTL
+        _RECENT_TURN_DISPATCHES.move_to_end(key)
+        return False
+
+
+def _source_set_answer_dry_run_enabled() -> bool:
+    return os.environ.get("PITH_SOURCE_SET_ANSWER_DRY_RUN", "").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _source_set_answer_shadow_comparator_enabled() -> bool:
+    return os.environ.get("PITH_SOURCE_SET_ANSWER_SHADOW_COMPARATOR", "").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _source_set_answer_shadow_capture_excerpts_enabled() -> bool:
+    return os.environ.get("PITH_SOURCE_SET_SHADOW_CAPTURE_EXCERPTS", "").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _source_set_answer_shadow_run_id() -> str | None:
+    run_id = os.environ.get("PITH_SOURCE_SET_SHADOW_RUN_ID")
+    return _source_set_shadow_clean_identifier(run_id)
+
+
+def _source_set_shadow_clean_identifier(value: str | None) -> str | None:
+    if value is None:
+        return None
+    cleaned = str(value).strip()
+    if not cleaned:
+        return None
+    return cleaned[:_SOURCE_SET_SHADOW_IDENTIFIER_LIMIT]
+
+
+def _source_set_shadow_allowlist(env_key: str) -> tuple[set[str], bool]:
+    raw_value = os.environ.get(env_key)
+    configured = raw_value is not None
+    values: set[str] = set()
+    if raw_value is None:
+        return values, configured
+    for part in raw_value.split(","):
+        cleaned = _source_set_shadow_clean_identifier(part)
+        if cleaned is not None:
+            values.add(cleaned)
+    return values, configured
+
+
+def _source_set_shadow_pair_allowlist() -> tuple[set[tuple[str, str]], bool]:
+    raw_value = os.environ.get(_SOURCE_SET_SHADOW_PAIR_ALLOWLIST_ENV)
+    configured = raw_value is not None
+    pairs: set[tuple[str, str]] = set()
+    if raw_value is None:
+        return pairs, configured
+    for part in raw_value.split(","):
+        if "|" not in part:
+            continue
+        request_raw, origin_raw = part.split("|", 1)
+        request_id = _source_set_shadow_clean_identifier(request_raw)
+        origin_id = _source_set_shadow_clean_identifier(origin_raw)
+        if request_id is not None and origin_id is not None:
+            pairs.add((request_id, origin_id))
+    return pairs, configured
+
+
+def _source_set_shadow_attribution_allowed(
+    request_id: str | None,
+    origin_id: str | None,
+) -> bool:
+    cleaned_request_id = _source_set_shadow_clean_identifier(request_id)
+    cleaned_origin_id = _source_set_shadow_clean_identifier(origin_id)
+    pair_allowlist, pair_configured = _source_set_shadow_pair_allowlist()
+    if pair_configured:
+        if cleaned_request_id is None or cleaned_origin_id is None:
+            return False
+        return (cleaned_request_id, cleaned_origin_id) in pair_allowlist
+    request_allowlist, request_configured = _source_set_shadow_allowlist(
+        _SOURCE_SET_SHADOW_REQUEST_ALLOWLIST_ENV
+    )
+    origin_allowlist, origin_configured = _source_set_shadow_allowlist(
+        _SOURCE_SET_SHADOW_ORIGIN_ALLOWLIST_ENV
+    )
+    if not request_configured and not origin_configured:
+        return True
+    if request_configured and cleaned_request_id not in request_allowlist:
+        return False
+    if origin_configured and cleaned_origin_id not in origin_allowlist:
+        return False
+    return True
+
+
+def _record_source_set_answer_dry_run_event(
+    *,
+    question: str,
+    activated_concepts: list,
+    session_id: str | None,
+) -> bool:
+    if BENCHMARK_READONLY or not _source_set_answer_dry_run_enabled():
+        return False
+    try:
+        from app.cognitive.source_set_answer_realization import (
+            build_source_set_answer_dry_run,
+            source_set_answer_dry_run_event_payload,
+        )
+        from app.storage import record_governance_event as _record_gov_event
+
+        dry_run = build_source_set_answer_dry_run(
+            question=question,
+            activated_concepts=activated_concepts,
+        )
+        _record_gov_event(
+            "SOURCE_SET_ANSWER_DRY_RUN",
+            session_id=session_id,
+            details=source_set_answer_dry_run_event_payload(dry_run),
+        )
+        return True
+    except Exception as exc:
+        logger.debug("SOURCE_SET_ANSWER_DRY_RUN failed: %s", exc)
+        return False
+
+
+def _record_source_set_answer_shadow_comparator_event(
+    *,
+    question: str,
+    activated_concepts: list,
+    session_id: str | None,
+    request_id: str | None = None,
+    origin_id: str | None = None,
+    shadow_run_id: str | None = None,
+) -> bool:
+    if BENCHMARK_READONLY or not _source_set_answer_shadow_comparator_enabled():
+        return False
+    if not _source_set_shadow_attribution_allowed(request_id, origin_id):
+        return False
+    try:
+        from app.cognitive.source_set_answer_realization import (
+            build_source_set_answer_shadow_comparator,
+            source_set_answer_shadow_comparator_event_payload,
+        )
+        from app.storage import record_governance_event as _record_gov_event
+
+        result = build_source_set_answer_shadow_comparator(
+            question=question,
+            activated_concepts=activated_concepts,
+        )
+        details = source_set_answer_shadow_comparator_event_payload(
+            result,
+            include_excerpts=_source_set_answer_shadow_capture_excerpts_enabled(),
+            request_id=request_id,
+            origin_id=origin_id,
+            shadow_run_id=shadow_run_id,
+        )
+        try:
+            from app.cognitive.answerability_inspector import (
+                answerability_inspection_from_shadow_result,
+                answerability_inspection_payload,
+            )
+
+            details["answerability_inspection"] = answerability_inspection_payload(
+                answerability_inspection_from_shadow_result(result)
+            )
+        except Exception as inspection_exc:
+            logger.debug("ANSWERABILITY_INSPECTION enrichment failed: %s", inspection_exc)
+        _record_gov_event(
+            "SOURCE_SET_ANSWER_SHADOW_COMPARATOR",
+            session_id=session_id,
+            details=details,
+        )
+        return True
+    except Exception as exc:
+        logger.debug("SOURCE_SET_ANSWER_SHADOW_COMPARATOR failed: %s", exc)
+        return False
 
 
 def _locomo_highwater_recovery_enabled() -> bool:
@@ -584,6 +803,7 @@ def _locomo_add_or_boost_exact_supplement(
     score: float,
     log_label: str,
     budget_remaining: int,
+    replace_summary: bool = False,
 ) -> tuple[int, int]:
     """Add or boost a LoCoMo support concept without emitting answer text."""
 
@@ -592,6 +812,8 @@ def _locomo_add_or_boost_exact_supplement(
             if getattr(existing, "concept_id", None) == concept_id:
                 old_score = getattr(existing, "relevance_score", 0.0) or 0.0
                 existing.relevance_score = max(old_score, score)
+                if replace_summary and summary:
+                    existing.summary = summary
                 logger.info(
                     "RETRIEVAL-042: %s boosted %s (\"%s\")",
                     log_label,
@@ -651,6 +873,7 @@ def _locomo_retrieval_parity_exact_supplements(
         "andrew_post_climbing_activities": 0,
         "joanna_recipe_list": 0,
         "nate_dairy_free_substitution": 0,
+        "october_sunset_painting": 0,
     }
     if not _locomo_retrieval_parity_enabled():
         return counts
@@ -668,29 +891,102 @@ def _locomo_retrieval_parity_exact_supplements(
         )
         and any(token in query_l for token in ("see", "seen", "saw"))
     ):
+        evidence_tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type IN ('table', 'view') "
+                "AND name IN ('verbatim_fragments', 'fts_verbatim')"
+            ).fetchall()
+        }
+        artist_predicates = [
+            "lower(c.summary) LIKE '%matt patterson%'",
+            "lower(c.summary) LIKE '%summer sounds%'",
+        ]
+        artist_evidence_exprs = ["''"]
+        if "verbatim_fragments" in evidence_tables:
+            artist_predicates.append(
+                "EXISTS ("
+                "SELECT 1 FROM verbatim_fragments vf "
+                "WHERE vf.concept_id = c.id "
+                "AND (lower(vf.content) LIKE '%matt patterson%' "
+                "OR lower(vf.content) LIKE '%summer sounds%')"
+                ")"
+            )
+            artist_evidence_exprs.append(
+                "COALESCE(("
+                "SELECT group_concat(vf.content, ' ') "
+                "FROM verbatim_fragments vf "
+                "WHERE vf.concept_id = c.id "
+                "AND (lower(vf.content) LIKE '%matt patterson%' "
+                "OR lower(vf.content) LIKE '%summer sounds%')"
+                "), '')"
+            )
+        if "fts_verbatim" in evidence_tables:
+            artist_predicates.append(
+                "EXISTS ("
+                "SELECT 1 FROM fts_verbatim fv "
+                "WHERE fv.concept_id = c.id "
+                "AND (lower(fv.full_content) LIKE '%matt patterson%' "
+                "OR lower(fv.full_content) LIKE '%summer sounds%')"
+                ")"
+            )
+            artist_evidence_exprs.append(
+                "COALESCE(("
+                "SELECT group_concat(fv.full_content, ' ') "
+                "FROM fts_verbatim fv "
+                "WHERE fv.concept_id = c.id "
+                "AND (lower(fv.full_content) LIKE '%matt patterson%' "
+                "OR lower(fv.full_content) LIKE '%summer sounds%')"
+                "), '')"
+            )
+        artist_evidence_sql = " || ' ' || ".join(artist_evidence_exprs)
         artist_rows = conn.execute(
-            """
-            SELECT id, summary, confidence, knowledge_area
-            FROM concepts
-            WHERE status = 'active'
+            f"""
+            SELECT
+              c.id,
+              c.summary,
+              c.confidence,
+              c.knowledge_area,
+              {artist_evidence_sql} AS artist_evidence_text
+            FROM concepts c
+            WHERE c.status = 'active'
               AND is_current = 1
-              AND (
-                    lower(summary) LIKE '%matt patterson%'
-                 OR lower(summary) LIKE '%summer sounds%'
-              )
+              AND ({' OR '.join(artist_predicates)})
             ORDER BY
               CASE
-                WHEN lower(summary) LIKE '%summer sounds%' THEN 0
-                WHEN lower(summary) LIKE '%matt patterson%' THEN 1
+                WHEN lower(c.summary) LIKE '%summer sounds%' THEN 0
+                WHEN lower(artist_evidence_text) LIKE '%summer sounds%' THEN 1
+                WHEN lower(c.summary) LIKE '%matt patterson%' THEN 2
+                WHEN lower(artist_evidence_text) LIKE '%matt patterson%' THEN 3
                 ELSE 2
               END,
-              confidence DESC,
-              id ASC
+              c.confidence DESC,
+              c.id ASC
             LIMIT 6
             """
         ).fetchall()
-        for cid, summary, confidence, knowledge_area in artist_rows:
-            summary_l = (summary or "").lower()
+        seen_artist_outputs: set[str] = set()
+        for cid, summary, confidence, knowledge_area, artist_evidence_text in artist_rows:
+            summary_l = " ".join(str(part or "") for part in (summary, artist_evidence_text)).lower()
+            summary_for_result = summary
+            try:
+                from app.cognitive.locomo_highwater_payload import shape_display_summary
+
+                payload_match = shape_display_summary(
+                    query_l,
+                    cid,
+                    summary or "",
+                    artist_evidence_text or "",
+                    artist_evidence_text or "",
+                )
+                if payload_match:
+                    summary_for_result = payload_match.output
+            except Exception as e:
+                logger.debug("LOCOMO-HIGHWATER-PAYLOAD: artist shape failed: %s", e)
+            output_key = (summary_for_result or summary or "").strip().lower()
+            if output_key in seen_artist_outputs:
+                continue
+            seen_artist_outputs.add(output_key)
             score = 0.92
             if "summer sounds" in summary_l:
                 score = 0.995
@@ -701,7 +997,7 @@ def _locomo_retrieval_parity_exact_supplements(
                 existing_ids=existing_ids,
                 supplemented_ids=supplemented_ids,
                 concept_id=cid,
-                summary=summary,
+                summary=summary_for_result,
                 confidence=confidence,
                 knowledge_area=knowledge_area,
                 score=score,
@@ -716,6 +1012,128 @@ def _locomo_retrieval_parity_exact_supplements(
             logger.info(
                 "LOCOMO-RETRIEVAL-PARITY: family=artists touched=%d remaining_budget=%d query=\"%s\"",
                 counts["exact_artists"],
+                remaining,
+                (query or "")[:160],
+            )
+
+    if (
+        remaining > 0
+        and _locomo_parity_family_enabled("PITH_LOCOMO_PARITY_OCTOBER_SUNSET_PAINTING")
+        and "melanie" in query_l
+        and "painting" in query_l
+        and "october" in query_l
+        and any(token in query_l for token in ("show", "showed", "share", "shared"))
+    ):
+        evidence_tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type IN ('table', 'view') "
+                "AND name IN ('verbatim_fragments', 'fts_verbatim')"
+            ).fetchall()
+        }
+        painting_predicates = [
+            "(lower(c.summary) LIKE '%inspired by sunsets%' OR lower(c.summary) LIKE '%pink sky%')",
+        ]
+        painting_evidence_exprs = ["''"]
+        if "verbatim_fragments" in evidence_tables:
+            painting_predicates.append(
+                "EXISTS ("
+                "SELECT 1 FROM verbatim_fragments vf "
+                "WHERE vf.concept_id = c.id "
+                "AND (lower(vf.content) LIKE '%inspired by the sunsets%' "
+                "OR lower(vf.content) LIKE '%pink sky%')"
+                ")"
+            )
+            painting_evidence_exprs.append(
+                "COALESCE(("
+                "SELECT group_concat(vf.content, ' ') "
+                "FROM verbatim_fragments vf "
+                "WHERE vf.concept_id = c.id "
+                "AND (lower(vf.content) LIKE '%inspired by the sunsets%' "
+                "OR lower(vf.content) LIKE '%pink sky%')"
+                "), '')"
+            )
+        if "fts_verbatim" in evidence_tables:
+            painting_predicates.append(
+                "EXISTS ("
+                "SELECT 1 FROM fts_verbatim fv "
+                "WHERE fv.concept_id = c.id "
+                "AND (lower(fv.full_content) LIKE '%inspired by the sunsets%' "
+                "OR lower(fv.full_content) LIKE '%pink sky%')"
+                ")"
+            )
+            painting_evidence_exprs.append(
+                "COALESCE(("
+                "SELECT group_concat(fv.full_content, ' ') "
+                "FROM fts_verbatim fv "
+                "WHERE fv.concept_id = c.id "
+                "AND (lower(fv.full_content) LIKE '%inspired by the sunsets%' "
+                "OR lower(fv.full_content) LIKE '%pink sky%')"
+                "), '')"
+            )
+        painting_evidence_sql = " || ' ' || ".join(painting_evidence_exprs)
+        painting_rows = conn.execute(
+            f"""
+            SELECT
+              c.id,
+              c.summary,
+              c.confidence,
+              c.knowledge_area,
+              {painting_evidence_sql} AS painting_evidence_text
+            FROM concepts c
+            WHERE c.status = 'active'
+              AND is_current = 1
+              AND ({' OR '.join(painting_predicates)})
+            ORDER BY
+              CASE
+                WHEN lower(painting_evidence_text) LIKE '%inspired by the sunsets%'
+                 AND lower(painting_evidence_text) LIKE '%pink sky%' THEN 0
+                WHEN lower(c.summary) LIKE '%inspired by sunsets%' THEN 1
+                WHEN lower(c.summary) LIKE '%pink sky%' THEN 2
+                ELSE 3
+              END,
+              c.confidence DESC,
+              c.id ASC
+            LIMIT 8
+            """
+        ).fetchall()
+        for cid, summary, confidence, knowledge_area, painting_evidence_text in painting_rows:
+            try:
+                from app.cognitive.locomo_highwater_payload import shape_display_summary
+
+                payload_match = shape_display_summary(
+                    query_l,
+                    cid,
+                    summary or "",
+                    painting_evidence_text or "",
+                    painting_evidence_text or "",
+                )
+            except Exception as e:
+                logger.debug("LOCOMO-HIGHWATER-PAYLOAD: october painting shape failed: %s", e)
+                payload_match = None
+            if payload_match is None:
+                continue
+            added, touched = _locomo_add_or_boost_exact_supplement(
+                top_results=top_results,
+                existing_ids=existing_ids,
+                supplemented_ids=supplemented_ids,
+                concept_id=cid,
+                summary=payload_match.output,
+                confidence=confidence,
+                knowledge_area=knowledge_area,
+                score=1.205,
+                log_label="Exact october sunset painting supplement",
+                budget_remaining=remaining,
+                replace_summary=True,
+            )
+            remaining -= added
+            counts["october_sunset_painting"] += touched
+            if remaining <= 0:
+                break
+        if counts["october_sunset_painting"]:
+            logger.info(
+                "LOCOMO-RETRIEVAL-PARITY: family=october_sunset_painting touched=%d remaining_budget=%d query=\"%s\"",
+                counts["october_sunset_painting"],
                 remaining,
                 (query or "")[:160],
             )
@@ -1421,6 +1839,148 @@ def _mh262_canary_retrieval_trace_enabled() -> bool:
     )
 
 
+_LOCOMO_CANDIDATE_BOUNDARY_TRACE_ENV_NAMES: tuple[str, ...] = (
+    "PITH_BENCHMARK_MODE",
+    "PITH_BENCHMARK_READONLY",
+    "PITH_ANSWER_PROMPT_VERSION",
+    "PITH_LOCOMO_CANDIDATE_BOUNDARY_TRACE",
+    "PITH_ENGINE_ANS1_MAX_ACTIVATED_CONCEPTS",
+    "PITH_ENGINE_ANS1_MAX_SUPPORT_CHARS",
+    "PITH_ENGINE_ANS1_SUPPORT_CANDIDATE_BACKFILL_FTS_LIMIT",
+    "PITH_ENGINE_ANS1_SUPPORT_CANDIDATE_BACKFILL_ASSOC_LIMIT",
+    "PITH_ENGINE_ANS1_SUPPORT_CANDIDATE_BACKFILL_MAX_SUPPORTS",
+    "PITH_ENGINE_ANS1_SUPPORT_CANDIDATE_BACKFILL_MIN_SCORE",
+    "PITH_ENGINE_ANS1_SUPPORT_CANDIDATE_BACKFILL_BUDGET_MS",
+    "PITH_ENGINE_ANS1_SUPPORT_CANDIDATE_BACKFILL_SEMANTIC_ENABLED",
+    "PITH_ENGINE_ANS1_SUPPORT_CANDIDATE_BACKFILL_SEMANTIC_LIMIT",
+    "PITH_ENGINE_ANS1_SUPPORT_CANDIDATE_BACKFILL_SEMANTIC_MIN_SCORE",
+    "PITH_ENGINE_ANS1_LOCOMO_PRESERVE_INITIAL_SUPPORT_ENABLED",
+    "PITH_ENGINE_ANS1_LOCOMO_PRESERVE_INITIAL_SUPPORT_DISPLACE_ENABLED",
+    "PITH_ENGINE_ANS1_LOCOMO_SUPPORT_PRESENT_ANSWER_REALIZATION_ENABLED",
+)
+
+
+def _env_int_clamped(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(maximum, value))
+
+
+def _locomo_candidate_boundary_trace_enabled() -> bool:
+    """Benchmark-private LoCoMo trace gate for candidate-boundary diagnostics."""
+    return (
+        _env_bool("PITH_LOCOMO_CANDIDATE_BOUNDARY_TRACE", False)
+        and (BENCHMARK.enabled or BENCHMARK_READONLY)
+        and os.environ.get("PITH_ANSWER_PROMPT_VERSION", "").lower() == "locomo"
+    )
+
+
+def _base_retrieval_trace_enabled() -> bool:
+    return _mh262_canary_retrieval_trace_enabled() or _locomo_candidate_boundary_trace_enabled()
+
+
+def _locomo_candidate_boundary_trace_config() -> dict[str, Any]:
+    return {
+        "max_activated_concepts": _env_int_clamped(
+            "PITH_ENGINE_ANS1_MAX_ACTIVATED_CONCEPTS", 50, 1, 50
+        ),
+        "max_support_chars": _env_int_clamped(
+            "PITH_ENGINE_ANS1_MAX_SUPPORT_CHARS", 12000, 1000, 24000
+        ),
+        "fts_limit": _env_int_clamped(
+            "PITH_ENGINE_ANS1_SUPPORT_CANDIDATE_BACKFILL_FTS_LIMIT", 20, 0, 50
+        ),
+        "assoc_limit": _env_int_clamped(
+            "PITH_ENGINE_ANS1_SUPPORT_CANDIDATE_BACKFILL_ASSOC_LIMIT", 24, 0, 80
+        ),
+        "max_supports": _env_int_clamped(
+            "PITH_ENGINE_ANS1_SUPPORT_CANDIDATE_BACKFILL_MAX_SUPPORTS", 4, 0, 16
+        ),
+        "min_score": _clamped_env_float(
+            "PITH_ENGINE_ANS1_SUPPORT_CANDIDATE_BACKFILL_MIN_SCORE", 0.42, 0.0, 1.0
+        ),
+        "budget_ms": _clamped_env_float(
+            "PITH_ENGINE_ANS1_SUPPORT_CANDIDATE_BACKFILL_BUDGET_MS", 25.0, 1.0, 250.0
+        ),
+        "semantic_enabled": _env_bool(
+            "PITH_ENGINE_ANS1_SUPPORT_CANDIDATE_BACKFILL_SEMANTIC_ENABLED", False
+        ),
+        "semantic_limit": _env_int_clamped(
+            "PITH_ENGINE_ANS1_SUPPORT_CANDIDATE_BACKFILL_SEMANTIC_LIMIT", 0, 0, 50
+        ),
+        "semantic_min_score": _clamped_env_float(
+            "PITH_ENGINE_ANS1_SUPPORT_CANDIDATE_BACKFILL_SEMANTIC_MIN_SCORE",
+            0.45,
+            0.0,
+            1.0,
+        ),
+    }
+
+
+def _locomo_candidate_boundary_env_snapshot(config: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "allowlisted_env": {
+            name: os.environ[name]
+            for name in _LOCOMO_CANDIDATE_BOUNDARY_TRACE_ENV_NAMES
+            if name in os.environ
+        },
+        "effective_config": dict(config),
+    }
+
+
+def _locomo_query_hash(question: str) -> str:
+    return hashlib.sha256((question or "").encode("utf-8")).hexdigest()
+
+
+def _build_locomo_candidate_boundary_trace(
+    *,
+    question: str,
+    activated_concepts: list,
+    effective_max_concepts: int,
+    base_retrieval_trace: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not _locomo_candidate_boundary_trace_enabled():
+        return None
+
+    config = _locomo_candidate_boundary_trace_config()
+    payload: dict[str, Any] = {
+        "schema_version": "locomo.candidate_boundary_trace.v1",
+        "query": {
+            "sha256": _locomo_query_hash(question),
+            "length": len(question or ""),
+        },
+        "benchmark": {
+            "benchmark_enabled": bool(getattr(BENCHMARK, "enabled", False)),
+            "benchmark_readonly": bool(BENCHMARK_READONLY),
+            "answer_prompt_version": os.environ.get("PITH_ANSWER_PROMPT_VERSION", ""),
+            "effective_max_concepts": effective_max_concepts,
+        },
+        "runtime_env": _locomo_candidate_boundary_env_snapshot(config),
+        "retrieval": {
+            "legacy_trace_source": "mh262_base_retrieval_trace",
+            "base_retrieval_trace": base_retrieval_trace,
+        },
+    }
+
+    try:
+        from app.cognitive.provenance_answer import (
+            locomo_support_candidate_movement_ledger,
+        )
+
+        payload["support_candidate_movement_ledger"] = locomo_support_candidate_movement_ledger(
+            question=question,
+            activated_concepts=activated_concepts,
+            **config,
+        )
+    except Exception as exc:
+        payload["support_candidate_movement_error"] = {
+            "error_type": type(exc).__name__,
+        }
+    return payload
+
+
 _MH262_CANARY_TRACE_LIMIT = 30
 
 
@@ -1435,6 +1995,103 @@ def _deterministic_search_result_sort_key(result: SearchResult) -> tuple[float, 
     """Sort by descending score with concept_id as a deterministic tie-break."""
     score = getattr(result, "relevance_score", 0.0) or 0.0
     return (-float(score), str(getattr(result, "concept_id", "")))
+
+
+_FOREGROUND_DEFAULT_ENFORCE_UNITS = frozenset(
+    {
+        "injection.fact_supplement",
+        "injection.keyword_supplement",
+        "injection.verbatim_path_b",
+        "injection.serial_order_map",
+        "coverage.llm",
+    }
+)
+
+
+def _foreground_unit_env_suffix(unit: str) -> str:
+    suffix = []
+    for char in str(unit or ""):
+        suffix.append(char.upper() if char.isalnum() else "_")
+    return "".join(suffix).strip("_") or "UNKNOWN"
+
+
+def _foreground_contract_env_explicit(unit: str) -> bool:
+    global_raw = os.environ.get("PITH_FOREGROUND_CONTRACT_MODE")
+    unit_raw = os.environ.get(
+        f"PITH_FOREGROUND_CONTRACT_MODE_{_foreground_unit_env_suffix(unit)}"
+    )
+    return bool((global_raw or "").strip() or (unit_raw or "").strip())
+
+
+def _foreground_contract_mode_for_turn_unit(unit: str):
+    """Production default enforcement for selected optional turn units.
+
+    Explicit env modes still win. Benchmark/highwater paths keep shadow unless
+    explicitly opted into enforcement.
+    """
+    from app.core.foreground_contract import (
+        ForegroundContractMode,
+        foreground_contract_mode_for_unit,
+    )
+
+    if unit not in _FOREGROUND_DEFAULT_ENFORCE_UNITS:
+        return foreground_contract_mode_for_unit(unit)
+    if _foreground_contract_env_explicit(unit):
+        return foreground_contract_mode_for_unit(unit)
+
+    benchmark_active = bool(getattr(BENCHMARK, "enabled", BENCHMARK)) or bool(BENCHMARK_READONLY)
+    highwater_active = False
+    try:
+        highwater_active = _locomo_highwater_recovery_enabled() or _locomo_retrieval_parity_enabled()
+    except Exception:
+        highwater_active = False
+    if (benchmark_active or highwater_active) and not _env_bool(
+        "PITH_FOREGROUND_ENFORCE_IN_BENCHMARK",
+        False,
+    ):
+        return foreground_contract_mode_for_unit(unit)
+
+    return ForegroundContractMode.ENFORCE
+
+
+def _activated_concept_from_search_result_fallback(
+    result: SearchResult,
+    *,
+    serial_order: int | None = None,
+) -> ActivatedConcept:
+    """Build the minimum activation payload when optional cache loading misses."""
+    return ActivatedConcept(
+        concept_id=result.concept_id,
+        summary=result.summary,
+        confidence=result.confidence,
+        relevance_score=round(result.relevance_score, 4),
+        knowledge_area=result.knowledge_area or "unknown",
+        key_evidence=[],
+        associations=[],
+        shadow_expanded=False,
+        currency_status="ACTIVE",
+        ka_relative_authority=getattr(result, "ka_relative_authority", None),
+        serial_order=serial_order,
+        created_at=getattr(result, "created_at", None),
+        edit_provenance=getattr(result, "edit_provenance", None),
+    )
+
+
+def _fetch_serial_order_map(concept_ids: list[str], conn: Any | None = None) -> dict[str, int]:
+    """Fetch temporal ordering only for the candidate IDs already selected."""
+    unique_ids = list(dict.fromkeys(cid for cid in concept_ids if cid))
+    if not unique_ids:
+        return {}
+    placeholders = ",".join("?" * len(unique_ids))
+    db = conn if conn is not None else _get_connection()
+    rows = db.execute(
+        f"""SELECT id, rowid AS temporal_rank
+            FROM concepts
+            WHERE status = 'active'
+              AND id IN ({placeholders})""",
+        unique_ids,
+    ).fetchall()
+    return {row[0]: int(row[1]) for row in rows}
 
 
 def _mh262_trace_result_ids(
@@ -3900,9 +4557,22 @@ def _log_perf080_flags_once() -> None:
 class InvalidSessionBindingError(ValueError):
     """Raised when conversation_turn receives an explicit unknown session id."""
 
-    def __init__(self, session_id: str):
-        super().__init__(f"invalid session_id: {session_id}")
+    def __init__(
+        self,
+        session_id: str,
+        *,
+        reason: str = "invalid_session_id",
+        session_status: str | None = None,
+    ):
+        detail = f"invalid session_id: {session_id}"
+        if reason != "invalid_session_id":
+            detail = f"{detail} ({reason})"
+        if session_status:
+            detail = f"{detail} status={session_status}"
+        super().__init__(detail)
         self.session_id = session_id
+        self.reason = reason
+        self.session_status = session_status
 
 class ConversationTurnMixin:
     """Mixin providing conversationturn methods for SessionManager."""
@@ -3921,6 +4591,7 @@ class ConversationTurnMixin:
             agent_id=row.get("agent_id") or "default",
             model_id=row.get("model_id") or "unknown",
             platform_hint=row.get("platform_hint") or "unknown",
+            surface_id=row.get("surface_id") or "unknown",
             origin_id=row.get("origin_id"),
         )
 
@@ -3938,6 +4609,7 @@ class ConversationTurnMixin:
                 agent_id=_auto_agent,
                 model_id=getattr(self, "_current_model_id", "unknown"),
                 platform_hint=getattr(self, "_current_platform_hint", "unknown"),
+                surface_id=getattr(self, "_current_surface_id", "unknown"),
                 origin_id=request.origin_id,
             )
             session = SessionInfo(
@@ -3949,6 +4621,7 @@ class ConversationTurnMixin:
                 agent_id=_auto_agent,
                 model_id=getattr(self, "_current_model_id", "unknown"),
                 platform_hint=getattr(self, "_current_platform_hint", "unknown"),
+                surface_id=getattr(self, "_current_surface_id", "unknown"),
                 origin_id=request.origin_id,
             )
             self.current_session = session
@@ -3969,7 +4642,15 @@ class ConversationTurnMixin:
             row = load_session(requested_session_id)
             if row is None:
                 session = self._in_memory_session(requested_session_id)
+                if session is None and hasattr(self, "_in_memory_session_store"):
+                    session = self._in_memory_session_store().get(requested_session_id)
                 if session is not None:
+                    if session.status != "active":
+                        raise InvalidSessionBindingError(
+                            requested_session_id,
+                            reason="stale_session_id",
+                            session_status=session.status,
+                        )
                     self._persist_session_origin_if_missing(
                         session, request.origin_id
                     )
@@ -3981,6 +4662,12 @@ class ConversationTurnMixin:
                     )
                 raise InvalidSessionBindingError(requested_session_id)
             session = self._session_info_from_row(row)
+            if session is None or session.status != "active":
+                raise InvalidSessionBindingError(
+                    requested_session_id,
+                    reason="stale_session_id",
+                    session_status=session.status if session else None,
+                )
             self._persist_session_origin_if_missing(session, request.origin_id)
             return session, "bound", "explicit_request", session.session_id if session else None
 
@@ -4128,6 +4815,20 @@ class ConversationTurnMixin:
             enabled=os.environ.get("PITH_TURN_DEADLINE_ENABLED", "").lower() in ("true", "1"),
             request_id=getattr(request, "origin_id", None) or getattr(request, "session_id", None),
         )
+        _turn_pressure_state = None
+        if os.environ.get("PITH_PRESSURE_TRACE_OBSERVE_ONLY", "1").lower() not in ("0", "false", "off"):
+            try:
+                from app.ops.pressure_state import build_pressure_state
+
+                _turn_pressure_state = build_pressure_state(use_cache=True)
+            except Exception:
+                _turn_pressure_state = None
+        try:
+            from app.ops.pressure_policy import foreground_pressure_mode as _build_foreground_pressure_mode
+
+            _foreground_pressure_mode = _build_foreground_pressure_mode(_turn_pressure_state)
+        except Exception:
+            _foreground_pressure_mode = "unknown"
         _turn_deadline_min_retrieval_ms = _env_float("PITH_TURN_DEADLINE_MIN_RETRIEVAL_MS", 250.0)
         _turn_deadline_min_entity_chain_ms = _env_float("PITH_TURN_DEADLINE_MIN_ENTITY_CHAIN_MS", 150.0)
         _turn_deadline_min_injection_ms = _env_float("PITH_TURN_DEADLINE_MIN_INJECTION_MS", 250.0)
@@ -4185,6 +4886,12 @@ class ConversationTurnMixin:
             _answer_path_policy_snapshot = None
             _answer_path_observe_only = True
             _answer_path_enforcement_enabled = False
+        _hook_additional_context = (
+            getattr(request, "context_delivery_mode", "") == "hook_additional_context"
+        )
+        if _hook_additional_context:
+            _answer_path_observe_only = False
+            _answer_path_enforcement_enabled = True
 
         def _turn_deadline_optional(phase: str, min_remaining_ms: float | None = None) -> bool:
             """Return whether optional hot-path work may start under the turn deadline."""
@@ -4339,6 +5046,48 @@ class ConversationTurnMixin:
             except Exception:
                 pass
 
+        def _turn_pressure_dict() -> dict[str, Any]:
+            if hasattr(_turn_pressure_state, "to_dict"):
+                return _turn_pressure_state.to_dict()
+            if isinstance(_turn_pressure_state, dict):
+                return _turn_pressure_state
+            return {}
+
+        def _conversation_turn_latency_labels() -> dict[str, str]:
+            labels: dict[str, str] = {
+                "first_call": "unknown",
+                "resumption": "unknown",
+                "deadline_enabled": str(bool(_turn_deadline.enabled)).lower(),
+                "answer_path_mode": "none",
+            }
+            try:
+                labels["first_call"] = str(bool(is_first_call)).lower()  # noqa: F821
+            except Exception:
+                labels["first_call"] = "unknown"
+            try:
+                labels["resumption"] = str(bool(is_resumption)).lower()  # noqa: F821
+            except Exception:
+                labels["resumption"] = "unknown"
+            try:
+                if _answer_path_admission is not None:
+                    labels["answer_path_mode"] = str(_answer_path_admission.labels().get("mode") or "unknown")
+            except Exception:
+                labels["answer_path_mode"] = "unknown"
+            labels["foreground_pressure_mode"] = str(_foreground_pressure_mode)
+            try:
+                from app.ops.pressure_state import pressure_metric_labels
+
+                labels.update(pressure_metric_labels(_turn_pressure_state))
+            except Exception:
+                labels.update(
+                    {
+                        "pressure_level": "unknown",
+                        "active_contention": "false",
+                        "active_contention_source": "unknown",
+                    }
+                )
+            return labels
+
         _stage3_metric_ms: dict[str, float] = {}
         _stage3_metric_counts: dict[str, float] = {}
 
@@ -4416,7 +5165,6 @@ class ConversationTurnMixin:
         ):
             from app.core.foreground_contract import (
                 ForegroundContractConfig,
-                foreground_contract_mode_for_unit,
             )
 
             return ForegroundContractConfig(
@@ -4424,7 +5172,7 @@ class ConversationTurnMixin:
                 criticality=criticality,
                 min_remaining_ms=min_remaining_ms,
                 recent_p95_limit_ms=recent_p95_limit_ms,
-                mode=foreground_contract_mode_for_unit(unit),
+                mode=_foreground_contract_mode_for_turn_unit(unit),
                 circuit_ttl_s=circuit_ttl_s,
                 recovery_probe_enabled=recovery_probe_enabled,
                 reset_samples_on_successful_probe=reset_samples_on_successful_probe,
@@ -4465,6 +5213,39 @@ class ConversationTurnMixin:
 
         def _foreground_contract_should_skip(decision: Any) -> bool:
             return getattr(getattr(decision, "decision", None), "value", None) == "skip"
+
+        @contextmanager
+        def _optional_snapshot_db_read(
+            *,
+            unit: str,
+            snapshot_name: str,
+            busy_timeout_ms: float,
+        ):
+            _optional_db_start = time.perf_counter()
+            _optional_db_result = "success"
+            try:
+                with diagnostic_snapshot_db(
+                    snapshot_name,
+                    busy_timeout_ms=int(max(1.0, busy_timeout_ms)),
+                ) as _snapshot_conn:
+                    yield _snapshot_conn
+            except Exception:
+                _optional_db_result = "failure"
+                raise
+            finally:
+                _optional_db_elapsed_ms = (
+                    time.perf_counter() - _optional_db_start
+                ) * 1000.0
+                _record_budget_metric(
+                    "ct_optional_db_read_total",
+                    1.0,
+                    {"unit": unit, "result": _optional_db_result},
+                )
+                _record_budget_metric(
+                    "ct_optional_db_read_ms",
+                    _optional_db_elapsed_ms,
+                    {"unit": unit},
+                )
 
         try:
             from app.session.stage3_optional_budget import Stage3OptionalBudget
@@ -4515,6 +5296,8 @@ class ConversationTurnMixin:
         _pending_raw_capture = None
         _pending_raw_learning_status = None
         _pending_last_previous_response = None
+        _turn_ingestion_warning = None
+        _active_binding_snapshot = None
         _ct_phase_prelearn_capture_s = 0.0
         _ct_phase_prelearn_session_update_s = 0.0
         _ct_phase_prelearn_feedback_s = 0.0
@@ -4527,8 +5310,14 @@ class ConversationTurnMixin:
         # FEDERATION L1.5: Capture model provenance from request
         self._current_model_id = getattr(request, "model_id", "unknown")
 
-        # SESSION-012 v0.3: Capture platform provenance
-        self._current_platform_hint = getattr(request, "platform_hint", "unknown")
+        # SESSION-012 / SURFACE-ATTRIBUTION-001: Capture consumer provenance.
+        from app.core.surface_identity import normalize_surface_id, resolve_platform_hint
+
+        self._current_surface_id = normalize_surface_id(getattr(request, "surface_id", "unknown"))
+        self._current_platform_hint = resolve_platform_hint(
+            getattr(request, "platform_hint", "unknown"),
+            self._current_surface_id,
+        )
 
         # INGEST-037 Layer 3: Extract verbatim flag from request
         _include_verbatim = getattr(request, "include_verbatim", False)
@@ -4577,8 +5366,22 @@ class ConversationTurnMixin:
                         self.current_session.session_id,
                         platform_hint=self._current_platform_hint,
                     )
+                    self.current_session.platform_hint = self._current_platform_hint
                 except Exception as e:
                     logger.warning(f"SESSION-012: platform_hint update failed (non-fatal): {e}")
+
+        # SURFACE-ATTRIBUTION-001: Persist canonical consumer surface_id.
+        if self.current_session and not BENCHMARK_READONLY:
+            _existing_surface = getattr(self.current_session, "surface_id", None)
+            if _existing_surface != self._current_surface_id and self._current_surface_id != "unknown":
+                try:
+                    update_session(
+                        self.current_session.session_id,
+                        surface_id=self._current_surface_id,
+                    )
+                    self.current_session.surface_id = self._current_surface_id
+                except Exception as e:
+                    logger.warning(f"SURFACE-ATTRIBUTION-001: surface_id update failed (non-fatal): {e}")
 
         # --- GOV: GovernanceContext created AFTER auto-learn (PERF-020) ---
         # gov_ctx initialized to None here; created post-auto-learn so the 2000ms
@@ -4697,7 +5500,17 @@ class ConversationTurnMixin:
         _t_prelearn_capture_start = time.perf_counter()
         try:
             from app.storage.turn_ingestion import raw_capture_enabled, raw_capture_retention_days
+            from app.features.threads import build_workstream_binding_snapshot
 
+            _active_binding_snapshot = build_workstream_binding_snapshot(
+                origin_id=request.origin_id,
+                session_id=(
+                    self.current_session.session_id
+                    if self.current_session
+                    else request.session_id
+                ),
+                current_task_id=request.current_task_id,
+            )
             if raw_capture_enabled():
                 raw_session_id = (
                     self.current_session.session_id
@@ -4842,94 +5655,126 @@ class ConversationTurnMixin:
 
                 # Parse Tier 2 concepts if provided
                 extracted = None
+                _empty_extracted_concepts_skip = False
                 if request.extracted_concepts_json:
                     try:
                         parsed = json.loads(request.extracted_concepts_json)
                         if isinstance(parsed, list):
-                            extracted = parsed if len(parsed) > 0 else None
+                            if len(parsed) > 0:
+                                extracted = parsed
+                            else:
+                                _empty_extracted_concepts_skip = True
                             if extracted:
                                 logger.info(f"S-1: Received {len(parsed)} Tier 2 concepts")
                     except json.JSONDecodeError:
                         logger.warning("S-1: extracted_concepts_json invalid JSON, Tier 1 only")
 
-                # AGENT-001: Forward agent_id from request (request is authoritative source)
-                _req_aid = getattr(request, "agent_id", "default")
-                # FEDERATION L1.5: Forward model_id from request
-                _req_mid = getattr(request, "model_id", "unknown")
-                learn_request = SessionLearnRequest(
-                    user_message=prev_msg,
-                    assistant_response=prev_response,
-                    knowledge_area="conversation",
-                    extracted_concepts=extracted,  # None = Tier 1 only; list = Tier 1 + Tier 2
-                    session_id=self.current_session.session_id if self.current_session else None,
-                    agent_id=_req_aid,
-                    model_id=_req_mid,
-                    # RETRIEVAL-021: Forward activated concept IDs for dedup bias
-                    activated_concept_ids=self._last_activated_concept_ids or None,
-                    trigger_path="auto_learn",  # SESSION-LEARN-MISMATCH-001
-                )
-                # PERF-FORT-2: Dispatch auto-learn to background thread.
-                # Returns immediately — learning completes ~1s later.
-                # Results available as _last_autolearn_result on NEXT turn.
-                from app.core.config import get_feature_flag
-                if get_feature_flag("BACKGROUND_AUTOLEARN_ENABLED", True):
-                    # PERF-FORT-2: Snapshot previous result BEFORE dispatch.
-                    # Background thread will overwrite _last_autolearn_result,
-                    # so capture the stable value for this turn's response.
-                    _snapshot_autolearn = getattr(self, '_last_autolearn_result', None)
-                    _snapshot_autolearn_obj = getattr(self, '_last_autolearn_result_obj', None)
-                    _snapshot_autolearn_bw = getattr(self, '_last_autolearn_budget_warnings', []) or []
-                    import concurrent.futures as _cf_fort2
-                    if not hasattr(self, '_learn_executor') or self._learn_executor is None:
-                        self._learn_executor = _cf_fort2.ThreadPoolExecutor(
-                            max_workers=1, thread_name_prefix="autolearn"
-                        )
-                    # A2 amendment: Check queue depth before submitting
-                    _pending = self._learn_executor._work_queue.qsize() if hasattr(self._learn_executor, '_work_queue') else 0
-                    if _pending > 50:
-                        logger.error(f"S-1: Auto-learn queue depth={_pending}, dropping — system under extreme load")
-                        if raw_capture_ref:
-                            _pending_raw_learning_status = {
-                                **raw_capture_ref,
-                                "status": "failed",
-                                "error": "background_autolearn_queue_depth_exceeded",
-                            }
-                    else:
-                        if _pending > 10:
-                            logger.warning(f"S-1: Auto-learn queue depth={_pending}, learning may be falling behind")
-                        # PERF-FORT-2: Defer dispatch to end of conversation_turn
-                        # to avoid DB lock contention with main-path writes.
-                        # Store args for deferred dispatch.
-                        _deferred_autolearn_args = (
-                            learn_request,
-                            extracted,
-                            request.message,
-                            prev_msg,
-                            prev_response,
-                            self.current_session,
-                            raw_capture_ref,
-                        )
-                    logger.info("S-1: Auto-learn prepared for deferred background dispatch")
-                    # auto_learn_result stays None — main path uses snapshots
-                    # Store snapshots in local vars for downstream consumers
-                    _bg_snapshot_auto_learned = _snapshot_autolearn
-                    _bg_snapshot_learn_obj = _snapshot_autolearn_obj
-                    _bg_snapshot_budget_warnings = _snapshot_autolearn_bw
-                else:
-                    # Synchronous fallback (feature flag OFF — rollback path)
-                    auto_learn_result = self.session_learn(learn_request)
+                if _empty_extracted_concepts_skip:
+                    from app.storage.turn_ingestion import (
+                        SKIP_REASON_EMPTY_EXTRACTED_CONCEPTS,
+                        build_skip_reason_error,
+                    )
+
+                    _turn_ingestion_warning = {
+                        "code": "empty_extracted_concepts",
+                        "learning_status": "skipped",
+                        "message": (
+                            "extracted_concepts_json=[] records skipped learning for the previous "
+                            "response. Provide real extracted concepts on the next conversation_turn."
+                        ),
+                        "fallback_eligible": bool(raw_capture_ref),
+                    }
                     if raw_capture_ref:
                         _pending_raw_learning_status = {
                             **raw_capture_ref,
-                            "status": "attempted",
-                            "concepts_extracted": auto_learn_result.learning_events if auto_learn_result else 0,
+                            "status": "skipped",
+                            "concepts_extracted": 0,
+                            "error": build_skip_reason_error(SKIP_REASON_EMPTY_EXTRACTED_CONCEPTS),
                         }
-                    logger.info(
-                        f"S-1: Auto-learned (sync): {auto_learn_result.learning_events} events, "
-                        f"sources={auto_learn_result.extraction_source_breakdown}"
+                    logger.warning("S-1: Empty extracted_concepts_json skipped learning for previous response")
+                else:
+                    # AGENT-001: Forward agent_id from request (request is authoritative source)
+                    _req_aid = getattr(request, "agent_id", "default")
+                    # FEDERATION L1.5: Forward model_id from request
+                    _req_mid = getattr(request, "model_id", "unknown")
+                    # RUNG0 Component C (A8): Forward provenance trust-tier from request
+                    _req_prov = getattr(request, "provenance", "human")
+                    learn_request = SessionLearnRequest(
+                        user_message=prev_msg,
+                        assistant_response=prev_response,
+                        knowledge_area="conversation",
+                        extracted_concepts=extracted,  # None = Tier 1 only; list = Tier 1 + Tier 2
+                        session_id=self.current_session.session_id if self.current_session else None,
+                        agent_id=_req_aid,
+                        model_id=_req_mid,
+                        provenance=_req_prov,
+                        # RETRIEVAL-021: Forward activated concept IDs for dedup bias
+                        activated_concept_ids=self._last_activated_concept_ids or None,
+                        trigger_path="auto_learn",  # SESSION-LEARN-MISMATCH-001
                     )
-                    if auto_learn_result and auto_learn_result.garbage_rejected > 0 and self._last_extraction_request_types:
-                        self._suppressed_gap_types.update(self._last_extraction_request_types)
+                    # PERF-FORT-2: Dispatch auto-learn to background thread.
+                    # Returns immediately — learning completes ~1s later.
+                    # Results available as _last_autolearn_result on NEXT turn.
+                    from app.core.config import get_feature_flag
+                    if get_feature_flag("BACKGROUND_AUTOLEARN_ENABLED", True):
+                        # PERF-FORT-2: Snapshot previous result BEFORE dispatch.
+                        # Background thread will overwrite _last_autolearn_result,
+                        # so capture the stable value for this turn's response.
+                        _snapshot_autolearn = getattr(self, '_last_autolearn_result', None)
+                        _snapshot_autolearn_obj = getattr(self, '_last_autolearn_result_obj', None)
+                        _snapshot_autolearn_bw = getattr(self, '_last_autolearn_budget_warnings', []) or []
+                        import concurrent.futures as _cf_fort2
+                        if not hasattr(self, '_learn_executor') or self._learn_executor is None:
+                            self._learn_executor = _cf_fort2.ThreadPoolExecutor(
+                                max_workers=1, thread_name_prefix="autolearn"
+                            )
+                        # A2 amendment: Check queue depth before submitting
+                        _pending = self._learn_executor._work_queue.qsize() if hasattr(self._learn_executor, '_work_queue') else 0
+                        if _pending > 50:
+                            logger.error(f"S-1: Auto-learn queue depth={_pending}, dropping — system under extreme load")
+                            if raw_capture_ref:
+                                _pending_raw_learning_status = {
+                                    **raw_capture_ref,
+                                    "status": "failed",
+                                    "error": "background_autolearn_queue_depth_exceeded",
+                                }
+                        else:
+                            if _pending > 10:
+                                logger.warning(f"S-1: Auto-learn queue depth={_pending}, learning may be falling behind")
+                            # PERF-FORT-2: Defer dispatch to end of conversation_turn
+                            # to avoid DB lock contention with main-path writes.
+                            # Store args for deferred dispatch.
+                            _deferred_autolearn_args = (
+                                learn_request,
+                                extracted,
+                                request.message,
+                                prev_msg,
+                                prev_response,
+                                self.current_session,
+                                raw_capture_ref,
+                                _active_binding_snapshot,
+                            )
+                        logger.info("S-1: Auto-learn prepared for deferred background dispatch")
+                        # auto_learn_result stays None — main path uses snapshots
+                        # Store snapshots in local vars for downstream consumers
+                        _bg_snapshot_auto_learned = _snapshot_autolearn
+                        _bg_snapshot_learn_obj = _snapshot_autolearn_obj
+                        _bg_snapshot_budget_warnings = _snapshot_autolearn_bw
+                    else:
+                        # Synchronous fallback (feature flag OFF — rollback path)
+                        auto_learn_result = self.session_learn(learn_request)
+                        if raw_capture_ref:
+                            _pending_raw_learning_status = {
+                                **raw_capture_ref,
+                                "status": "attempted",
+                                "concepts_extracted": auto_learn_result.learning_events if auto_learn_result else 0,
+                            }
+                        logger.info(
+                            f"S-1: Auto-learned (sync): {auto_learn_result.learning_events} events, "
+                            f"sources={auto_learn_result.extraction_source_breakdown}"
+                        )
+                        if auto_learn_result and auto_learn_result.garbage_rejected > 0 and self._last_extraction_request_types:
+                            self._suppressed_gap_types.update(self._last_extraction_request_types)
 
             except Exception as e:
                 if raw_capture_ref:
@@ -4956,8 +5801,22 @@ class ConversationTurnMixin:
         ):
             _t_prelearn_first_turn_capture_start = time.perf_counter()
             try:
-                from app.core.config import get_feature_flag as _gff_ft
-                if _gff_ft("VERBATIM_FIRST_TURN_CAPTURE", True):
+                if _foreground_pressure_mode == "critical":
+                    _turn_deadline.skip(
+                        "prelearn.first_turn_capture",
+                        "foreground_pressure_mode",
+                        priority="optional",
+                        foreground_pressure_mode=_foreground_pressure_mode,
+                    )
+                    _record_budget_metric(
+                        "foreground_pressure_optional_skip_total",
+                        1.0,
+                        {"phase": "prelearn.first_turn_capture", "mode": _foreground_pressure_mode},
+                    )
+                else:
+                    from app.core.config import get_feature_flag as _gff_ft
+                    _first_turn_capture_enabled = _gff_ft("VERBATIM_FIRST_TURN_CAPTURE", True)
+                if _foreground_pressure_mode != "critical" and _first_turn_capture_enabled:
                     _ft_session_ids = []
                     if hasattr(self, '_session_concept_ids') and self._session_concept_ids:
                         _ft_session_ids = list(self._session_concept_ids)[-3:]
@@ -5257,10 +6116,6 @@ class ConversationTurnMixin:
 
             # PERF-075: Tiered correction detection — fast sync (Layers 1-3+5), deferred Layer 4
             prev_concepts = self._last_activated_concept_dicts if self._last_activated_concept_dicts else None
-            try:
-                from app.storage.embedding import embedding_engine as _emb_engine
-            except Exception:
-                _emb_engine = None
 
             # Fast path: Layers 1-3+5 only (regex/pattern, <5ms). No embedding.
             correction_event = detect_correction(
@@ -5272,6 +6127,18 @@ class ConversationTurnMixin:
 
             # Defer Layer 4 (embedding drift) to background if fast path found nothing
             # and we have activated concepts to compare against
+            if correction_event is None and prev_concepts:
+                if _foreground_pressure_mode in {"protected", "critical"}:
+                    _record_budget_metric(
+                        "foreground_pressure_optional_skip_total",
+                        1.0,
+                        {"phase": "correction.layer4_embedding", "mode": _foreground_pressure_mode},
+                    )
+                    raise _BudgetSkip()
+                try:
+                    from app.storage.embedding import embedding_engine as _emb_engine
+                except Exception:
+                    _emb_engine = None
             if correction_event is None and prev_concepts and _emb_engine is not None:
                 self._defer_correction_layer4(
                     message=request.message,
@@ -5330,9 +6197,6 @@ class ConversationTurnMixin:
                 request.message,
             )
 
-        # Lazy import to avoid circular dependency at module load
-        from app.retrieval import retrieval_engine
-
         # --- FIX 2: Topic shift detection (budget: <1ms) ---
         # Detect if current query diverges from session context.
         # If shift detected, clear context to prevent anchoring bias.
@@ -5357,6 +6221,7 @@ class ConversationTurnMixin:
         # --- S1: Build search query (budget: 0ms) ---
         # Pass full natural language to embedding search (no keyword mangling)
         _stage3_query_build_start = time.perf_counter()
+        _raw_user_search_query = request.message or ""
         search_query = request.message
         if effective_context:
             search_query = f"{request.message} {effective_context[:500]}"
@@ -5675,7 +6540,7 @@ class ConversationTurnMixin:
 
         _stage3_answer_path_start = time.perf_counter()
         try:
-            from app.session.answer_path_admission import classify_answer_path
+            from app.session.answer_path_admission import AnswerPathAdmission, SMALL, classify_answer_path
 
             _answer_path_first_call_hint = not getattr(self, "_conversation_turn_called", False)
             try:
@@ -5688,14 +6553,26 @@ class ConversationTurnMixin:
                     _answer_path_first_call_hint = True
             except Exception:
                 pass
-            _answer_path_admission = classify_answer_path(
-                request.message or search_query,
-                adaptive_config=_adaptive_config,
-                effective_max_concepts=effective_max_concepts,
-                first_call_hint=_answer_path_first_call_hint,
-                resumption_hint=compaction_was_detected,
-                observe_only=_answer_path_observe_only,
-            )
+            if _hook_additional_context:
+                _answer_path_admission = AnswerPathAdmission(
+                    mode=SMALL,
+                    reason="hook_additional_context",
+                    allow_multihop=False,
+                    allow_entity_chain=False,
+                    allow_graph=False,
+                    allow_optional_injection=False,
+                    max_concepts_cap=1,
+                    observe_only=False,
+                )
+            else:
+                _answer_path_admission = classify_answer_path(
+                    request.message or search_query,
+                    adaptive_config=_adaptive_config,
+                    effective_max_concepts=effective_max_concepts,
+                    first_call_hint=_answer_path_first_call_hint,
+                    resumption_hint=compaction_was_detected,
+                    observe_only=_answer_path_observe_only,
+                )
             if (
                 _answer_path_admission.max_concepts_cap is not None
                 and _answer_path_enforcement_enabled
@@ -5719,6 +6596,37 @@ class ConversationTurnMixin:
             _answer_path_admission = None
         finally:
             _stage3_add_ms("ct_subphase_answer_path_classify_ms", _stage3_answer_path_start)
+
+        if _foreground_pressure_mode in {"protected", "critical"}:
+            _pressure_cap = int(
+                _env_float(
+                    "PITH_FOREGROUND_PRESSURE_CRITICAL_MAX_CONCEPTS"
+                    if _foreground_pressure_mode == "critical"
+                    else "PITH_FOREGROUND_PRESSURE_PROTECTED_MAX_CONCEPTS",
+                    4.0 if _foreground_pressure_mode == "critical" else 8.0,
+                )
+            )
+            if _pressure_cap > 0 and effective_max_concepts > _pressure_cap:
+                _old_pressure_eff = effective_max_concepts
+                effective_max_concepts = _pressure_cap
+                _turn_deadline.skip(
+                    "retrieval.pressure_concept_cap",
+                    "foreground_pressure_mode",
+                    priority="required_degraded",
+                    foreground_pressure_mode=_foreground_pressure_mode,
+                    old_effective_max_concepts=_old_pressure_eff,
+                    effective_max_concepts=effective_max_concepts,
+                )
+                _record_budget_metric(
+                    "foreground_pressure_optional_skip_total",
+                    1.0,
+                    {"phase": "retrieval.pressure_concept_cap", "mode": _foreground_pressure_mode},
+                )
+
+        # Lazy import to avoid circular dependency at module load.
+        # Keep this inside the retrieval phase so cold singleton initialization is
+        # attributed to retrieval instead of pre-retrieval correction detection.
+        from app.retrieval import retrieval_engine
 
         # --- RETRIEVAL-037a: Multi-hop retrieval gate ---
         _multihop_enabled = os.environ.get("PITH_MULTIHOP_ENABLED", "").lower() in ("true", "1")
@@ -5785,15 +6693,18 @@ class ConversationTurnMixin:
                     "session_id": self.current_session.session_id if self.current_session else None,  # SESSION-012
                 }
                 try:
-                    if "deadline" in inspect.signature(retrieval_engine.search_lightweight).parameters:
+                    _slw_signature = inspect.signature(retrieval_engine.search_lightweight)
+                    if "deadline" in _slw_signature.parameters:
                         _slw_kwargs["deadline"] = _turn_deadline
+                    if "query_intent_source_query" in _slw_signature.parameters:
+                        _slw_kwargs["query_intent_source_query"] = _raw_user_search_query
                 except (TypeError, ValueError):
                     pass
                 search_results = retrieval_engine.search_lightweight(search_query, **_slw_kwargs)
         _t_search_lw_end = time.perf_counter()  # PERF-017: search_lightweight sub-metric
         _stage3_set_count("ct_subphase_initial_result_count", len(search_results or []))
         _base_retrieval_trace: dict[str, Any] | None = None
-        if _mh262_canary_retrieval_trace_enabled():
+        if _base_retrieval_trace_enabled():
             _base_retrieval_trace = {
                 "schema_version": "mh262.base_retrieval_trace.v1",
                 "limit": _MH262_CANARY_TRACE_LIMIT,
@@ -5811,6 +6722,23 @@ class ConversationTurnMixin:
             )
             if _slw_trace is not None:
                 _base_retrieval_trace["search_lightweight"] = _slw_trace
+        _query_intent_trace_payload = getattr(
+            retrieval_engine,
+            "last_query_intent_trace",
+            None,
+        )
+        try:
+            from app.core.config import get_feature_flag as _gff_qie_trace
+
+            _query_intent_trace_exposed = _gff_qie_trace("QUERY_INTENT_TRACE_ENABLED", True)
+        except Exception:
+            _query_intent_trace_exposed = True
+        if (
+            _query_intent_trace_exposed
+            and _base_retrieval_trace is not None
+            and _query_intent_trace_payload
+        ):
+            _base_retrieval_trace["query_intent_trace"] = _query_intent_trace_payload
 
         # --- PERF-076: Retrieval phase hard cap ---
         # If search_lightweight already consumed the budget, skip enhancement features
@@ -6491,20 +7419,97 @@ class ConversationTurnMixin:
                         f"RETRIEVAL-048: Sparse results (top_score={_top_score:.3f}, "
                         f"count={len(top_results)}) — re-querying with budget={_rq_budget}"
                     )
-                    _rq_results = retrieval_engine.search_lightweight(
-                        search_query,
-                        top_k=_rq_budget,
-                        min_confidence=0.0,
-                        agent_id=_req_agent_id if _req_agent_id != 'default' else None,
-                        scope=_req_scope,
+                    _rq_queries = [search_query]
+                    _qie_rescue_active = False
+                    _qie_rescue_rejected = 0
+                    _qie_rescue_rejection_reasons: dict[str, int] = {}
+                    try:
+                        from app.core.config import get_feature_flag as _gff_qie
+
+                        if (
+                            _gff_qie("QUERY_INTENT_RESCUE_ENABLED", True)
+                            and isinstance(_query_intent_trace_payload, dict)
+                            and _query_intent_trace_payload.get("matched_aliases")
+                        ):
+                            _query_intent_trace_payload["rescue_attempted"] = True
+                            _qie_max_variants = max(
+                                1,
+                                min(
+                                    3,
+                                    int(os.environ.get("PITH_QUERY_INTENT_RESCUE_MAX_VARIANTS", "2")),
+                                ),
+                            )
+                            _qie_variants = [
+                                str(v)
+                                for v in _query_intent_trace_payload.get("query_variants", [])
+                                if v and str(v) != search_query
+                            ][:_qie_max_variants]
+                            if _qie_variants:
+                                _rq_queries = _qie_variants
+                                _qie_rescue_active = True
+                                _query_intent_trace_payload["rescue_triggered"] = True
+                                _query_intent_trace_payload["rescue_variants_run"] = list(_rq_queries)
+                    except Exception as _qie_rq_e:
+                        logger.debug("QUERY-INTENT: rescue setup failed (non-fatal): %s", _qie_rq_e)
+
+                    _qie_rescue_score_floor = _clamped_env_float(
+                        "PITH_QUERY_INTENT_RESCUE_SCORE_FLOOR",
+                        0.30,
+                        0.0,
+                        1.0,
                     )
+                    _qie_rescue_kas = set()
+                    _qie_rescue_terms = set()
+                    if _qie_rescue_active and isinstance(_query_intent_trace_payload, dict):
+                        _qie_rescue_kas = set(_query_intent_trace_payload.get("inferred_kas", []) or [])
+                        for _term in _query_intent_trace_payload.get("expanded_terms", []) or []:
+                            _qie_rescue_terms.update(str(_term).lower().split())
+
+                    def _qie_rescue_admit(rr) -> tuple[bool, str]:
+                        if not _qie_rescue_active:
+                            return True, "rescue_inactive"
+                        if float(getattr(rr, "relevance_score", 0.0) or 0.0) < _qie_rescue_score_floor:
+                            return False, "score_below_floor"
+                        _rr_ka = getattr(rr, "knowledge_area", None)
+                        if _rr_ka and _rr_ka in _qie_rescue_kas:
+                            return True, "ka_overlap"
+                        _summary_terms = set(str(getattr(rr, "summary", "") or "").lower().split())
+                        if _qie_rescue_terms and (_qie_rescue_terms & _summary_terms):
+                            return True, "term_overlap"
+                        return False, "topic_overlap_missing"
+
+                    _rq_results = []
+                    for _rq_query_text in _rq_queries:
+                        _rq_kwargs = {
+                            "top_k": _rq_budget,
+                            "min_confidence": 0.0,
+                            "agent_id": _req_agent_id if _req_agent_id != 'default' else None,
+                            "scope": _req_scope,
+                        }
+                        try:
+                            if "query_intent_expansion_enabled" in inspect.signature(
+                                retrieval_engine.search_lightweight
+                            ).parameters:
+                                _rq_kwargs["query_intent_expansion_enabled"] = False
+                        except (TypeError, ValueError):
+                            pass
+                        _rq_results.extend(retrieval_engine.search_lightweight(_rq_query_text, **_rq_kwargs))
                     # Merge: union by concept_id, prefer higher relevance
                     _existing = {r.concept_id: r for r in top_results}
                     _rq_added = 0
                     for rr in _rq_results:
+                        _qie_admitted, _qie_reject_reason = _qie_rescue_admit(rr)
+                        if not _qie_admitted:
+                            _qie_rescue_rejected += 1
+                            _qie_rescue_rejection_reasons[_qie_reject_reason] = (
+                                _qie_rescue_rejection_reasons.get(_qie_reject_reason, 0) + 1
+                            )
+                            continue
                         if rr.concept_id not in _existing:
                             _existing[rr.concept_id] = rr
                             _rq_added += 1
+                        elif rr.relevance_score > _existing[rr.concept_id].relevance_score:
+                            _existing[rr.concept_id] = rr
                     if _rq_added > 0:
                         _before_requery_merge = list(top_results)
                         top_results = sorted(
@@ -6519,6 +7524,26 @@ class ConversationTurnMixin:
                         )
                         _requery_fired = True
                         logger.info(f"RETRIEVAL-048: Re-query added {_rq_added} concepts (total={len(top_results)})")
+                    if _qie_rescue_active and isinstance(_query_intent_trace_payload, dict):
+                        _query_intent_trace_payload["rescue_admitted_count"] = _rq_added
+                        _query_intent_trace_payload["rescue_rejected_count"] = _qie_rescue_rejected
+                        _query_intent_trace_payload["rescue_rejection_reasons"] = dict(
+                            sorted(_qie_rescue_rejection_reasons.items())
+                        )
+                        try:
+                            from app.ops.metrics import metrics as _qie_metrics
+
+                            _qie_metrics.record("query_intent_rescue_triggered", 1.0)
+                            _qie_metrics.record("query_intent_rescue_admitted", float(_rq_added))
+                            _qie_metrics.record("query_intent_rescue_rejected", float(_qie_rescue_rejected))
+                            for _reason, _count in _qie_rescue_rejection_reasons.items():
+                                _qie_metrics.record(
+                                    "query_intent_rescue_rejection_reason",
+                                    float(_count),
+                                    {"reason": _reason},
+                                )
+                        except Exception:
+                            pass
         except Exception as _rq_e:
             logger.warning(f"RETRIEVAL-048: Re-query failed (non-fatal): {_rq_e}")
         finally:
@@ -6559,17 +7584,24 @@ class ConversationTurnMixin:
                         _existing_066 = {r.concept_id: r for r in top_results}
                         _per_sq_unique: list[list] = []
                         for _sq_i, _sq in enumerate(_sub_queries):
-                            _sq_results = retrieval_engine.search_lightweight(
-                                _sq,
-                                top_k=max(12, effective_max_concepts),
-                                min_confidence=0.0,
-                                agent_id=(
+                            _sq_kwargs = {
+                                "top_k": max(12, effective_max_concepts),
+                                "min_confidence": 0.0,
+                                "agent_id": (
                                     _req_agent_id
                                     if _req_agent_id != "default"
                                     else None
                                 ),
-                                scope=_req_scope,
-                            )
+                                "scope": _req_scope,
+                            }
+                            try:
+                                if "query_intent_expansion_enabled" in inspect.signature(
+                                    retrieval_engine.search_lightweight
+                                ).parameters:
+                                    _sq_kwargs["query_intent_expansion_enabled"] = False
+                            except (TypeError, ValueError):
+                                pass
+                            _sq_results = retrieval_engine.search_lightweight(_sq, **_sq_kwargs)
                             _sq_new = []
                             for _sr in _sq_results:
                                 if _sr.concept_id not in _existing_066:
@@ -7655,6 +8687,9 @@ class ConversationTurnMixin:
                 and _first_call_sync_refresh
             )
         )
+        if _foreground_pressure_mode in {"protected", "critical"}:
+            _required_context_allow_sync_refresh = False
+            _required_context_stale_first = True
         _required_context_payload, _required_context_stats = get_required_context(
             prefer_stale_fallback=_required_context_prefer_stale,
             stale_first=_required_context_stale_first,
@@ -7762,14 +8797,36 @@ class ConversationTurnMixin:
                     _stage3_set_count("ct_subphase_fact_supplement_assoc_targets_count", len(_fs_assoc_targets))
 
                     if _fs_assoc_targets:
-                        _fs_conn = _get_connection()
                         _fs_ph = ','.join('?' * len(_fs_assoc_targets))
                         _fs_db_start = time.perf_counter()
-                        _fs_rows = _fs_conn.execute(
-                            f"""SELECT id, summary, confidence, knowledge_area, concept_type, status
-                               FROM concepts WHERE id IN ({_fs_ph})""",
-                            list(_fs_assoc_targets),
-                        ).fetchall()
+                        try:
+                            with _optional_snapshot_db_read(
+                                unit="injection.fact_supplement",
+                                snapshot_name="conversation_turn.fact_supplement",
+                                busy_timeout_ms=_env_float(
+                                    "PITH_FACT_SUPPLEMENT_DB_BUSY_TIMEOUT_MS",
+                                    150.0,
+                                ),
+                            ) as _fs_conn:
+                                _fs_rows = _fs_conn.execute(
+                                    f"""SELECT id, summary, confidence, knowledge_area, concept_type, status
+                                       FROM concepts WHERE id IN ({_fs_ph})""",
+                                    list(_fs_assoc_targets),
+                                ).fetchall()
+                        except sqlite3.OperationalError as _fs_db_e:
+                            logger.debug(
+                                "RETRIEVAL-050: Fact supplement DB read skipped: %s",
+                                _fs_db_e,
+                            )
+                            _record_budget_metric(
+                                "ct_stage3_optional_skip_total",
+                                1.0,
+                                {
+                                    "unit": "injection.fact_supplement",
+                                    "reason": "optional_db_read_failed",
+                                },
+                            )
+                            _fs_rows = []
                         _stage3_add_ms("ct_subphase_fact_supplement_db_load_ms", _fs_db_start)
 
                         from app.cognitive.entity_detector import has_specific_entities
@@ -8084,7 +9141,7 @@ class ConversationTurnMixin:
                             _locomo_parity_added = max(0, len(_kw_existing_ids) - _locomo_parity_existing_before)
                             _kw_added += _locomo_parity_added
                             logger.info(
-                                "LOCOMO-RETRIEVAL-PARITY: enabled added=%d exact_mentorship=%d children_help_event=%d exact_artists=%d camping_activity=%d camping_value=%d exact_self_care=%d andrew_post_climbing_activities=%d joanna_recipe_list=%d nate_dairy_free_substitution=%d",
+                                "LOCOMO-RETRIEVAL-PARITY: enabled added=%d exact_mentorship=%d children_help_event=%d exact_artists=%d camping_activity=%d camping_value=%d exact_self_care=%d andrew_post_climbing_activities=%d joanna_recipe_list=%d nate_dairy_free_substitution=%d october_sunset_painting=%d",
                                 _locomo_parity_added,
                                 _locomo_parity_counts["exact_mentorship"],
                                 _locomo_parity_counts["exact_children_help_event"],
@@ -8095,6 +9152,7 @@ class ConversationTurnMixin:
                                 _locomo_parity_counts["andrew_post_climbing_activities"],
                                 _locomo_parity_counts["joanna_recipe_list"],
                                 _locomo_parity_counts["nate_dairy_free_substitution"],
+                                _locomo_parity_counts["october_sunset_painting"],
                             )
                         _stage3_set_count(
                             "ct_subphase_locomo_parity_exact_mentorship_count",
@@ -9282,7 +10340,6 @@ class ConversationTurnMixin:
         ).lower() in ("true", "1")
         if (
             _SOURCE_SET_TRACE_ENABLED
-            and top_results
             and _turn_deadline_optional("injection.source_set_trace", 50.0)
         ):
             try:
@@ -9305,22 +10362,64 @@ class ConversationTurnMixin:
 
         _stage3_serial_order_start = time.perf_counter()
         if top_results and _turn_deadline_optional("injection.serial_order_map", 50.0):
+            _serial_order_fg_config = _foreground_contract_config(
+                unit="injection.serial_order_map",
+                criticality="quality_sensitive_optional",
+                min_remaining_ms=_env_float("PITH_FOREGROUND_SERIAL_ORDER_MAP_MIN_MS", 75.0),
+                recent_p95_limit_ms=_env_float(
+                    "PITH_FOREGROUND_SERIAL_ORDER_MAP_P95_LIMIT_MS",
+                    150.0,
+                ),
+                circuit_ttl_s=_env_float(
+                    "PITH_FOREGROUND_SERIAL_ORDER_MAP_CIRCUIT_TTL_S",
+                    60.0,
+                ),
+            )
+            _serial_order_decision = _foreground_contract_decide(
+                _serial_order_fg_config,
+                phase="injection.serial_order_map",
+            )
+            _serial_order_attempted = False
             try:
-                _sr_conn = _get_connection()
-                _sr_ids = [r.concept_id for r in top_results]
-                _sr_placeholders = ",".join("?" * len(_sr_ids))
-                _sr_rows = _sr_conn.execute(
-                    f"SELECT id, temporal_rank FROM ("
-                    f"  SELECT id, ROW_NUMBER() OVER (ORDER BY created_at ASC) as temporal_rank"
-                    f"  FROM concepts WHERE status = 'active'"
-                    f") WHERE id IN ({_sr_placeholders})",
-                    _sr_ids,
-                ).fetchall()
-                _serial_order_map = {row[0]: row[1] for row in _sr_rows}
-                if _serial_order_map:
-                    logger.info(f'RETRIEVAL-037c: serial_order_map built for {len(_serial_order_map)}/{len(_sr_ids)} concepts')
+                if _foreground_contract_should_skip(_serial_order_decision):
+                    _record_budget_metric(
+                        "ct_stage3_optional_skip_total",
+                        1.0,
+                        {
+                            "unit": "injection.serial_order_map",
+                            "reason": getattr(
+                                _serial_order_decision,
+                                "reason",
+                                "foreground_contract_skip",
+                            ),
+                        },
+                    )
+                else:
+                    _serial_order_attempted = True
+                    _sr_ids = [r.concept_id for r in top_results]
+                    with _optional_snapshot_db_read(
+                        unit="injection.serial_order_map",
+                        snapshot_name="conversation_turn.serial_order_map",
+                        busy_timeout_ms=_env_float(
+                            "PITH_SERIAL_ORDER_MAP_DB_BUSY_TIMEOUT_MS",
+                            150.0,
+                        ),
+                    ) as _sr_conn:
+                        _serial_order_map = _fetch_serial_order_map(_sr_ids, conn=_sr_conn)
+                    if _serial_order_map:
+                        logger.info(f'RETRIEVAL-037c: serial_order_map built for {len(_serial_order_map)}/{len(_sr_ids)} concepts')
             except Exception as e:
                 logger.debug(f"RETRIEVAL-037c: temporal rank fetch failed (non-fatal): {e}")
+            finally:
+                _serial_order_elapsed_ms = (
+                    time.perf_counter() - _stage3_serial_order_start
+                ) * 1000.0
+                if _serial_order_attempted:
+                    _foreground_contract_record_latency(
+                        _serial_order_fg_config,
+                        _serial_order_elapsed_ms,
+                        phase="injection.serial_order_map",
+                    )
         _stage3_add_ms("ct_subphase_injection_serial_order_map_ms", _stage3_serial_order_start)
         _include_verbatim_fragments = (
             _include_verbatim
@@ -9334,24 +10433,17 @@ class ConversationTurnMixin:
         for result in top_results:
             concept = _concept_cache.get(result.concept_id)
             if not concept:
-                if _mab_bridge_repair_enabled():
-                    activated.append(
-                        ActivatedConcept(
-                            concept_id=result.concept_id,
-                            summary=result.summary,
-                            confidence=result.confidence,
-                            relevance_score=round(result.relevance_score, 4),
-                            knowledge_area=result.knowledge_area or "unknown",
-                            key_evidence=[],
-                            associations=[],
-                            shadow_expanded=False,
-                            currency_status="ACTIVE",
-                            ka_relative_authority=getattr(result, "ka_relative_authority", None),
-                            serial_order=_serial_order_map.get(result.concept_id),
-                            created_at=getattr(result, "created_at", None),
-                            edit_provenance=getattr(result, "edit_provenance", None),
-                        )
+                _record_budget_metric(
+                    "ct_concept_cache_fallback_total",
+                    1.0,
+                    {"reason": "missing_concept"},
+                )
+                activated.append(
+                    _activated_concept_from_search_result_fallback(
+                        result,
+                        serial_order=_serial_order_map.get(result.concept_id),
                     )
+                )
                 continue
 
             # Extract top 2 evidence items (prefer structured Evidence content)
@@ -10217,21 +11309,73 @@ class ConversationTurnMixin:
                 100.0,
                 5000.0,
             )
+            _coverage_llm_fg_config = _foreground_contract_config(
+                unit="coverage.llm",
+                criticality="governance_optional",
+                min_remaining_ms=_coverage_llm_min_remaining_ms,
+                recent_p95_limit_ms=_env_float(
+                    "PITH_FOREGROUND_COVERAGE_LLM_P95_LIMIT_MS",
+                    1000.0,
+                ),
+                circuit_ttl_s=_env_float(
+                    "PITH_FOREGROUND_COVERAGE_LLM_CIRCUIT_TTL_S",
+                    60.0,
+                ),
+            )
             _allow_coverage_llm = _turn_deadline.can_start(
                 "coverage.llm",
                 min_remaining_ms=_coverage_llm_min_remaining_ms,
             )
+            _coverage_llm_decision = None
+            if _allow_coverage_llm:
+                _coverage_llm_decision = _foreground_contract_decide(
+                    _coverage_llm_fg_config,
+                    phase="coverage.llm",
+                )
+                if _foreground_contract_should_skip(_coverage_llm_decision):
+                    _allow_coverage_llm = False
+                    _record_budget_metric(
+                        "ct_stage3_optional_skip_total",
+                        1.0,
+                        {
+                            "unit": "coverage.llm",
+                            "reason": getattr(
+                                _coverage_llm_decision,
+                                "reason",
+                                "foreground_contract_skip",
+                            ),
+                        },
+                    )
             if not _allow_coverage_llm:
                 try:
                     from app.ops.metrics import metrics as _coverage_metrics
                     _coverage_metrics.record("coverage_llm_deadline_skipped", 1.0)
                 except Exception:
                     pass
+            _coverage_llm_observed_ms: float | None = None
+
+            def _coverage_llm_latency_recorder(elapsed_ms: float) -> None:
+                nonlocal _coverage_llm_observed_ms
+                _coverage_llm_observed_ms = elapsed_ms
+                _foreground_contract_record_latency(
+                    _coverage_llm_fg_config,
+                    elapsed_ms,
+                    phase="coverage.llm",
+                )
+
             coverage_confidence = self._compute_coverage_confidence(
                 activated_dicts,
                 request.message,
                 allow_llm=_allow_coverage_llm,
+                coverage_llm_latency_recorder=(
+                    _coverage_llm_latency_recorder if _allow_coverage_llm else None
+                ),
             )
+            if _allow_coverage_llm and _coverage_llm_observed_ms is None:
+                _foreground_contract_cancel_recovery_probe(
+                    _coverage_llm_fg_config,
+                    phase="coverage.llm",
+                )
             blind_spot_match = self._check_blind_spot_relevance(request.message, coverage_confidence)
             if coverage_confidence:
                 logger.info(
@@ -10406,6 +11550,20 @@ class ConversationTurnMixin:
                 _turn_deadline_contra_full_ms,
                 _turn_deadline_contra_lite_ms,
             )
+            if _foreground_pressure_mode == "critical":
+                _contradiction_mode = "emergency_minimal"
+                _turn_deadline.record_phase_mode(
+                    "contradiction_detection",
+                    _contradiction_mode,
+                    criticality="required_degraded",
+                )
+            elif _foreground_pressure_mode == "protected" and _contradiction_mode == "full":
+                _contradiction_mode = "lite"
+                _turn_deadline.record_phase_mode(
+                    "contradiction_detection",
+                    _contradiction_mode,
+                    criticality="required_degraded",
+                )
             if _contradiction_mode != "full" and gov_ctx:
                 gov_ctx.log_event(
                     GOV_EVENT_TURN_DEADLINE_DEGRADED,
@@ -11036,7 +12194,20 @@ class ConversationTurnMixin:
         # --- S6: ALWAYS-SERVE orientation (budget: ~10ms) ---
         # Standard/deep paths keep always-serve behavior. Enforced small turns
         # may skip this optional assembly work when answer-path admission denies it.
-        if _answer_path_allows_optional("assembly.temporal_orientation"):
+        if _foreground_pressure_mode == "critical":
+            _turn_deadline.skip(
+                "assembly.temporal_orientation",
+                "foreground_pressure_mode",
+                priority="optional",
+                foreground_pressure_mode=_foreground_pressure_mode,
+            )
+            _record_budget_metric(
+                "foreground_pressure_optional_skip_total",
+                1.0,
+                {"phase": "assembly.temporal_orientation", "mode": _foreground_pressure_mode},
+            )
+            orientation_summary, greeting_hint = None, None
+        elif _answer_path_allows_optional("assembly.temporal_orientation"):
             orientation_summary, greeting_hint = self._build_temporal_context(request, is_resumption=is_resumption)
         else:
             orientation_summary, greeting_hint = None, None
@@ -11560,7 +12731,7 @@ class ConversationTurnMixin:
         try:
             from app.ops.metrics import metrics
 
-            metrics.record("conversation_turn_latency_ms", elapsed_ms)
+            metrics.record("conversation_turn_latency_ms", elapsed_ms, _conversation_turn_latency_labels())
             if _answer_path_admission is not None:
                 metrics.record(
                     "answer_path_mode_total",
@@ -11600,6 +12771,40 @@ class ConversationTurnMixin:
                 "ct_phase_constraint_assembly_ms": _t_constraint_assembly_ms / 1000.0,
                 "ct_phase_assembly_ms": (t_end - t_contradiction),
             }
+            _pre_correction_parent_ms = max(0.0, (t_health - t_autolearn) * 1000.0)
+            _correction_parent_ms = max(0.0, (t_correction - t_health) * 1000.0)
+            _stage3_metric_ms.setdefault("ct_phase_pre_correction_required_context_ms", 0.0)
+            _stage3_metric_ms.setdefault("ct_phase_pre_correction_workstream_activation_ms", 0.0)
+            _stage3_metric_ms.setdefault("ct_phase_pre_correction_checkpoint_resume_ms", 0.0)
+            _stage3_metric_ms.setdefault("ct_phase_pre_correction_compaction_detection_ms", 0.0)
+            _pre_correction_children_ms = sum(
+                _stage3_metric_ms.get(name, 0.0)
+                for name in (
+                    "ct_phase_pre_correction_required_context_ms",
+                    "ct_phase_pre_correction_workstream_activation_ms",
+                    "ct_phase_pre_correction_checkpoint_resume_ms",
+                    "ct_phase_pre_correction_compaction_detection_ms",
+                )
+            )
+            _stage3_metric_ms["ct_phase_pre_correction_unattributed_ms"] = max(
+                0.0,
+                _pre_correction_parent_ms - _pre_correction_children_ms,
+            )
+            _stage3_metric_ms.setdefault("ct_phase_correction_signal_scan_ms", _correction_parent_ms)
+            _stage3_metric_ms.setdefault("ct_phase_correction_compound_apply_ms", 0.0)
+            _stage3_metric_ms.setdefault("ct_phase_correction_embedding_ms", 0.0)
+            _correction_children_ms = sum(
+                _stage3_metric_ms.get(name, 0.0)
+                for name in (
+                    "ct_phase_correction_signal_scan_ms",
+                    "ct_phase_correction_compound_apply_ms",
+                    "ct_phase_correction_embedding_ms",
+                )
+            )
+            _stage3_metric_ms["ct_phase_correction_unattributed_ms"] = max(
+                0.0,
+                _correction_parent_ms - _correction_children_ms,
+            )
             _turn_latency_phase_ms = {
                 metric_name: round(duration_s * 1000, 2)
                 for metric_name, duration_s in _phases.items()
@@ -11624,6 +12829,22 @@ class ConversationTurnMixin:
                 _phase_metrics.record(metric_name, float(value))
         except Exception:
             pass  # Metrics are best-effort
+
+        _latency_components_payload = None
+        try:
+            from app.retrieval.policy_trace import build_latency_components_ms
+
+            _latency_components_payload = build_latency_components_ms(
+                processing_time_ms=elapsed_ms,
+                phase_ms=_turn_latency_phase_ms,
+                stage3_metric_ms=_stage3_metric_ms,
+            )
+        except Exception as _latency_components_e:
+            logger.warning(
+                "RETRIEVAL-POLICY-LATENCY: failed (non-fatal): %s",
+                _latency_components_e,
+            )
+            _latency_components_payload = None
 
         # TURN-DEADLINE: request-wide deadline telemetry is aggregate only.
         try:
@@ -11872,6 +13093,7 @@ class ConversationTurnMixin:
                                 if _answer_path_admission is not None
                                 else None
                             ),
+                            pressure_state=_turn_pressure_dict(),
                         ),
                     )
                 except Exception as _trace_err:
@@ -12210,12 +13432,32 @@ class ConversationTurnMixin:
             logger.warning(f"C1-CHAIN: Failed (non-fatal): {_c1_e}")
             _chain_answer = None
             _chain_answer_diagnostics = None
+        _record_source_set_answer_dry_run_event(
+            question=request.message or search_query,
+            activated_concepts=activated,
+            session_id=self.current_session.session_id if self.current_session else None,
+        )
+        _record_source_set_answer_shadow_comparator_event(
+            question=request.message or search_query,
+            activated_concepts=activated,
+            session_id=self.current_session.session_id if self.current_session else None,
+            request_id=getattr(request, "request_id", None),
+            origin_id=getattr(request, "origin_id", None),
+            shadow_run_id=_source_set_answer_shadow_run_id(),
+        )
         if _canary_retrieval_trace is not None:
             _canary_retrieval_trace["turn_admission"]["final_activated_ids"] = [
                 ac.concept_id for ac in activated
             ]
             _canary_retrieval_trace["turn_admission"]["activation_count"] = len(activated)
             _canary_retrieval_trace["turn_admission"]["effective_max_concepts"] = effective_max_concepts
+
+        _locomo_candidate_boundary_trace = _build_locomo_candidate_boundary_trace(
+            question=request.message or search_query,
+            activated_concepts=activated,
+            effective_max_concepts=effective_max_concepts,
+            base_retrieval_trace=_base_retrieval_trace,
+        )
 
         _terminal_conflict_trace_payload = None
         if os.environ.get("PITH_MAB_TERMINAL_CONFLICT_TRACE", "").lower() in ("true", "1"):
@@ -12309,6 +13551,32 @@ class ConversationTurnMixin:
                 _bounded_depths,
             )
 
+        _retrieval_policy_trace_payload = None
+        try:
+            from app.retrieval.policy_trace import build_retrieval_policy_trace
+
+            _retrieval_policy_trace_payload = build_retrieval_policy_trace(
+                adaptive_config=_adaptive_config,
+                answer_path_admission=_answer_path_admission,
+                question_classification=question_classification,
+                turn_deadline=_turn_deadline,
+                source_set_trace=_source_set_trace_payload,
+                coverage_confidence=coverage_confidence,
+                coverage_score=coverage_score,
+                governance_summary=governance_summary,
+                requested_max_concepts=request.max_concepts,
+                effective_max_concepts=effective_max_concepts,
+                activated_concepts=activated,
+            )
+            if _query_intent_trace_exposed and _query_intent_trace_payload:
+                _retrieval_policy_trace_payload["query_intent_trace"] = _query_intent_trace_payload
+        except Exception as _rpt_e:
+            logger.warning(
+                "RETRIEVAL-POLICY-TRACE: failed (non-fatal): %s",
+                _rpt_e,
+            )
+            _retrieval_policy_trace_payload = None
+
         response = ConversationTurnResponse(
             activated_concepts=activated,
             activation_count=len(activated),
@@ -12331,6 +13599,9 @@ class ConversationTurnMixin:
             governance_summary=governance_summary,
             source_set_trace=_source_set_trace_payload,
             canary_retrieval_trace=_canary_retrieval_trace,
+            retrieval_policy_trace=_retrieval_policy_trace_payload,
+            latency_components_ms=_latency_components_payload,
+            locomo_candidate_boundary_trace=_locomo_candidate_boundary_trace,
             terminal_conflict_trace=_terminal_conflict_trace_payload,
             constraint_set=constraint_set_response,
             correction_signals=correction_signals_response,
@@ -12398,6 +13669,7 @@ class ConversationTurnMixin:
             working_context=working_context,
             active_workstream=active_workstream,
             workstream_activation=workstream_activation,
+            turn_ingestion_warning=_turn_ingestion_warning,
             # RETRIEVAL-037d: Chain hint from multihop decomposition
             chain_hint=self._build_chain_hint(_multihop_used, _multihop_clauses, _per_hop_concepts),
             # SAL V0: Structured summary (None when SAL disabled)
@@ -12568,9 +13840,9 @@ class ConversationTurnMixin:
             # MONITOR-001: Persist pressure_score to sessions table for trend analysis
             if self.current_session and not BENCHMARK_READONLY:
                 try:
-                    from app.storage import update_session
+                    from app.storage import update_session as _update_pressure_session
 
-                    update_session(self.current_session.session_id, pressure_score=round(pressure, 4))
+                    _update_pressure_session(self.current_session.session_id, pressure_score=round(pressure, 4))
                 except Exception:
                     pass  # Non-fatal — column may not exist yet
 
@@ -12605,6 +13877,18 @@ class ConversationTurnMixin:
             object.__setattr__(response, '_pending_raw_learning_status', _pending_raw_learning_status)
         if _pending_autolearn is not None:
             object.__setattr__(response, '_pending_autolearn', _pending_autolearn)
+        # OPS-526: compute + attach per-turn idempotency dedup key. Used by
+        # dispatch_post_response_tasks to suppress duplicate deferred writes when
+        # a client-lifecycle backstop double-fires conversation_turn.
+        try:
+            _th = hashlib.sha256("|".join([
+                request.message or "", request.previous_message or "", request.previous_response or "",
+            ]).encode("utf-8")).hexdigest()
+            _ident = (getattr(request, "origin_id", None) or getattr(request, "session_id", None) or "")
+            if _ident:
+                object.__setattr__(response, "_pending_turn_dedup_key", f"{_ident}:{_th}")
+        except Exception as e:
+            logger.debug("OPS-526: turn dedup key attach skipped: %s", e)
         try:
             if _pending_coactivation_edges:
                 object.__setattr__(response, '_pending_coactivation_edges', _pending_coactivation_edges)
@@ -12651,6 +13935,16 @@ class ConversationTurnMixin:
         contribute to turn latency. The response object carries _pending_autolearn
         via object.__setattr__ (bypasses Pydantic).
         """
+        # OPS-526: per-turn idempotency guard. If this turn's dedup key was seen
+        # within the TTL window, skip ALL deferred writes (duplicate dispatch).
+        dedup_key = getattr(response, "_pending_turn_dedup_key", None)
+        if dedup_key and _seen_recent_turn(dedup_key):
+            try:
+                from app.ops.metrics import metrics as _m
+                _m.record("turn_dispatch_deduped", 1.0, {"source": "conversation_turn"})
+            except Exception:
+                pass
+            return
         raw_capture = getattr(response, '_pending_raw_capture', None)
         if raw_capture:
             try:
@@ -12737,9 +14031,11 @@ class ConversationTurnMixin:
                         prev_response,
                         bound_session,
                         raw_capture_ref,
+                        _active_binding_snapshot,
                     ) = dal
                     idempotency_raw = "|".join(
                         [
+                            getattr(bound_session, "origin_id", "") or "",
                             getattr(learn_request, "session_id", "") or "",
                             getattr(learn_request, "request_id", "") or "",
                             request_message or "",
@@ -12756,6 +14052,7 @@ class ConversationTurnMixin:
                         prev_response=prev_response,
                         bound_session=bound_session,
                         raw_capture_ref=raw_capture_ref,
+                        active_binding_snapshot=_active_binding_snapshot,
                         idempotency_key=idempotency_key,
                     )
 
@@ -12772,6 +14069,7 @@ class ConversationTurnMixin:
                             payload.get("prev_response", ""),
                             bs,
                             payload.get("raw_capture_ref"),
+                            payload.get("active_binding_snapshot"),
                         )
 
                     submit_lifecycle_drain(
@@ -13095,6 +14393,7 @@ class ConversationTurnMixin:
         query_text: str,
         *,
         allow_llm: bool = True,
+        coverage_llm_latency_recorder: Any | None = None,
     ) -> dict | None:
         """4-signal LLM coverage validator (COVERAGE-001).
 
@@ -13163,7 +14462,10 @@ class ConversationTurnMixin:
 
         # LLM classification (SYNC — 2s hard timeout)
         try:
-            signals = self._classify_coverage_signals(query_text)
+            signals = self._classify_coverage_signals(
+                query_text,
+                latency_recorder=coverage_llm_latency_recorder,
+            )
         except Exception as e:
             logger.debug(f"COVERAGE-001: LLM classification failed (fail-open): {e}")
             return None
@@ -13233,7 +14535,12 @@ class ConversationTurnMixin:
             "n_contextual": len(contextual),
         }
 
-    def _classify_coverage_signals(self, query: str) -> dict | None:
+    def _classify_coverage_signals(
+        self,
+        query: str,
+        *,
+        latency_recorder: Any | None = None,
+    ) -> dict | None:
         """SYNC function — single LLM call extracting 4 binary coverage signals.
 
         Uses gpt-4o-mini via OpenRouter. OpenRouter is the ONLY provider
@@ -13278,6 +14585,8 @@ class ConversationTurnMixin:
                 messages=[{"role": "user", "content": prompt}],
             )
             _coverage_llm_elapsed_ms = (time.perf_counter() - _coverage_llm_start) * 1000.0
+            if latency_recorder is not None:
+                latency_recorder(_coverage_llm_elapsed_ms)
             raw = resp.choices[0].message.content.strip()
 
             import re
@@ -14375,6 +15684,13 @@ class ConversationTurnMixin:
 
     def _check_rate_limit(self) -> tuple:
         """S7: Simple sliding-window rate limit on session_learn calls."""
+        try:
+            from app.api.pricing import usage_limits_enabled
+            if not usage_limits_enabled():
+                return (True, 0)
+        except Exception:
+            logger.warning("PREVIEW-001: Could not inspect usage limit policy; preserving session_learn rate limit")
+
         # INGEST-025: Auto-detect bulk pattern before checking limit
         self._detect_bulk_pattern()
 

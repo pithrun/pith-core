@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Pith Installer v1.0.0
-# macOS/Linux bash installer
+# macOS developer preview installer; Linux remains an unverified source/developer path.
 
 # Configuration
 DOWNLOAD_URL="${DOWNLOAD_URL:-https://github.com/pithrun/pith-core/releases/latest/download}"
@@ -13,9 +13,28 @@ PITH_AUTO_PYTHON="${PITH_AUTO_PYTHON:-0}"
 PITH_NO_AUTO_PYTHON="${PITH_NO_AUTO_PYTHON:-0}"
 PITH_REPAIR_RUNTIME="${PITH_REPAIR_RUNTIME:-0}"
 PITH_FORCE_MANAGED_PYTHON="${PITH_FORCE_MANAGED_PYTHON:-0}"
-PITH_HOME="${PITH_HOME:-$HOME/.pith}"
-STEP_COUNT=9
+# Keep PITH_VERSION on line 18.
+# scripts/version-bump.sh and TEST-090 depend on this exact location.
 PITH_VERSION="1.0.1"
+detect_account_home() {
+    if command -v dscl >/dev/null 2>&1; then
+        dscl . -read "/Users/$(id -un)" NFSHomeDirectory 2>/dev/null | awk '{print $2; exit}' && return
+    fi
+    if command -v getent >/dev/null 2>&1; then
+        getent passwd "$(id -un)" 2>/dev/null | cut -d: -f6 && return
+    fi
+    echo "$HOME"
+}
+PITH_ACCOUNT_HOME="${PITH_ACCOUNT_HOME:-$(detect_account_home)}"
+if [[ -z "$PITH_ACCOUNT_HOME" ]]; then
+    PITH_ACCOUNT_HOME="$HOME"
+fi
+PITH_CANONICAL_HOME="$PITH_ACCOUNT_HOME/.pith"
+PITH_DEFAULT_HOME="$HOME/.pith"
+PITH_HOME="${PITH_HOME:-$PITH_DEFAULT_HOME}"
+PITH_SKIP_GLOBAL_CLI_LINK="${PITH_SKIP_GLOBAL_CLI_LINK:-0}"
+PITH_FORCE_GLOBAL_CLI_LINK="${PITH_FORCE_GLOBAL_CLI_LINK:-0}"
+STEP_COUNT=9
 PITH_DEFAULT_PORT="${PITH_DEFAULT_PORT:-8000}"
 PITH_PORT_SCAN_MAX="${PITH_PORT_SCAN_MAX:-8020}"
 PITH_PORT="${PITH_PORT:-}"
@@ -71,7 +90,7 @@ print_banner() {
     echo -e "${BLUE}"
     echo "╔════════════════════════════════════════╗"
     echo "║   🧠 Pith Installer v${PITH_VERSION}       ║"
-    echo "║      macOS/Linux Edition               ║"
+    echo "║      macOS Developer Preview           ║"
     echo "╚════════════════════════════════════════╝"
     echo -e "${NC}"
     echo ""
@@ -192,15 +211,42 @@ select_pith_port() {
     error_exit "No free Pith port found in ${PITH_DEFAULT_PORT}-${PITH_PORT_SCAN_MAX}. Set PITH_PORT to an available port and rerun install."
 }
 
-persist_pith_port_config() {
+upsert_pith_env() {
+    local key="$1"
+    local value="$2"
     local env_file="$PITH_HOME/.env"
-    if [[ -f "$env_file" ]] && grep -q '^PITH_PORT=' "$env_file"; then
-        sed -i.bak "s/^PITH_PORT=.*/PITH_PORT=$PITH_PORT/" "$env_file" && rm -f "$env_file.bak"
+    mkdir -p "$PITH_HOME"
+    touch "$env_file"
+    if grep -q "^${key}=" "$env_file"; then
+        sed -i.bak "s|^${key}=.*|${key}=${value}|" "$env_file" && rm -f "$env_file.bak"
     else
-        echo "PITH_PORT=$PITH_PORT" >> "$env_file"
+        echo "${key}=${value}" >> "$env_file"
     fi
     chmod 600 "$env_file"
+}
+
+ensure_pith_env_value() {
+    local key="$1"
+    local value="$2"
+    local env_file="$PITH_HOME/.env"
+    mkdir -p "$PITH_HOME"
+    touch "$env_file"
+    if ! grep -q "^${key}=" "$env_file"; then
+        echo "${key}=${value}" >> "$env_file"
+    fi
+    chmod 600 "$env_file"
+}
+
+persist_pith_port_config() {
+    upsert_pith_env "PITH_PORT" "$PITH_PORT"
     mark_success "Configured Pith API port: $PITH_PORT"
+}
+
+persist_preview_usage_config() {
+    upsert_pith_env "PITH_USAGE_LIMITS_ENABLED" "false"
+    upsert_pith_env "PITH_DEV_MODE" "true"
+    upsert_pith_env "PITH_TIER" "dev"
+    mark_success "Configured free developer preview with no active local Pith usage caps"
 }
 
 private_beta_pause() {
@@ -210,6 +256,56 @@ private_beta_pause() {
         read -r -p "$prompt" _ || true
         echo ""
     fi
+}
+
+migrate_legacy_env_aliases() {
+    local env_file="$PITH_HOME/.env"
+    [[ -f "$env_file" ]] || return 0
+    "$PYTHON_EXECUTABLE" - "$env_file" <<'PY'
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+env_file = Path(sys.argv[1])
+alias_map = {
+    "BRAIN_API_KEY": "PITH_API_KEY",
+    "BRAIN_API_URL": "PITH_API_URL",
+    "BRAIN_DATA_DIR": "PITH_DATA_DIR",
+}
+lines = env_file.read_text(encoding="utf-8").splitlines()
+seen = set()
+legacy_values = {}
+for line in lines:
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#") or "=" not in stripped:
+        continue
+    key, value = stripped.split("=", 1)
+    key = key.strip()
+    if key in alias_map and alias_map[key] not in legacy_values:
+        legacy_values[alias_map[key]] = value
+    else:
+        seen.add(key)
+
+output = []
+changed = False
+for line in lines:
+    stripped = line.strip()
+    if stripped and not stripped.startswith("#") and "=" in stripped:
+        key = stripped.split("=", 1)[0].strip()
+        if key in alias_map:
+            changed = True
+            continue
+    output.append(line)
+
+for canonical, value in legacy_values.items():
+    if canonical not in seen:
+        output.append(f"{canonical}={value}")
+        changed = True
+
+if changed:
+    env_file.write_text("\n".join(output).rstrip() + "\n", encoding="utf-8")
+PY
 }
 
 surface_label() {
@@ -231,10 +327,10 @@ surface_detail() {
         claude_desktop) echo "MCP config plus manual Instructions for Claude step" ;;
         codex) echo "HTTP/API lifecycle instructions in ~/.codex/AGENTS.md plus optional MCP config for tool access" ;;
         vscode) echo "MCP config plus Copilot Agent Chat instruction file" ;;
-        claude_code) echo "MCP config template for Claude Code / Claude CLI" ;;
+        claude_code) echo "MCP config plus Pith lifecycle instructions/hooks where supported by the installed Claude Code version" ;;
         cursor) echo "MCP config template; add Cursor User Rule or AGENTS.md for default Pith invocation" ;;
-        windsurf) echo "MCP config template; user-observed automatic invocation, verify in Cascade" ;;
-        cline) echo "MCP settings template" ;;
+        windsurf) echo "Experimental MCP config template; not launch-verified" ;;
+        cline) echo "Experimental MCP settings template; not launch-verified" ;;
         project) echo ".mcp.json and .vscode/mcp.json templates inside the installed server folder" ;;
         *) echo "MCP config" ;;
     esac
@@ -290,6 +386,17 @@ surface_selected_and_detected() {
 }
 
 select_install_surfaces() {
+    if [[ -n "${PITH_SELECTED_SURFACES+x}" ]]; then
+        PITH_SELECTED_SURFACES="$(normalize_surface_list "${PITH_SELECTED_SURFACES:-none}")"
+        if [[ -z "$PITH_SELECTED_SURFACES" ]]; then
+            PITH_SELECTED_SURFACES="none"
+        fi
+        if [[ "$PITH_SELECTED_SURFACES" == "none" ]]; then
+            mark_warning "Skipping AI app surface configuration. You can rerun the installer later."
+        fi
+        return
+    fi
+
     PITH_SELECTED_SURFACES="$(normalize_surface_list "${PITH_CLIENTS:-all}")"
     local surfaces=(claude_desktop codex vscode claude_code cursor windsurf cline project)
 
@@ -298,7 +405,7 @@ select_install_surfaces() {
     fi
 
     if [[ "${PITH_PRIVATE_BETA:-0}" != "1" || "${PITH_SKIP_PAUSES:-0}" == "1" || ! -t 0 ]]; then
-        PITH_SELECTED_SURFACES="all"
+        PITH_SELECTED_SURFACES="claude_desktop,claude_code,codex,vscode,cursor,project"
         return
     fi
 
@@ -444,7 +551,7 @@ body = """# Pith Cognitive Loop
 
 Pith is installed locally. For Codex, use the local HTTP/API command as the primary cognitive lifecycle path because Codex MCP stdio transport can restart or close between turns.
 
-On every substantive user message, run `conversation_turn` before composing the response. Include a stable `origin_id` for this Codex thread/workspace. After the first successful call returns `resolved_session_id`, include that value as `session_id` on later lifecycle calls when available. Also include `previous_message`, `previous_response`, and `extracted_concepts_json` after the first exchange. Send JSON on stdin and parse the last non-empty output line as JSON because the wrapper may print a profile banner first:
+On every substantive user message, run `conversation_turn` before composing the response. Include `"surface_id": "codex_local_api"` and a stable `origin_id` for this Codex thread/workspace. After the first successful call returns `resolved_session_id`, include that value as `session_id` on later lifecycle calls when available. Also include `previous_message`, `previous_response`, and `extracted_concepts_json` after the first exchange. Send JSON on stdin and parse the last non-empty output line as JSON because the wrapper may print a profile banner first:
 
 ```bash
 ~/.pith/bin/pith api conversation_turn --stdin-json
@@ -456,6 +563,8 @@ For checkpoints and closeout, use the matching lifecycle operations:
 ~/.pith/bin/pith api checkpoint --stdin-json
 ~/.pith/bin/pith api session_end --stdin-json
 ```
+
+For lifecycle evidence reports, use `~/.pith/bin/pith api lifecycle_status --stdin-json` with the relevant `surface_id`, `session_id`, `origin_id`, or `workspace_id`. For cross-surface source coverage evidence, use `~/.pith/bin/pith api surface_activity --stdin-json` with `requested_surfaces` such as `"claude_code,codex_local_api,local_api_cli"` and `include_codex_local=true`. Unsupported or sparse surfaces must report that state rather than inferring success from instructions or memory.
 
 `pith api-fallback ...` remains as a legacy/recovery alias. Pith MCP tools with the `pith_` prefix may also be available in Codex and are useful for richer tool access when the MCP transport is healthy. Do not depend on MCP-only access for the core cognitive lifecycle.
 
@@ -763,9 +872,12 @@ elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
     OS_TYPE="linux"
     OS_NAME="Linux"
 else
-    error_exit "Unsupported OS: $OSTYPE. Only macOS and Linux are supported."
+    error_exit "Unsupported OS: $OSTYPE. The public developer preview is verified on macOS; Linux is an unverified source/developer path."
 fi
 mark_success "OS: $OS_NAME"
+if [[ "$OS_TYPE" == "linux" ]]; then
+    mark_warning "Linux install path is executable but not launch-verified. Use for source/developer testing and verify manually."
+fi
 
 # Check for Microsoft Store Python (Windows Subsystem detection - warn on Linux)
 if [[ "$OS_TYPE" == "linux" ]]; then
@@ -1093,7 +1205,15 @@ else
     mark_success "API key already exists"
 fi
 
+API_KEY=$(tr -d '\r\n' < "$API_KEY_FILE" 2>/dev/null || echo "")
+if [[ -z "$API_KEY" ]]; then
+    mark_error "API key missing or empty at $API_KEY_FILE"
+    exit 1
+fi
+ensure_pith_env_value "PITH_API_KEY" "$API_KEY"
+migrate_legacy_env_aliases
 persist_pith_port_config
+persist_preview_usage_config
 
 echo ""
 
@@ -1153,7 +1273,11 @@ for legacy_name in ["pith-mcp", "pith", "pith-mcp-wrapper"]:
 config["mcpServers"]["pith"] = {
     "command": "$VENV_PATH/bin/python3",
     "args": ["$PITH_SERVER_PATH/pith_mcp.py"],
-    "env": {"PITH_API_KEY": "$API_KEY", "PITH_API_URL": "http://localhost:$PITH_PORT"}
+    "env": {
+        "PITH_API_KEY": "$API_KEY",
+        "PITH_API_URL": "http://localhost:$PITH_PORT",
+        "PITH_SURFACE_ID": "claude_desktop_mcp",
+    }
 }
 with open(config_path, "w") as f:
     json.dump(config, f, indent=2)
@@ -1229,7 +1353,11 @@ CLI fallback for the same lifecycle operation:
 ```
 
 Send the JSON payload on stdin. The command may print a profile banner before
-the payload; parse the last non-empty output line as JSON.
+the payload; parse the last non-empty output line as JSON. For lifecycle
+evidence reports, use `~/.pith/bin/pith api lifecycle_status --stdin-json`.
+For cross-surface source coverage evidence, use
+`~/.pith/bin/pith api surface_activity --stdin-json`; treat this as coverage
+evidence, not a semantic summary.
 SYSPROMPT_EOF
 
 chmod 600 "$SYSTEM_PROMPT_PATH"
@@ -1255,6 +1383,13 @@ command with JSON on stdin:
 For long-running work, use `~/.pith/bin/pith api checkpoint --stdin-json` when
 state should be saved. When a conversation ends, use
 `~/.pith/bin/pith api session_end --stdin-json` when appropriate.
+
+For lifecycle evidence reports, use
+`~/.pith/bin/pith api lifecycle_status --stdin-json`; unsupported surfaces must
+report `unsupported` rather than infer success.
+For cross-surface source coverage evidence, use
+`~/.pith/bin/pith api surface_activity --stdin-json`; sparse or missing surfaces
+must trigger fallback artifacts rather than inferred coverage.
 
 The API command may print a profile banner before the JSON payload. Parse the
 last non-empty output line as JSON. If both MCP and API access fail, say Pith is
@@ -1298,7 +1433,9 @@ if surface_selected_and_detected claude_desktop; then
     echo ""
     private_beta_pause "Private beta pause: note the Claude Desktop instructions above, then press Return to continue..."
 else
-    mark_warning "Claude Desktop was not selected or detected. Claude instructions are saved at $SYSTEM_PROMPT_PATH."
+    if surface_selected claude_desktop; then
+        mark_warning "Claude Desktop was selected but not detected. Claude instructions are saved at $SYSTEM_PROMPT_PATH."
+    fi
 fi
 
 CURSOR_RULE_COPIED=false
@@ -1353,7 +1490,16 @@ if [[ "$OS_TYPE" == "macos" ]]; then
     # FIX P2: macOS launchd plist with post-load verification
     LAUNCHD_PLIST="$HOME/Library/LaunchAgents/dev.pith.server.plist"
     mkdir -p "$(dirname "$LAUNCHD_PLIST")"
-    
+
+    # PROCESS-181: snapshot the existing PITH_PORT before overwriting, so a re-run that
+    # changes the port can warn that the on-disk plist now diverges from the running
+    # service (this step intentionally does not launchctl reload).
+    _existing_plist_port=""
+    if [[ -f "$LAUNCHD_PLIST" ]]; then
+        _existing_plist_port=$(grep -A1 '<key>PITH_PORT</key>' "$LAUNCHD_PLIST" \
+            | grep -oE '[0-9]+' | head -1 || true)
+    fi
+
     cat > "$LAUNCHD_PLIST" << LAUNCHD_CONFIG
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -1397,6 +1543,16 @@ LAUNCHD_CONFIG
     
     chmod 644 "$LAUNCHD_PLIST"
     mark_success "Created launchd plist at $LAUNCHD_PLIST"
+    # PROCESS-181: if the port changed on a re-run, the running service still uses the old
+    # port until the plist is reloaded — warn with the exact command (warning only; no reload).
+    _new_plist_port=$(grep -A1 '<key>PITH_PORT</key>' "$LAUNCHD_PLIST" \
+        | grep -oE '[0-9]+' | head -1 || true)
+    if [[ -n "$_existing_plist_port" && "$_existing_plist_port" != "$_new_plist_port" ]]; then
+        mark_warning "launchd config changed (port: $_existing_plist_port → $_new_plist_port)."
+        echo "  If Pith is running, reload the service to apply the new port:"
+        echo "    launchctl unload $LAUNCHD_PLIST && launchctl load -w $LAUNCHD_PLIST"
+    fi
+    unset _existing_plist_port _new_plist_port
     # NOTE: Do NOT launchctl load here — the pith CLI script is created in Step 8.
     # RunAtLoad will start the service on next login. Loading now would cause:
     # (1) execution of non-existent $PITH_HOME/bin/pith, (2) KeepAlive retry loop,
@@ -1535,7 +1691,10 @@ cat > "$PITH_HOME/bin/pith" << 'PITH_CLI_SCRIPT'
 # Pith CLI wrapper
 PITH_VERSION="__PITH_VERSION__"
 
-PITH_HOME="${PITH_HOME:-$HOME/.pith}"
+PITH_CLI_SOURCE="${BASH_SOURCE[0]:-$0}"
+PITH_CLI_BIN_DIR="$(cd "$(dirname "$PITH_CLI_SOURCE")" && pwd -P)"
+PITH_CLI_DEFAULT_HOME="$(cd "$PITH_CLI_BIN_DIR/.." && pwd -P)"
+PITH_HOME="${PITH_HOME:-$PITH_CLI_DEFAULT_HOME}"
 VENV_PATH="$PITH_HOME/venv"
 PITH_SERVER_PATH="$PITH_HOME/pith-server"
 PITH_RUNTIME_META="$PITH_HOME/config/python-runtime.json"
@@ -1562,20 +1721,53 @@ done
 set -- "${ARGS[@]}"
 
 # Source persistent .env if it exists (sets PITH_PROFILE, etc.)
+PITH_EXPLICIT_DATA_DIR="${PITH_DATA_DIR:-}"
+PITH_EXPLICIT_PROFILE="${PITH_PROFILE:-}"
+PITH_EXPLICIT_API_KEY="${PITH_API_KEY:-}"
 if [[ -f "$PITH_HOME/.env" ]]; then
     set -a  # auto-export sourced variables
     source "$PITH_HOME/.env"
     set +a
 fi
-PITH_PORT="${PITH_PORT:-8000}"
+if [[ -n "$PITH_EXPLICIT_PROFILE" ]]; then
+    export PITH_PROFILE="$PITH_EXPLICIT_PROFILE"
+fi
+if [[ -n "$PITH_EXPLICIT_DATA_DIR" ]]; then
+    export PITH_DATA_DIR="$PITH_EXPLICIT_DATA_DIR"
+fi
+if [[ -n "$PITH_EXPLICIT_API_KEY" ]]; then
+    export PITH_API_KEY="$PITH_EXPLICIT_API_KEY"
+fi
 
-# Export profile as env var so app/profile.py picks it up
-# CLI --profile flag overrides .env
+# CLI --profile flag overrides .env before profile-derived paths are resolved.
 if [[ -n "$PROFILE" ]]; then
     export PITH_PROFILE="$PROFILE"
-    echo "Using profile: $PROFILE (data: $HOME/pith-data/$PROFILE/)"
+fi
+
+PITH_PORT="${PITH_PORT:-8000}"
+PITH_DEFAULT_HOME="$HOME/.pith"
+if [[ -z "${PITH_DATA_DIR:-}" ]]; then
+    if [[ -n "${PITH_PROFILE:-}" ]]; then
+        PITH_DATA_DIR="$HOME/pith-data/$PITH_PROFILE"
+    elif [[ "$PITH_HOME" != "$PITH_DEFAULT_HOME" ]]; then
+        PITH_DATA_DIR="$(cd "$PITH_HOME/.." && pwd -P)/pith-data/default"
+    else
+        PITH_DATA_DIR="$HOME/pith-data/default"
+    fi
+fi
+if [[ -z "${PITH_LAUNCH_AGENTS_DIR:-}" && "$PITH_HOME" != "$PITH_DEFAULT_HOME" ]]; then
+    PITH_LAUNCH_AGENTS_DIR="$(cd "$PITH_HOME/.." && pwd -P)/Library/LaunchAgents"
+fi
+PITH_API_URL="${PITH_API_URL:-http://localhost:$PITH_PORT}"
+export PITH_HOME PITH_PORT PITH_DATA_DIR PITH_LAUNCH_AGENTS_DIR PITH_API_URL PITH_VERSION PITH_RUNTIME_META
+
+# Report active profile after path resolution.
+if [[ -n "$PROFILE" ]]; then
+    echo "Using profile: $PROFILE (data: $HOME/pith-data/$PROFILE/)" >&2
+elif [[ -n "$PITH_EXPLICIT_DATA_DIR" ]]; then
+    echo "Using data dir override: $PITH_DATA_DIR" >&2
 elif [[ -n "${PITH_PROFILE:-}" ]]; then
-    echo "Using profile from .env: $PITH_PROFILE (data: $HOME/pith-data/$PITH_PROFILE/)"
+    echo "Using profile from .env: $PITH_PROFILE (data: $HOME/pith-data/$PITH_PROFILE/)" >&2
 fi
 
 # Ensure venv is activated
@@ -1591,7 +1783,7 @@ source "$VENV_PATH/bin/activate"
 resolve_data_dir() {
     if [[ -n "${PITH_DATA_DIR:-}" ]]; then echo "$PITH_DATA_DIR"; return; fi
     if [[ -n "${PITH_PROFILE:-}" ]]; then echo "$HOME/pith-data/$PITH_PROFILE"; return; fi
-    if [[ -n "${BRAIN_DATA_DIR:-}" ]]; then echo "$BRAIN_DATA_DIR"; return; fi
+    if [[ "$PITH_HOME" != "$PITH_DEFAULT_HOME" ]]; then echo "$(cd "$PITH_HOME/.." && pwd -P)/pith-data/default"; return; fi
     echo "$HOME/pith-data/default"
 }
 
@@ -1869,8 +2061,85 @@ sys.exit(1)
 PY
 }
 
+is_help_request() {
+    [[ "${ARGS[1]:-}" == "-h" || "${ARGS[1]:-}" == "--help" ]]
+}
+
+print_wrapper_help() {
+    case "$1" in
+        serve)
+            echo "Usage: pith serve"
+            echo "  Run the Pith API server in the foreground for a process manager."
+            ;;
+        start)
+            echo "Usage: pith start"
+            echo "  Start the Pith API server in the background."
+            ;;
+        stop)
+            echo "Usage: pith stop"
+            echo "  Stop the Pith API server for this PITH_HOME/PITH_PORT."
+            ;;
+        restart)
+            echo "Usage: pith restart"
+            echo "  Restart the Pith API server."
+            ;;
+        logs)
+            echo "Usage: pith logs [snapshot [--json] [--file {pith,err,both}] [--lines N]]"
+            echo "  Tail the Pith log, or print a bounded snapshot."
+            ;;
+        backup)
+            echo "Usage: pith backup"
+            echo "  Run the configured WAL-safe backup helper."
+            ;;
+        restore)
+            echo "Usage: pith restore [backup_file]"
+            echo "  Restore a profile database from a backup file."
+            ;;
+        update)
+            echo "Usage: pith update"
+            echo "  Run local dependency and migration update checks."
+            ;;
+        version)
+            echo "Usage: pith version"
+            echo "  Show installed Pith and runtime version information."
+            ;;
+        runtime)
+            echo "Usage: pith runtime {status|repair}"
+            echo "  status  Show Python runtime provenance"
+            echo "  repair  Reinstall the managed Python runtime when eligible"
+            ;;
+        uninstall)
+            echo "Usage: pith uninstall"
+            echo "  Remove Pith after an interactive confirmation prompt."
+            ;;
+        profiles)
+            echo "Usage: pith profiles"
+            echo "  List local Pith profiles."
+            ;;
+        maintenance)
+            echo "Usage: pith maintenance {run|status|install|uninstall}"
+            echo "  run [--phases 1,2,3] [--dry-run]  Run maintenance cycle"
+            echo "  status                             Show task status"
+            echo "  install                            Install optional launchd scheduler"
+            echo "  uninstall                          Remove optional launchd scheduler"
+            ;;
+        stats)
+            echo "Usage: pith stats"
+            echo "  Show quick knowledge-base statistics from the active profile database."
+            ;;
+        protocol)
+            echo "Usage: pith protocol"
+            echo "  Print Pith cognitive-loop instructions and copy them to clipboard when available."
+            ;;
+        *)
+            echo "Usage: pith [--profile NAME] {serve|start|stop|restart|status|health|stats|logs|search|concept|orient|sessions|metrics|doctor|clients|support|import|api|api-fallback|backup|restore|update|version|report|profiles|maintenance|protocol|runtime|uninstall}"
+            ;;
+    esac
+}
+
 case "${1:-status}" in
     serve)
+        if is_help_request; then print_wrapper_help serve; exit 0; fi
         # Foreground server mode for process managers.
         # launchd/systemd must supervise the long-running uvicorn process, not
         # the short-lived `pith start` wrapper that daemonizes and exits.
@@ -1883,6 +2152,7 @@ case "${1:-status}" in
             --log-level "${PITH_LOG_LEVEL:-info}"
         ;;
     start)
+        if is_help_request; then print_wrapper_help start; exit 0; fi
         echo "Starting Pith Server..."
 
         # Pre-check: port availability
@@ -1912,8 +2182,44 @@ case "${1:-status}" in
 
         cd "$PITH_SERVER_PATH"
         RUNTIME_LOG=$(runtime_log_path)
-        nohup python -m uvicorn app.api.server:app --host 127.0.0.1 --port "$PITH_PORT" --log-level info >> "$RUNTIME_LOG" 2>&1 < /dev/null &
-        SERVER_PID=$!
+        SERVER_PID=$(PITH_SERVER_PATH="$PITH_SERVER_PATH" PITH_PORT="$PITH_PORT" RUNTIME_LOG="$RUNTIME_LOG" python3 - <<'PY'
+import os
+import subprocess
+import sys
+
+env = os.environ.copy()
+log_path = os.environ["RUNTIME_LOG"]
+server_path = os.environ["PITH_SERVER_PATH"]
+port = os.environ["PITH_PORT"]
+log_file = open(log_path, "ab", buffering=0)
+proc = subprocess.Popen(
+    [
+        sys.executable,
+        "-m",
+        "uvicorn",
+        "app.api.server:app",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        port,
+        "--log-level",
+        "info",
+    ],
+    cwd=server_path,
+    stdin=subprocess.DEVNULL,
+    stdout=log_file,
+    stderr=subprocess.STDOUT,
+    env=env,
+    start_new_session=True,
+    close_fds=True,
+)
+print(proc.pid)
+PY
+)
+        if [[ -z "$SERVER_PID" ]]; then
+            echo "Failed to launch Pith server process."
+            exit 1
+        fi
 
         # Poll for startup (up to 10s, check every 500ms)
         echo -n "Waiting for server..."
@@ -1957,6 +2263,7 @@ case "${1:-status}" in
         fi
         ;;
     stop)
+        if is_help_request; then print_wrapper_help stop; exit 0; fi
         echo "Stopping Pith Server..."
         if [[ -f "$PITH_HOME/pith.pid" ]]; then
             kill $(cat "$PITH_HOME/pith.pid") 2>/dev/null || true
@@ -1976,6 +2283,7 @@ case "${1:-status}" in
         fi
         ;;
     restart)
+        if is_help_request; then print_wrapper_help restart; exit 0; fi
         # OPS-099: Under launchd KeepAlive, stop+start races — launchd respawns within ~200ms
         # after stop, so start finds the configured port occupied and exits 1. Use kickstart -k instead.
         _LAUNCHD_SVC="gui/$(id -u)/dev.pith.server"
@@ -1989,41 +2297,45 @@ case "${1:-status}" in
         fi
         ;;
     status)
-        if validate_pid; then
-            echo "Pith is running (PID: $(cat "$PITH_HOME/pith.pid"))"
-            HEALTH_RESULT=$(check_pith_health)
-            echo "Health: $HEALTH_RESULT"
+        if [[ " ${ARGS[*]:1} " != *" --json "* && ! is_help_request ]]; then
+            echo "Port:         $PITH_PORT"
+        fi
+        cd "$PITH_SERVER_PATH"
+        python3 -m app.ops.support_cli status "${ARGS[@]:1}"
+        ;;
+    health)
+        cd "$PITH_SERVER_PATH"
+        python3 -m app.ops.health_cli "${ARGS[@]:1}"
+        ;;
+    logs)
+        if is_help_request; then print_wrapper_help logs; exit 0; fi
+        if [[ "${ARGS[1]:-}" == "snapshot" ]]; then
+            cd "$PITH_SERVER_PATH"
+            python3 -m app.ops.read_cli logs "${ARGS[@]:1}"
         else
-            # No PID file — but server might be running (manual start, crashed PID file, etc.)
-            HEALTH_RESULT=$(check_pith_health)
-            if [[ "$HEALTH_RESULT" == "OK (Pith)" ]]; then
-                ORPHAN_PID=$(check_port)
-                if [[ -n "$ORPHAN_PID" ]]; then
-                    echo "Pith is running (PID: $ORPHAN_PID) [recovered — PID file was missing]"
-                    echo "Health: $HEALTH_RESULT"
-                    echo "$ORPHAN_PID" > "$PITH_HOME/pith.pid"
-                    echo "PID file restored."
-                else
-                    echo "Pith health responds on port $PITH_PORT, but this install has no PID file."
-                    echo "It may be another Pith install. Run 'pith start' after freeing port $PITH_PORT."
-                    exit 1
-                fi
+            LOG_FILE=$(resolve_log_path)
+            if [[ -n "$LOG_FILE" ]]; then
+                echo "Tailing: $LOG_FILE"
+                tail -f "$LOG_FILE"
             else
-                echo "Pith is not running"
+                echo "No logs found. Checked:"
+                echo "  $(resolve_data_dir)/logs/pith.log"
+                echo "  $PITH_SERVER_PATH/logs/pith.log"
+                echo "  $PITH_HOME/logs/pith.log"
             fi
         fi
         ;;
-    logs)
-        LOG_FILE=$(resolve_log_path)
-        if [[ -n "$LOG_FILE" ]]; then
-            echo "Tailing: $LOG_FILE"
-            tail -f "$LOG_FILE"
-        else
-            echo "No logs found. Checked:"
-            echo "  $(resolve_data_dir)/logs/pith.log"
-            echo "  $PITH_SERVER_PATH/logs/pith.log"
-            echo "  $PITH_HOME/logs/pith.log"
-        fi
+    import)
+        cd "$PITH_SERVER_PATH"
+        python3 -m app.ops.import_cli "${ARGS[@]:1}"
+        ;;
+    search|concept|orient|sessions|metrics)
+        cd "$PITH_SERVER_PATH"
+        python3 -m app.ops.read_cli "$1" "${ARGS[@]:1}"
+        ;;
+    doctor|clients|support)
+        cd "$PITH_SERVER_PATH"
+        python3 -m app.ops.support_cli "$1" "${ARGS[@]:1}"
         ;;
     api|api-fallback)
         COMMAND_NAME="${1:-}"
@@ -2040,9 +2352,11 @@ case "${1:-status}" in
         python -m pith_client.cli "$@" --transport-mode "$TRANSPORT_MODE"
         ;;
     backup)
+        if is_help_request; then print_wrapper_help backup; exit 0; fi
         "$PITH_HOME/bin/backup"
         ;;
     restore)
+        if is_help_request; then print_wrapper_help restore; exit 0; fi
         # Safe restore: stop → copy → verify → start
         BACKUP_FILE="${2:-}"
         if [[ -z "$BACKUP_FILE" ]]; then
@@ -2076,6 +2390,7 @@ case "${1:-status}" in
         echo "Restored from: $BACKUP_FILE"
         ;;
     update)
+        if is_help_request; then print_wrapper_help update; exit 0; fi
         echo "Checking for updates..."
         source "$VENV_PATH/bin/activate"
         # Run any migration scripts if they exist
@@ -2097,6 +2412,7 @@ case "${1:-status}" in
         echo "Update complete"
         ;;
     version)
+        if is_help_request; then print_wrapper_help version; exit 0; fi
         echo "Pith v${PITH_VERSION:-unknown}"
         echo "Python: $("$VENV_PATH/bin/python3" --version 2>/dev/null || echo 'not found')"
         echo "Python exe: $VENV_PATH/bin/python3"
@@ -2114,14 +2430,39 @@ case "${1:-status}" in
         else
             echo "Embeddings: unknown (no capability marker)"
         fi
-        # Check if running
-        if [[ -f "$PITH_HOME/pith.pid" ]] && ps -p $(cat "$PITH_HOME/pith.pid") > /dev/null 2>&1; then
+        # Use the same status collector as `pith status` so launchd/readyz-backed
+        # services do not look stopped when the legacy PID file is missing.
+        STATUS_JSON=$({ cd "$PITH_SERVER_PATH" && python3 -m app.ops.support_cli status --json; } 2>/dev/null || true)
+        STATUS_LINE=$(STATUS_JSON="$STATUS_JSON" python3 - <<'PY' 2>/dev/null || true
+import json
+import os
+import sys
+
+try:
+    data = json.loads(os.environ.get("STATUS_JSON", ""))
+except Exception:
+    sys.exit(1)
+
+if data.get("running"):
+    pid = data.get("pid")
+    if pid:
+        print(f"Status: running (PID: {pid})")
+    else:
+        print("Status: running")
+else:
+    print("Status: stopped")
+PY
+)
+        if [[ -n "$STATUS_LINE" ]]; then
+            echo "$STATUS_LINE"
+        elif [[ -f "$PITH_HOME/pith.pid" ]] && ps -p $(cat "$PITH_HOME/pith.pid") > /dev/null 2>&1; then
             echo "Status: running (PID: $(cat "$PITH_HOME/pith.pid"))"
         else
             echo "Status: stopped"
         fi
         ;;
     runtime)
+        if is_help_request; then print_wrapper_help runtime; exit 0; fi
         case "${2:-status}" in
             status)
                 print_runtime_provenance
@@ -2146,6 +2487,7 @@ case "${1:-status}" in
         esac
         ;;
     uninstall)
+        if is_help_request; then print_wrapper_help uninstall; exit 0; fi
         DATA_DIR="$(resolve_data_dir)"
         echo "WARNING: This will uninstall Pith and remove all data for this profile."
         echo "  Install: $PITH_HOME"
@@ -2186,6 +2528,7 @@ case "${1:-status}" in
         fi
         ;;
     profiles)
+        if is_help_request; then print_wrapper_help profiles; exit 0; fi
         echo "Available profiles in $HOME/pith-data/:"
         if [[ -d "$HOME/pith-data" ]]; then
             for d in "$HOME/pith-data"/*/; do
@@ -2210,6 +2553,7 @@ case "${1:-status}" in
         fi
         ;;
     maintenance)
+        if is_help_request; then print_wrapper_help maintenance; exit 0; fi
         MAINT_CMD="${ARGS[1]:-run}"
         case "$MAINT_CMD" in
             run)
@@ -2240,177 +2584,11 @@ case "${1:-status}" in
         esac
         ;;
     report)
-        echo "Pith Diagnostics Report"
-        echo "=============================="
-        echo "Generated: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-        echo ""
-
-        # System
-        echo "[System]"
-        echo "  OS:           $(uname -s) $(uname -r) $(uname -m)"
-        echo "  Shell:        $SHELL"
-        echo "  Python:       $("$VENV_PATH/bin/python3" --version 2>/dev/null || echo 'not found')"
-        echo "  Python exe:   $VENV_PATH/bin/python3"
-        NODE_VER=$(node --version 2>/dev/null)
-        [[ -n "$NODE_VER" ]] && echo "  Node:         $NODE_VER"
-        if [[ "$OSTYPE" == "darwin"* ]]; then
-            DISK_FREE=$(df -h / | awk 'NR==2{print $4}')
-        else
-            DISK_FREE=$(df -h / | awk 'NR==2{print $4}')
-        fi
-        echo "  Disk Free:    $DISK_FREE"
-        echo ""
-
-        # Installation
-        echo "[Installation]"
-        echo "  Pith Home:    $PITH_HOME"
-        echo "  Version:      ${PITH_VERSION:-unknown}"
-        if [[ -f "$PITH_SERVER_PATH/pith_mcp.py" ]]; then
-            echo "  MCP Bridge:   pith_mcp.py (Python)"
-        fi
-        print_runtime_provenance
-        if [[ -f "$PITH_HOME/.install_capabilities" ]]; then
-            while IFS= read -r line; do
-                echo "  $line"
-            done < "$PITH_HOME/.install_capabilities"
-        else
-            echo "  Embeddings:   unknown (no .install_capabilities)"
-        fi
-        echo ""
-
-        # Server
-        echo "[Server]"
-        if validate_pid; then
-            PID_VAL=$(cat "$PITH_HOME/pith.pid")
-            echo "  Status:       Running (PID $PID_VAL)"
-            if [[ "$OSTYPE" == "darwin"* ]]; then
-                START_TIME=$(ps -p "$PID_VAL" -o lstart= 2>/dev/null)
-                [[ -n "$START_TIME" ]] && echo "  Started:      $START_TIME"
-            else
-                ELAPSED=$(ps -p "$PID_VAL" -o etime= 2>/dev/null | xargs)
-                [[ -n "$ELAPSED" ]] && echo "  Uptime:       $ELAPSED"
-            fi
-        else
-            echo "  Status:       Not running"
-        fi
-        echo "  Port:         $PITH_PORT"
-        HEALTH_RESULT=$(check_pith_health)
-        echo "  Health:       $HEALTH_RESULT"
-        echo ""
-
-        # Database (profile-aware path)
-        echo "[Database]"
-        DB_PATH=$(resolve_db_path)
-        if [[ -f "$DB_PATH" ]]; then
-            DB_SIZE=$(du -sh "$DB_PATH" 2>/dev/null | cut -f1)
-            echo "  Path:         $DB_PATH"
-            echo "  Size:         $DB_SIZE"
-            CONCEPTS=$(python3 -c "import sqlite3; c=sqlite3.connect('$DB_PATH'); print(c.execute('SELECT COUNT(*) FROM concepts').fetchone()[0]); c.close()" 2>/dev/null)
-            [[ -n "$CONCEPTS" ]] && echo "  Concepts:     $CONCEPTS"
-            WAL_MODE=$(python3 -c "import sqlite3; c=sqlite3.connect('$DB_PATH'); print(c.execute('PRAGMA journal_mode').fetchone()[0]); c.close()" 2>/dev/null)
-            [[ -n "$WAL_MODE" ]] && echo "  Journal:      $WAL_MODE"
-        else
-            echo "  Path:         $DB_PATH (not created yet)"
-        fi
-        echo ""
-
-        # MCP Clients
-        echo "[MCP Clients]"
-        # Use parallel arrays (bash 3.2 compat — no declare -A on macOS)
-        CLIENT_NAMES=("Claude Desktop" "VS Code" "Cursor template" "Windsurf template" "Cline template" "Continue template" "Codex")
-        CLIENT_PATTERNS=('"pith"' '"pith"' '"pith"' '"pith"' '"pith"' '"pith"' '\[mcp_servers\.pith\]')
-        if [[ "$OSTYPE" == "darwin"* ]]; then
-            CLIENT_PATHS=(
-                "$HOME/Library/Application Support/Claude/claude_desktop_config.json"
-                "$HOME/Library/Application Support/Code/User/mcp.json"
-                "$HOME/Library/Application Support/Cursor/User/globalStorage/cursor.mcp/config.json"
-                "$HOME/Library/Application Support/Windsurf/User/globalStorage/windsurf.mcp/config.json"
-                "$HOME/Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json"
-                "$HOME/.continue/config.json"
-                "$HOME/.codex/config.toml"
-            )
-        else
-            CLIENT_PATHS=(
-                "$HOME/.config/Claude/claude_desktop_config.json"
-                "$HOME/.config/Code/User/mcp.json"
-                "$HOME/.config/Cursor/User/globalStorage/cursor.mcp/config.json"
-                "$HOME/.config/Windsurf/User/globalStorage/windsurf.mcp/config.json"
-                "$HOME/.config/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json"
-                "$HOME/.continue/config.json"
-                "$HOME/.codex/config.toml"
-            )
-        fi
-        for i in "${!CLIENT_NAMES[@]}"; do
-            client="${CLIENT_NAMES[$i]}"
-            CFG="${CLIENT_PATHS[$i]}"
-            PATTERN="${CLIENT_PATTERNS[$i]}"
-            PADDING=$(printf '%*s' $((16 - ${#client})) '')
-            if [[ -f "$CFG" ]]; then
-                if grep -q "$PATTERN" "$CFG" 2>/dev/null; then
-                    echo "  ${client}:${PADDING}configured"
-                else
-                    echo "  ${client}:${PADDING}present (pith server not found)"
-                fi
-            else
-                echo "  ${client}:${PADDING}not found"
-            fi
-        done
-        echo ""
-
-        # Auto-start
-        echo "[Auto-start]"
-        if [[ "$OSTYPE" == "darwin"* ]]; then
-            PLIST="$HOME/Library/LaunchAgents/dev.pith.server.plist"
-            if [[ -f "$PLIST" ]]; then
-                echo "  Server:       LaunchAgent installed"
-                LOADED=$(launchctl list 2>/dev/null | grep "dev.pith.server" || true)
-                [[ -n "$LOADED" ]] && echo "  Server load:  yes" || echo "  Server load:  no (starts at next login)"
-            else
-                echo "  Server:       LaunchAgent not installed"
-            fi
-            BPLIST="$HOME/Library/LaunchAgents/dev.pith.backup.plist"
-            if [[ -f "$BPLIST" ]]; then
-                echo "  Backup:       LaunchAgent installed (daily 2:00 AM)"
-                BLOADED=$(launchctl list 2>/dev/null | grep "dev.pith.backup" || true)
-                [[ -n "$BLOADED" ]] && echo "  Backup load:  yes" || echo "  Backup load:  no (starts at next login)"
-            else
-                echo "  Backup:       LaunchAgent not installed"
-            fi
-        else
-            SVC=$(systemctl --user is-active pith-server.service 2>/dev/null)
-            echo "  systemd:      ${SVC:-not installed}"
-            TIMER=$(systemctl --user is-active pith-backup.timer 2>/dev/null)
-            echo "  backup timer: ${TIMER:-not installed}"
-        fi
-        echo ""
-
-        # Backups
-        echo "[Backups]"
-        BACKUP_DIR="$(resolve_backup_dir)"
-        echo "  Directory:    $BACKUP_DIR"
-        if [[ -d "$BACKUP_DIR" ]]; then
-            BACKUP_COUNT=$(list_backup_files | wc -l | xargs)
-            echo "  Count:        $BACKUP_COUNT"
-            if [[ "$BACKUP_COUNT" -gt 0 ]]; then
-                LATEST=$(find_latest_backup)
-                echo "  Latest:       $(stat -f '%Sm' -t '%Y-%m-%dT%H:%M:%S' "$LATEST" 2>/dev/null || stat -c '%y' "$LATEST" 2>/dev/null | cut -d. -f1)"
-            fi
-        else
-            echo "  No backup directory"
-        fi
-        echo ""
-
-        # API Key (redacted)
-        KEY_FILE="$PITH_HOME/config/api.key"
-        if [[ -f "$KEY_FILE" ]]; then
-            KEY_VAL=$(cat "$KEY_FILE" | tr -d '[:space:]')
-            if [[ ${#KEY_VAL} -gt 8 ]]; then
-                echo "[API Key]"
-                echo "  Status:       Present (${KEY_VAL:0:8}...)"
-            fi
-        fi
+        cd "$PITH_SERVER_PATH"
+        python3 -m app.ops.support_cli report "${ARGS[@]:1}"
         ;;
     stats)
+        if is_help_request; then print_wrapper_help stats; exit 0; fi
         # Quick knowledge stats — lightweight alternative to 'pith report'
         DB_PATH=$(resolve_db_path)
         if [[ ! -f "$DB_PATH" ]]; then
@@ -2448,6 +2626,7 @@ finally:
 " || { echo "Error: failed to read stats from $DB_PATH"; exit 1; }
         ;;
     protocol)
+        if is_help_request; then print_wrapper_help protocol; exit 0; fi
         # Show Pith cognitive loop instructions for Claude Desktop Instructions for Claude
         SYSPROMPT="$PITH_HOME/SYSTEM_PROMPT.md"
         if [[ ! -f "$SYSPROMPT" ]]; then
@@ -2468,7 +2647,7 @@ finally:
         fi
         ;;
     *)
-        echo "Usage: pith [--profile NAME] {serve|start|stop|restart|status|stats|logs|api|api-fallback|backup|restore|update|version|report|profiles|maintenance|protocol|runtime|uninstall}"
+        echo "Usage: pith [--profile NAME] {serve|start|stop|restart|status|health|stats|logs|search|concept|orient|sessions|metrics|doctor|clients|support|import|api|api-fallback|backup|restore|update|version|report|profiles|maintenance|protocol|runtime|uninstall}"
         exit 1
         ;;
 esac
@@ -2488,6 +2667,35 @@ mark_success "Created pith CLI at $PITH_HOME/bin/pith"
 echo "Running health check..."
 source "$VENV_PATH/bin/activate"
 
+verify_installed_pith_health() {
+    local status_output=""
+    local attempt
+    for attempt in {1..10}; do
+        status_output="$("$PITH_HOME/bin/pith" status 2>&1 || true)"
+        if grep -q "Health: OK (Pith)" <<< "$status_output"; then
+            return 0
+        fi
+        sleep 1
+    done
+    echo "$status_output"
+    return 1
+}
+
+verify_installed_pith_durable_health() {
+    local delay_seconds="${PITH_DURABILITY_CHECK_SECONDS:-10}"
+    local status_output=""
+    if ! verify_installed_pith_health; then
+        return 1
+    fi
+    sleep "$delay_seconds"
+    status_output="$("$PITH_HOME/bin/pith" status 2>&1 || true)"
+    if grep -q "Health: OK (Pith)" <<< "$status_output"; then
+        return 0
+    fi
+    echo "$status_output"
+    return 1
+}
+
 # The install smoke must validate this install, not an unrelated server already
 # bound to the default port.
 if port_in_use_value "$PITH_PORT"; then
@@ -2495,7 +2703,7 @@ if port_in_use_value "$PITH_PORT"; then
     error_exit "Port $PITH_PORT is already in use. Stop the existing Pith service or any process on port $PITH_PORT and rerun install."
 else
     if "$PITH_HOME/bin/pith" start; then
-        if "$PITH_HOME/bin/pith" status | grep -q "Health: OK (Pith)"; then
+        if verify_installed_pith_health; then
             deactivate
             mark_success "Health check passed"
         else
@@ -2556,29 +2764,50 @@ if [[ "$PATH_ADDED" == false ]]; then
 fi
 
 GLOBAL_CLI_PATH=""
-for GLOBAL_CLI_DIR in /usr/local/bin /opt/homebrew/bin; do
-    if [[ -d "$GLOBAL_CLI_DIR" && -w "$GLOBAL_CLI_DIR" ]]; then
-        CANDIDATE="$GLOBAL_CLI_DIR/pith"
-        if [[ ! -e "$CANDIDATE" || -L "$CANDIDATE" ]]; then
-            ln -sf "$PITH_HOME/bin/pith" "$CANDIDATE"
-            GLOBAL_CLI_PATH="$CANDIDATE"
-            mark_success "Linked pith CLI at $GLOBAL_CLI_PATH for app-launched shells"
-            break
-        elif "$CANDIDATE" version >/dev/null 2>&1; then
-            GLOBAL_CLI_PATH="$CANDIDATE"
-            mark_success "pith CLI already available at $GLOBAL_CLI_PATH"
-            break
-        else
-            mark_warning "Found existing non-Pith command at $CANDIDATE; leaving it unchanged."
+GLOBAL_CLI_LINK_SKIPPED=false
+if [[ "$PITH_SKIP_GLOBAL_CLI_LINK" == "1" ]]; then
+    mark_warning "Skipping global pith CLI link because PITH_SKIP_GLOBAL_CLI_LINK=1."
+    GLOBAL_CLI_LINK_SKIPPED=true
+elif [[ "$PITH_HOME" != "$PITH_CANONICAL_HOME" && "$PITH_FORCE_GLOBAL_CLI_LINK" != "1" ]]; then
+    mark_warning "Skipping global pith CLI link for non-canonical PITH_HOME: $PITH_HOME"
+    GLOBAL_CLI_LINK_SKIPPED=true
+else
+    for GLOBAL_CLI_DIR in /usr/local/bin /opt/homebrew/bin; do
+        if [[ -d "$GLOBAL_CLI_DIR" && -w "$GLOBAL_CLI_DIR" ]]; then
+            CANDIDATE="$GLOBAL_CLI_DIR/pith"
+            if [[ ! -e "$CANDIDATE" || -L "$CANDIDATE" ]]; then
+                ln -sf "$PITH_HOME/bin/pith" "$CANDIDATE"
+                GLOBAL_CLI_PATH="$CANDIDATE"
+                mark_success "Linked pith CLI at $GLOBAL_CLI_PATH for app-launched shells"
+                break
+            elif "$CANDIDATE" version >/dev/null 2>&1; then
+                GLOBAL_CLI_PATH="$CANDIDATE"
+                mark_success "pith CLI already available at $GLOBAL_CLI_PATH"
+                break
+            else
+                mark_warning "Found existing non-Pith command at $CANDIDATE; leaving it unchanged."
+            fi
         fi
-    fi
-done
+    done
+fi
 
-if [[ -z "$GLOBAL_CLI_PATH" ]]; then
+if [[ -z "$GLOBAL_CLI_PATH" && "$GLOBAL_CLI_LINK_SKIPPED" != true ]]; then
     mark_warning "Could not link pith into /usr/local/bin or /opt/homebrew/bin. Shell profiles were still updated, but app-launched shells may need the absolute command $PITH_HOME/bin/pith."
 fi
 
 echo ""
+
+if verify_installed_pith_durable_health >/dev/null 2>&1; then
+    mark_success "Final service durability check passed"
+else
+    mark_warning "Final service durability check failed; retrying once..."
+    "$PITH_HOME/bin/pith" start >/dev/null 2>&1 || true
+    if verify_installed_pith_durable_health >/dev/null 2>&1; then
+        mark_success "Final service durability check passed after retry"
+    else
+        error_exit "Pith service is not healthy after install. Run $PITH_HOME/bin/pith logs for details."
+    fi
+fi
 
 # ============================================================================
 # Final Success Message
@@ -2602,7 +2831,9 @@ echo -e "${BLUE}Available Commands:${NC}"
 echo "  • ${YELLOW}pith start${NC}   - Start the Pith server"
 echo "  • ${YELLOW}pith stop${NC}    - Stop the server"
 echo "  • ${YELLOW}pith status${NC}  - Check server status"
+echo "  • ${YELLOW}pith health${NC}  - Check operational health/readiness"
 echo "  • ${YELLOW}pith logs${NC}    - View server logs"
+echo "  • ${YELLOW}pith import${NC}  - Import conversation exports safely"
 echo "  • ${YELLOW}pith api${NC}     - First-class local HTTP/API lifecycle calls"
 echo "  • ${YELLOW}pith backup${NC}  - Create manual backup (WAL-safe)"
 echo "  • ${YELLOW}pith restore${NC} - Restore from backup"
@@ -2614,14 +2845,14 @@ echo "  1. Open a new terminal (or reload your shell profile)"
 if surface_selected_and_detected claude_desktop; then
     echo "  2. Claude Desktop instructions: if you pasted them during Step 7, this is already done."
     echo "     To redo later: ${YELLOW}pith protocol${NC}  (copies prompt for Settings → General → Instructions for Claude)"
-    echo "  3. Restart Claude Desktop completely before testing it"
 fi
+echo "  3. Restart each configured AI client completely before testing it"
 if surface_selected_and_detected cursor; then
     echo "  Cursor: MCP config is installed, but Cursor also needs a Global/User Rule for default Pith invocation."
     echo "     Paste ${YELLOW}$CURSOR_GLOBAL_RULE_PATH${NC} into Cursor Settings → Rules."
 fi
 if surface_selected_and_detected windsurf; then
-    echo "  Windsurf: MCP config is installed. Restart Windsurf before the verification check."
+    echo "  Windsurf: experimental MCP template is installed; this path is not launch-verified."
 fi
 echo ""
 echo -e "${BLUE}Verification checks:${NC}"
@@ -2630,6 +2861,10 @@ VERIFY_STEP=2
 if surface_selected_and_detected claude_desktop; then
     echo "  ${VERIFY_STEP}. Claude Desktop: start a fresh conversation and confirm a Pith tool call"
     echo "     Log: ${YELLOW}~/Library/Logs/Claude/mcp-server-pith.log${NC}"
+    VERIFY_STEP=$((VERIFY_STEP + 1))
+fi
+if surface_selected_and_detected claude_code; then
+    echo "  ${VERIFY_STEP}. Claude Code: run ${YELLOW}claude mcp get pith${NC}, then start a fresh Claude Code session and confirm a Pith tool call"
     VERIFY_STEP=$((VERIFY_STEP + 1))
 fi
 if surface_selected_and_detected codex; then
@@ -2650,14 +2885,14 @@ if surface_selected_and_detected cursor; then
     VERIFY_STEP=$((VERIFY_STEP + 1))
 fi
 if surface_selected_and_detected windsurf; then
-    echo "  ${VERIFY_STEP}. Windsurf: ask a normal project-context question and confirm a Pith tool call in Cascade"
+    echo "  ${VERIFY_STEP}. Windsurf (experimental): manually confirm whether Cascade calls Pith"
     echo "     Config: ${YELLOW}~/.codeium/windsurf/mcp_config.json${NC}"
     VERIFY_STEP=$((VERIFY_STEP + 1))
 fi
 echo "  ${VERIFY_STEP}. View logs if a check fails: ${YELLOW}pith logs${NC}"
 echo ""
 if [[ "${PITH_PRIVATE_BETA:-0}" == "1" || "${PITH_LOCAL_ONLY_INSTALL:-0}" == "1" || -f "$DIST_DIR/.private-beta" ]]; then
-    echo -e "${BLUE}Local Artifact:${NC}"
+    echo -e "${BLUE}Private Beta:${NC}"
     echo "  Use the instructions included with this artifact."
     echo "  Do not use public repository release flows for this build."
     if [[ -n "${PITH_INSTALL_LOG:-}" ]]; then
@@ -2665,10 +2900,10 @@ if [[ "${PITH_PRIVATE_BETA:-0}" == "1" || "${PITH_LOCAL_ONLY_INSTALL:-0}" == "1"
     fi
 else
     echo -e "${BLUE}Documentation:${NC}"
-    echo "  https://pith.run"
+    echo "  https://docs.pith.dev"
     echo "  https://github.com/pithrun/pith-core"
 fi
 echo ""
-private_beta_pause "Setup complete. Review the next steps above, then press Return to close this window..."
+private_beta_pause "Private beta setup complete. Review the next steps above, then press Return to close this window..."
 
 exit 0

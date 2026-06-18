@@ -217,39 +217,49 @@ def derive_grouped_count_packet(
     confidence: object,
 ) -> dict[str, object]:
     """Derive a conservative grouped count packet from source-visible text."""
-    source_text = " ".join(text for text in (user_message, summary, evidence_text) if text)
-    if not source_text.strip():
-        return {}
-    if _ASSISTANT_ONLY_SUGGESTION_RE.search(source_text) and not _SELECTION_SIGNAL_RE.search(source_text):
-        return {}
+    source_candidates = [
+        text
+        for text in (
+            summary,
+            evidence_text,
+            " ".join(text for text in (summary, evidence_text) if text),
+        )
+        if text and text.strip()
+    ]
+    for source_text in source_candidates:
+        if _ASSISTANT_ONLY_SUGGESTION_RE.search(source_text) and not _SELECTION_SIGNAL_RE.search(source_text):
+            continue
 
-    match = _GROUP_BOUNDARY_RE.search(source_text)
-    if not match:
-        return {}
+        match = _GROUP_BOUNDARY_RE.search(source_text)
+        if not match:
+            continue
 
-    count = _parse_count(match.group("count"))
-    members = _split_members(match.group("members"))
-    if count is None or count != len(members):
-        return {}
+        count = _parse_count(match.group("count"))
+        members = _split_members(match.group("members"))
+        if count is None or count != len(members):
+            continue
 
-    method = (
-        "user_selected_grouped_set_v1"
-        if _SELECTION_SIGNAL_RE.search(source_text)
-        else "source_text_grouped_count_v1"
-    )
-    packet = {
-        "schema_version": 1,
-        "packet_type": "grouped_count",
-        "subject": "user" if re.search(r"\b(?:i|we|user|client)\b", source_text, re.I) else "source",
-        "domain": "general",
-        "group_label": match.group("label"),
-        "count": count,
-        "members": members,
-        "source_evidence": [{"verbatim": source_text[:_MAX_EVIDENCE], "role": "user"}],
-        "derivation_method": method,
-        "confidence": _coerce_confidence(confidence),
-    }
-    return sanitize_grouped_count_packet(packet)
+        method = (
+            "user_selected_grouped_set_v1"
+            if _SELECTION_SIGNAL_RE.search(source_text)
+            else "source_text_grouped_count_v1"
+        )
+        packet = {
+            "schema_version": 1,
+            "packet_type": "grouped_count",
+            "subject": "user" if re.search(r"\b(?:i|we|user|client)\b", source_text, re.I) else "source",
+            "domain": "general",
+            "group_label": match.group("label"),
+            "count": count,
+            "members": members,
+            "source_evidence": [{"verbatim": source_text[:_MAX_EVIDENCE], "role": "user"}],
+            "derivation_method": method,
+            "confidence": _coerce_confidence(confidence),
+        }
+        sanitized = sanitize_grouped_count_packet(packet)
+        if sanitized:
+            return sanitized
+    return {}
 
 
 def normalise_grouped_count_packet_metadata(

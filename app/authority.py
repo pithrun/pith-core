@@ -264,22 +264,23 @@ def batch_compute_authority(conn: sqlite3.Connection, concept_ids: list[str] | N
     if concept_ids:
         placeholders = ",".join("?" for _ in concept_ids)
         rows = conn.execute(
-            f"SELECT id, concept_type, stability, data, knowledge_area FROM concepts WHERE id IN ({placeholders})",
+            f"SELECT id, concept_type, stability, data, knowledge_area, provenance FROM concepts WHERE id IN ({placeholders})",
             concept_ids,
         ).fetchall()
     else:
         rows = conn.execute(
-            "SELECT id, concept_type, stability, data, knowledge_area FROM concepts WHERE status != 'deleted' AND maturity != 'DISCARDED'"
+            "SELECT id, concept_type, stability, data, knowledge_area, provenance FROM concepts WHERE status != 'deleted' AND maturity != 'DISCARDED'"
         ).fetchall()
 
     updated = 0
-    from app.core.constants import TYPE_AUTHORITY_CAPS
+    from app.core.constants import PROVENANCE_AUTHORITY_CAPS, TYPE_AUTHORITY_CAPS
 
     for row in rows:
         cid = row[0]
         ctype = row[1] or "observation"
         stab = row[2] or 0.5
         ka = row[4] if len(row) > 4 else None
+        provenance = row[5] if len(row) > 5 else "human"
 
         try:
             cdata = json.loads(row[3]) if row[3] else {}
@@ -293,8 +294,13 @@ def batch_compute_authority(conn: sqlite3.Connection, concept_ids: list[str] | N
         score = compute_authority_score(ctype, cdata, stab, version_count)
 
         # AUTHORITY-001: Compute and persist effective_authority
+        # A8: extend the cap with a provenance term so machine/agent-authored concepts
+        # can be ranked below human knowledge. prov_cap is None for 'human' (uncapped)
+        # and for any tier not populated in PROVENANCE_AUTHORITY_CAPS (dormant by default).
         type_cap = TYPE_AUTHORITY_CAPS.get(ctype)
-        effective = min(score, type_cap) if type_cap is not None else score
+        prov_cap = PROVENANCE_AUTHORITY_CAPS.get(provenance)
+        _caps = [c for c in (type_cap, prov_cap) if c is not None]
+        effective = min(score, *_caps) if _caps else score
 
         # Federation Phase 0, Component 0.1: KA-relative percentile authority
         ka_rel = None

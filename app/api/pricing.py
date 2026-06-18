@@ -3,6 +3,7 @@
 PRICING-002: Count concept-producing turns against daily budget.
 PRICING-003: Generate upgrade_nudge when budget exhausted.
 PRICING-005: Dev mode bypass via PITH_DEV_MODE=true.
+PREVIEW-001: Free developer preview is unlimited unless limits are explicitly enabled.
 """
 
 import logging
@@ -34,9 +35,23 @@ class BudgetZone(StrEnum):
 PITH_DEV_MODE = os.environ.get("PITH_DEV_MODE", "false").lower() == "true"
 
 
+def _truthy_env(value: str | None) -> bool:
+    return (value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def usage_limits_enabled() -> bool:
+    """Return True only when usage limits are explicitly enabled.
+
+    Public/free developer preview installs must not impose Pith turn, query,
+    or learning caps by default. This keeps metering code available for future
+    opt-in environments without degrading preview users.
+    """
+    return _truthy_env(os.environ.get("PITH_USAGE_LIMITS_ENABLED"))
+
+
 def dev_mode_active() -> bool:
-    """Check if dev mode is active (unlimited budget)."""
-    return PITH_DEV_MODE
+    """Check whether Pith should run with unlimited local usage."""
+    return PITH_DEV_MODE or not usage_limits_enabled()
 
 
 # Tier-to-budget mapping
@@ -52,13 +67,14 @@ class ConversationMeter:
     """In-memory daily turn counter. Resets on date change or server restart.
 
     Counts conversation_turn calls where auto-learning produced concepts.
-    This is the billing primitive — the minimum viable metering gate.
+    In free developer preview this is diagnostic-only unless usage limits are
+    explicitly enabled.
     """
 
     def __init__(self):
         self._date_key: str = ""
         self._turn_count: int = 0
-        self._tier: str = os.environ.get("PITH_TIER", "default")
+        self._tier: str = os.environ.get("PITH_TIER", "dev" if dev_mode_active() else "default")
         self._daily_limit: int = _TIER_BUDGETS.get(self._tier, DAILY_TURN_BUDGET_DEFAULT)
         self._capped_at: str | None = None  # PRICING-007: ISO timestamp when budget hit 0
 
@@ -137,12 +153,15 @@ class ConversationMeter:
     def get_status(self) -> dict:
         """Return current metering status for diagnostics."""
         self._reset_if_new_day()
+        unlimited = dev_mode_active()
         return {
             "tier": self._tier,
-            "daily_limit": self._daily_limit,
+            "daily_limit": -1 if unlimited else self._daily_limit,
             "turns_used": self._turn_count,
             "turns_remaining": self.check_turn_budget(),
-            "dev_mode": dev_mode_active(),
+            "dev_mode": unlimited,
+            "usage_limits_enabled": usage_limits_enabled(),
+            "unlimited_usage": unlimited,
             "date_key": self._date_key,
             "budget_zone": self.get_budget_zone().value,  # PRICING-006
             "capped_at": self._capped_at,  # PRICING-007

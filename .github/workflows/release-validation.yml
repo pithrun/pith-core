@@ -156,8 +156,8 @@ jobs:
               Path("scripts/install.ps1"),
           ]
           forbidden = [
-              "esteyangandrew/pith-core",
-              "_session_worktrees",
+              "esteyangandrew/" + "pith-core",
+              "_session" + "_worktrees",
               "/Volumes/Pith-Archive",
               "PITH_INSTALL_RC_TOKEN",
               "install-rc",

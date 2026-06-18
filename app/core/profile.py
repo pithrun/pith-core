@@ -6,8 +6,7 @@ Supports multiple isolated Pith instances on one machine.
 Resolution order:
   1. PITH_DATA_DIR env var (explicit override, highest priority)
   2. PITH_PROFILE env var → ~/pith-data/{profile}/
-  3. BRAIN_DATA_DIR env var (backward compat — DEPRECATED)
-  4. Default: ~/pith-data/default/
+  3. Default: ~/pith-data/default/
 """
 
 import logging
@@ -44,15 +43,7 @@ def resolve_data_dir(profile: str | None = None) -> Path:
         _ensure_dirs(data_dir)
         return data_dir
 
-    # Priority 3: Legacy BRAIN_DATA_DIR (backward compat — DEPRECATED)
-    legacy = os.environ.get("BRAIN_DATA_DIR")
-    if legacy:
-        data_dir = Path(legacy)
-        logger.warning("DEPRECATED: BRAIN_DATA_DIR env var. Rename to PITH_DATA_DIR in your config.")
-        _ensure_dirs(data_dir)
-        return data_dir
-
-    # Priority 4: Default profile
+    # Priority 3: Default profile
     data_dir = PITH_DATA_ROOT / "default"
     logger.debug("Data dir from default profile: %s", data_dir)
     _ensure_dirs(data_dir)
@@ -140,7 +131,7 @@ def list_profiles() -> list[str]:
 def get_active_profile() -> str:
     """Return the name of the currently active profile.
 
-    If using an explicit PITH_DATA_DIR or BRAIN_DATA_DIR that doesn't
+    If using an explicit PITH_DATA_DIR that doesn't
     live under ~/pith-data/, returns the path string instead.
     """
     explicit = os.environ.get("PITH_DATA_DIR")
@@ -154,13 +145,5 @@ def get_active_profile() -> str:
     profile_name = os.environ.get("PITH_PROFILE")
     if profile_name:
         return profile_name
-
-    legacy = os.environ.get("PITH_DATA_DIR")
-    if legacy:
-        p = Path(legacy)
-        try:
-            return p.relative_to(PITH_DATA_ROOT).parts[0]
-        except (ValueError, IndexError):
-            return str(p)
 
     return "default"

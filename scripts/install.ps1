@@ -408,7 +408,6 @@ $EnvFile = "$PithServerPath\.env"
 if (-not (Test-Path $EnvFile)) {
     @(
         "PITH_API_KEY=$ApiKey",
-        "# Legacy alias (still supported): BRAIN_API_KEY",
         "HOST=127.0.0.1",
         "PORT=8000"
     ) | Set-Content -Path $EnvFile

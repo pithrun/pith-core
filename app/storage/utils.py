@@ -87,6 +87,7 @@ CREATE TABLE IF NOT EXISTS concepts (
     staleness_consecutive_hits INTEGER DEFAULT 0,
     last_authority_recompute TEXT DEFAULT NULL,
     last_currency_recompute TEXT DEFAULT NULL,
+    last_decayed_at TEXT DEFAULT NULL,
     valid_from DATETIME DEFAULT NULL,
     valid_until DATETIME DEFAULT NULL,
     superseded_by TEXT DEFAULT NULL,
@@ -111,7 +112,8 @@ CREATE TABLE IF NOT EXISTS concepts (
     utility_updated TEXT DEFAULT NULL,
     last_synthesis_evaluated_at TEXT DEFAULT NULL,
     edit_provenance TEXT DEFAULT NULL,
-    subject_key TEXT DEFAULT NULL
+    subject_key TEXT DEFAULT NULL,
+    provenance TEXT NOT NULL DEFAULT 'human'
 );
 
 CREATE INDEX IF NOT EXISTS idx_concepts_session ON concepts(session_id);
@@ -178,6 +180,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     concepts_evolved INTEGER DEFAULT 0,
     model_id TEXT DEFAULT NULL,
     platform_hint TEXT NOT NULL DEFAULT 'unknown',
+    surface_id TEXT NOT NULL DEFAULT 'unknown',
     origin_id TEXT DEFAULT NULL,
     pressure_score REAL DEFAULT NULL,
     last_learning_at TEXT DEFAULT NULL,
@@ -565,6 +568,7 @@ CREATE TABLE IF NOT EXISTS raw_turn_payloads (
     assistant_response TEXT,
     message_len INTEGER NOT NULL DEFAULT 0,
     response_len INTEGER NOT NULL DEFAULT 0,
+    payload_completeness TEXT NOT NULL DEFAULT 'unknown',
     content_hash TEXT NOT NULL,
     captured_at TEXT NOT NULL,
     retention_days INTEGER NOT NULL DEFAULT 30,

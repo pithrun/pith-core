@@ -42,24 +42,60 @@ switch ($action) {
         & $MyInvocation.MyCommand.Path start
     }
     "status" {
-        if (Test-Path "$PithHome\pith.pid") {
-            $pidVal = Get-Content "$PithHome\pith.pid"
-            if (Get-Process -Id $pidVal -ErrorAction SilentlyContinue) {
-                Write-Host "Pith is running (PID: $pidVal)"
-            } else {
-                Write-Host "Pith is not running (stale PID file)"
-                Remove-Item "$PithHome\pith.pid" -ErrorAction SilentlyContinue
-            }
+        Push-Location $PithServerPath
+        if ($args.Count -gt 1) {
+            & $PythonExe -m app.ops.support_cli status @($args[1..($args.Count - 1)])
         } else {
-            Write-Host "Pith is not running"
+            & $PythonExe -m app.ops.support_cli status
         }
+        Pop-Location
+    }
+    "health" {
+        Push-Location $PithServerPath
+        if ($args.Count -gt 1) {
+            & $PythonExe -m app.ops.health_cli @($args[1..($args.Count - 1)])
+        } else {
+            & $PythonExe -m app.ops.health_cli
+        }
+        Pop-Location
     }
     "logs" {
-        if (Test-Path "$PithHome\logs\pith.log") {
+        if (($args.Count -gt 1) -and ($args[1] -eq "snapshot")) {
+            Push-Location $PithServerPath
+            & $PythonExe -m app.ops.read_cli logs @($args[1..($args.Count - 1)])
+            Pop-Location
+        } elseif (Test-Path "$PithHome\logs\pith.log") {
             Get-Content "$PithHome\logs\pith.log" -Tail 50 -Wait
         } else {
             Write-Host "No logs found"
         }
+    }
+    "import" {
+        Push-Location $PithServerPath
+        if ($args.Count -gt 1) {
+            & $PythonExe -m app.ops.import_cli @($args[1..($args.Count - 1)])
+        } else {
+            & $PythonExe -m app.ops.import_cli
+        }
+        Pop-Location
+    }
+    { $_ -in @("search", "concept", "orient", "sessions", "metrics") } {
+        Push-Location $PithServerPath
+        if ($args.Count -gt 1) {
+            & $PythonExe -m app.ops.read_cli $args[0] @($args[1..($args.Count - 1)])
+        } else {
+            & $PythonExe -m app.ops.read_cli $args[0]
+        }
+        Pop-Location
+    }
+    { $_ -in @("doctor", "clients", "support") } {
+        Push-Location $PithServerPath
+        if ($args.Count -gt 1) {
+            & $PythonExe -m app.ops.support_cli $args[0] @($args[1..($args.Count - 1)])
+        } else {
+            & $PythonExe -m app.ops.support_cli $args[0]
+        }
+        Pop-Location
     }
     "backup" {
         $SafeBackup = "$PithHome\pith-server\scripts\backup\safe_backup.ps1"
@@ -157,147 +193,13 @@ switch ($action) {
         }
     }
     "report" {
-        Write-Host "Pith Brain Diagnostics Report"
-        Write-Host "=============================="
-        Write-Host "Generated: $(Get-Date -Format 'yyyy-MM-ddTHH:mm:ssZ')"
-        Write-Host ""
-
-        # System
-        Write-Host "[System]"
-        Write-Host "  OS:           $([System.Environment]::OSVersion.VersionString)"
-        Write-Host "  PowerShell:   $($PSVersionTable.PSVersion)"
-        $pyVer = & python.exe --version 2>&1
-        Write-Host "  Python:       $pyVer ($PythonExe)"
-        $nodeVer = & node --version 2>$null
-        if ($nodeVer) { Write-Host "  Node:         $nodeVer" }
-        $drive = Get-PSDrive ($PithHome.Substring(0,1))
-        Write-Host "  Disk Free:    $([Math]::Round($drive.Free / 1GB, 1)) GB"
-        Write-Host ""
-
-        # Installation
-        Write-Host "[Installation]"
-        Write-Host "  Pith Home:    $PithHome"
-        Write-Host "  Version:      __PITH_VERSION__"
-        $pkgJson = "$PithServerPath\package.json"
-        if (Test-Path $pkgJson) {
-            $pkg = Get-Content $pkgJson -Raw | ConvertFrom-Json -ErrorAction SilentlyContinue
-            if ($pkg.version) { Write-Host "  Server Ver:   $($pkg.version)" }
-        }
-        $capFile = "$PithHome\.install_capabilities"
-        if (Test-Path $capFile) {
-            Get-Content $capFile | ForEach-Object { Write-Host "  $_" }
+        Push-Location $PithServerPath
+        if ($args.Count -gt 1) {
+            & $PythonExe -m app.ops.support_cli report @($args[1..($args.Count - 1)])
         } else {
-            Write-Host "  Embeddings:   unknown (no .install_capabilities)"
+            & $PythonExe -m app.ops.support_cli report
         }
-        Write-Host ""
-
-        # Server
-        Write-Host "[Server]"
-        if (Test-Path "$PithHome\pith.pid") {
-            $pidVal = Get-Content "$PithHome\pith.pid"
-            $proc = Get-Process -Id $pidVal -ErrorAction SilentlyContinue
-            if ($proc) {
-                Write-Host "  Status:       Running (PID $pidVal)"
-                $uptime = (Get-Date) - $proc.StartTime
-                Write-Host "  Uptime:       $([Math]::Floor($uptime.TotalHours))h $($uptime.Minutes)m"
-            } else {
-                Write-Host "  Status:       Not running (stale PID)"
-            }
-        } else {
-            Write-Host "  Status:       Not running"
-        }
-        Write-Host "  Port:         8000"
-        try {
-            $health = Invoke-WebRequest -Uri "http://127.0.0.1:8000/health" -TimeoutSec 3 -ErrorAction SilentlyContinue
-            Write-Host "  Health:       OK ($($health.StatusCode))"
-        } catch {
-            Write-Host "  Health:       Unreachable"
-        }
-        Write-Host ""
-
-        # Database
-        Write-Host "[Database]"
-        $dbPath = Resolve-DbPath
-        if (Test-Path $dbPath) {
-            $dbSize = [Math]::Round((Get-Item $dbPath).Length / 1MB, 2)
-            Write-Host "  Path:         $dbPath"
-            Write-Host "  Size:         $dbSize MB"
-            try {
-                $concepts = & $PythonExe -c "import sqlite3; c=sqlite3.connect(r'$dbPath'); print(c.execute('SELECT COUNT(*) FROM concepts').fetchone()[0]); c.close()" 2>$null
-                if ($concepts) { Write-Host "  Concepts:     $concepts" }
-                $wal = & $PythonExe -c "import sqlite3; c=sqlite3.connect(r'$dbPath'); print(c.execute('PRAGMA journal_mode').fetchone()[0]); c.close()" 2>$null
-                if ($wal) { Write-Host "  Journal:      $wal" }
-            } catch {}
-        } else {
-            Write-Host "  Path:         $dbPath (not created yet)"
-        }
-        Write-Host ""
-
-        # MCP Clients
-        Write-Host "[MCP Clients]"
-        $clients = @{
-            "Claude Desktop" = "$env:APPDATA\Claude\claude_desktop_config.json"
-            "Claude Code"    = "$env:APPDATA\Claude\claude_code_config.json"
-            "Cursor"         = "$env:APPDATA\Cursor\User\globalStorage\cursor.mcp\config.json"
-            "Windsurf"       = "$env:APPDATA\Windsurf\User\globalStorage\windsurf.mcp\config.json"
-            "Cline"          = "$env:APPDATA\Code\User\globalStorage\saoudrizwan.claude-dev\settings\cline_mcp_settings.json"
-            "Continue"       = "$env:USERPROFILE\.continue\config.json"
-            "Codex"          = "$env:USERPROFILE\.codex\config.toml"
-        }
-        foreach ($name in $clients.Keys) {
-            $path = $clients[$name]
-            $pattern = if ($name -eq "Codex") { '\[mcp_servers\.pith\]' } else { '"pith"' }
-            if (Test-Path $path) {
-                $content = Get-Content $path -Raw -ErrorAction SilentlyContinue
-                if ($content -match $pattern) {
-                    Write-Host "  ${name}:$((' ' * (16 - $name.Length)))configured"
-                } elseif ($content -match "brain-mcp") {
-                    Write-Host "  ${name}:$((' ' * (16 - $name.Length)))configured (legacy brain-mcp — run installer to update)"
-                } else {
-                    Write-Host "  ${name}:$((' ' * (16 - $name.Length)))present (pith not found)"
-                }
-            } else {
-                Write-Host "  ${name}:$((' ' * (16 - $name.Length)))not found"
-            }
-        }
-        Write-Host ""
-
-        # Scheduled Tasks
-        Write-Host "[Scheduled Tasks]"
-        foreach ($taskName in @("Pith-Brain-Server", "Pith-Backup-3h")) {
-            try {
-                $task = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop
-                Write-Host "  ${taskName}:$((' ' * (22 - $taskName.Length)))$($task.State)"
-            } catch {
-                Write-Host "  ${taskName}:$((' ' * (22 - $taskName.Length)))not registered"
-            }
-        }
-        Write-Host ""
-
-        # Backups
-        Write-Host "[Backups]"
-        $backupDir = "$PithHome\backups"
-        if (Test-Path $backupDir) {
-            $backups = Get-ChildItem "$backupDir\*.db" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending
-            Write-Host "  Count:        $($backups.Count)"
-            if ($backups.Count -gt 0) {
-                Write-Host "  Latest:       $($backups[0].LastWriteTime.ToString('yyyy-MM-ddTHH:mm:ss'))"
-                Write-Host "  Oldest:       $($backups[-1].LastWriteTime.ToString('yyyy-MM-ddTHH:mm:ss'))"
-            }
-        } else {
-            Write-Host "  No backup directory"
-        }
-        Write-Host ""
-
-        # API Key (redacted)
-        $keyFile = "$PithHome\config\api.key"
-        if (Test-Path $keyFile) {
-            $key = (Get-Content $keyFile -Raw -ErrorAction SilentlyContinue).Trim()
-            if ($key.Length -gt 8) {
-                Write-Host "[API Key]"
-                Write-Host "  Status:       Present ($($key.Substring(0,8))...)"
-            }
-        }
+        Pop-Location
     }
     default {
         Write-Host "Pith Brain - Personal Knowledge Server"
@@ -309,7 +211,17 @@ switch ($action) {
         Write-Host "  stop        Stop the Pith server"
         Write-Host "  restart     Restart the Pith server"
         Write-Host "  status      Check server status"
+        Write-Host "  health      Check operational health/readiness"
         Write-Host "  logs        Tail server logs"
+        Write-Host "  search      Search concepts"
+        Write-Host "  concept     Read concept details"
+        Write-Host "  orient      Show present-moment orientation"
+        Write-Host "  sessions    List cognitive sessions"
+        Write-Host "  metrics     Show metrics snapshots"
+        Write-Host "  doctor      Run read-only install diagnostics"
+        Write-Host "  clients     Show detected/configured client surfaces"
+        Write-Host "  support     Create redacted support bundles"
+        Write-Host "  import      Import conversation exports safely"
         Write-Host "  backup      Create a WAL-safe backup"
         Write-Host "  restore     Restore from a backup file"
         Write-Host "  update      Update dependencies + embeddings"

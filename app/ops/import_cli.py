@@ -1,13 +1,13 @@
 """CLI for Pith Import — import conversation history from ChatGPT, Claude, etc.
 
 Usage:
-  python -m app.import_cli run --source chatgpt --file ~/Downloads/chatgpt-export.zip
-  python -m app.import_cli run --source claude --file ~/Downloads/claude-export.zip
-  python -m app.import_cli run --resume
-  python -m app.import_cli cancel
-  python -m app.import_cli status
-  python -m app.import_cli report
-  python -m app.import_cli log
+  python -m app.ops.import_cli run --source chatgpt --file ~/Downloads/chatgpt-export.zip --confirm-llm-processing
+  python -m app.ops.import_cli run --source claude --file ~/Downloads/claude-export.zip --confirm-llm-processing
+  python -m app.ops.import_cli run --resume --confirm-llm-processing
+  python -m app.ops.import_cli cancel
+  python -m app.ops.import_cli status
+  python -m app.ops.import_cli report
+  python -m app.ops.import_cli log
 """
 
 from __future__ import annotations
@@ -46,14 +46,14 @@ EXPORT_GUIDE = textwrap.dedent("""\
         2. Click "Export Data" → Confirm
         3. Check your email for a download link (usually arrives in <5 min)
         4. Download and unzip → find conversations.json
-        5. Run: pith import --source chatgpt --file ~/Downloads/conversations.json
+        5. Run: pith import run --source chatgpt --file ~/Downloads/conversations.json --confirm-llm-processing
 
       Claude:
         1. Go to claude.ai → Settings → Privacy
         2. Click "Export Data" → Confirm
         3. Check your email for a download link
         4. Download the ZIP file
-        5. Run: pith import --source claude --file ~/Downloads/claude-export.zip
+        5. Run: pith import run --source claude --file ~/Downloads/claude-export.zip --confirm-llm-processing
 """)
 
 LLM_DISCLOSURE = (
@@ -72,8 +72,6 @@ def _resolve_data_dir() -> Path:
         return Path(d)
     if p := os.environ.get("PITH_PROFILE"):
         return Path.home() / "pith-data" / p
-    if d := os.environ.get("BRAIN_DATA_DIR"):
-        return Path(d)
     return Path.home() / "pith-data" / "default"
 
 
@@ -101,6 +99,14 @@ def _load_status() -> dict | None:
     if sf.exists():
         return json.loads(sf.read_text())
     return None
+
+
+def _json_requested(args) -> bool:
+    return getattr(args, "json", False) is True
+
+
+def _print_json(data: dict | list) -> None:
+    print(json.dumps(data, indent=2, sort_keys=True, default=str))
 
 
 def _auto_scan() -> list[Path]:
@@ -172,6 +178,26 @@ def _cli_progress_callback(progress) -> None:
 def cmd_run(args) -> int:
     """Run the import pipeline."""
     from app.ops.import_pipeline import run_import_pipeline
+
+    disclosure_shown = False
+
+    if args.local_only:
+        print("✗ Local-only extraction is not available yet.")
+        print("  Re-run without --local-only and with --confirm-llm-processing to use your configured LLM provider.")
+        return 2
+
+    if not args.confirm_llm_processing:
+        if not sys.stdin.isatty():
+            print("✗ Import run requires explicit LLM-processing consent.")
+            print("  Add --confirm-llm-processing to acknowledge provider-backed extraction.")
+            return 2
+        print(f"\n{LLM_DISCLOSURE}")
+        disclosure_shown = True
+        answer = input("Continue with provider-backed extraction? [y/N]: ").strip().lower()
+        if answer not in {"y", "yes"}:
+            print("Import cancelled.")
+            return 1
+        args.confirm_llm_processing = True
 
     file_path = args.file
     source = args.source
@@ -246,15 +272,8 @@ def cmd_run(args) -> int:
         print(f"✗ File not found: {path}")
         return 1
 
-    # ── LLM disclosure ──
-    if not args.local_only:
+    if not disclosure_shown:
         print(f"\n{LLM_DISCLOSURE}")
-
-    # ── local-only gate ──
-    if args.local_only:
-        print("⚠️  Local-only extraction coming soon.")
-        print("   Currently all concept extraction uses your configured LLM provider.")
-        print("   Proceeding with LLM-based extraction.\n")
 
     # ── Run pipeline ──
     size_mb = path.stat().st_size / (1024 * 1024)
@@ -369,9 +388,26 @@ def cmd_cancel(args) -> int:
     """Cancel an in-progress import."""
     from app.ops.import_pipeline import cancel_import
 
+    status = _load_status() or {}
+    state = str(status.get("state", "")).lower()
+    active_states = {"starting", "running", "cancel_requested"}
+    if state not in active_states:
+        message = "No active import to cancel."
+        if _json_requested(args):
+            _print_json({"ok": False, "state": state or None, "message": message})
+        else:
+            print(message)
+        return 1
+
     cancel_import()
-    print("✓ Cancel requested. The import will stop after the current conversation.")
-    _save_status({"state": "cancel_requested", "updated_at": datetime.now(UTC).isoformat()})
+    updated = dict(status)
+    updated["state"] = "cancel_requested"
+    updated["updated_at"] = datetime.now(UTC).isoformat()
+    _save_status(updated)
+    if _json_requested(args):
+        _print_json({"ok": True, "state": "cancel_requested", "message": "Cancel requested."})
+    else:
+        print("✓ Cancel requested. The import will stop after the current conversation.")
     return 0
 
 
@@ -379,7 +415,14 @@ def cmd_status(args) -> int:
     """Show current/last import status."""
     status = _load_status()
     if not status:
+        if _json_requested(args):
+            _print_json({"history_found": False, "status": None})
+            return 0
         print("No import history found.")
+        return 0
+
+    if _json_requested(args):
+        _print_json({"history_found": True, "status": status})
         return 0
 
     state = status.get("state", "unknown")
@@ -421,17 +464,26 @@ def cmd_report(args) -> int:
     """Show the last import report."""
     status = _load_status()
     if not status:
+        if _json_requested(args):
+            _print_json({"report_found": False, "reason": "no_import_history"})
+            return 1
         print("No import history found. Run 'pith import' first.")
         return 1
 
     # The full result with report is saved separately
     report_file = _resolve_data_dir() / "import_last_report.json"
     if not report_file.exists():
+        if _json_requested(args):
+            _print_json({"report_found": False, "reason": "no_report_file"})
+            return 1
         print("No report available from last import.")
         print("  Tip: Reports are generated when the import completes without --no-scan.")
         return 1
 
     report = json.loads(report_file.read_text())
+    if _json_requested(args):
+        _print_json({"report_found": True, "report": report})
+        return 0
     _print_report(report)
     return 0
 
@@ -440,13 +492,20 @@ def cmd_log(args) -> int:
     """Show import error log."""
     log = _log_file()
     if not log.exists():
+        if _json_requested(args):
+            _print_json({"log_found": False, "lines": []})
+            return 0
         print("No import log found.")
         return 0
 
     lines = log.read_text().splitlines()
     # Show last N lines
     n = args.lines if hasattr(args, "lines") else 50
-    for line in lines[-n:]:
+    selected = lines[-n:]
+    if _json_requested(args):
+        _print_json({"log_found": True, "lines": selected})
+        return 0
+    for line in selected:
         print(line)
     return 0
 
@@ -463,9 +522,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub = parser.add_subparsers(dest="command")
 
-    # ── run (default) ──
+    # ── run ──
     run_parser = sub.add_parser(
-        "run", help="Run an import (default if no subcommand given)",
+        "run", help="Run an import",
         epilog=EXPORT_GUIDE,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -491,24 +550,36 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument(
         "--local-only",
         action="store_true",
-        help="Use local-only extraction (coming soon — currently uses LLM)",
+        help="Use local-only extraction (not yet available)",
+    )
+    run_parser.add_argument(
+        "--confirm-llm-processing",
+        action="store_true",
+        help="Acknowledge that extraction sends excerpts to your configured LLM provider",
     )
 
     # ── cancel ──
-    sub.add_parser("cancel", help="Cancel an in-progress import")
+    cancel_parser = sub.add_parser("cancel", help="Cancel an in-progress import")
+    cancel_parser.add_argument("--json", action="store_true")
 
     # ── status ──
-    sub.add_parser("status", help="Show current/last import status")
+    status_parser = sub.add_parser("status", help="Show current/last import status")
+    status_parser.add_argument("--json", action="store_true")
 
     # ── report ──
-    sub.add_parser("report", help="View the last import report")
+    report_parser = sub.add_parser("report", help="View the last import report")
+    report_parser.add_argument("--json", action="store_true")
 
     # ── log ──
     log_parser = sub.add_parser("log", help="Show import error log")
+    log_parser.add_argument("--json", action="store_true")
     log_parser.add_argument(
         "--lines", "-n", type=int, default=50,
         help="Number of log lines to show (default: 50)",
     )
+
+    # ── help ──
+    sub.add_parser("help", help="Show import help")
 
     return parser
 
@@ -519,12 +590,12 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    # Default to 'run' if no subcommand given but flags are present
     if args.command is None:
-        # Check if any run-specific flags were passed at top level
-        # If bare 'pith import' with no args, treat as run (triggers auto-scan)
-        args.command = "run"
-        args = parser.parse_args(["run"] + (argv or sys.argv[1:]))
+        parser.print_help()
+        return 0
+    if args.command == "help":
+        parser.print_help()
+        return 0
 
     dispatch = {
         "run": cmd_run,

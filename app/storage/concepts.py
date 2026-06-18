@@ -21,6 +21,7 @@ from typing import Optional
 import app.storage.connection as _conn
 from app.core.config import BENCHMARK_READONLY
 from app.core.datetime_utils import _utc_now, _utc_now_iso
+from app.core.ka_admission import storage_guard_unreviewed_general
 from app.core.models import Concept
 from app.storage.connection import access_tracker, read_snapshot_db
 from app.storage.utils import DB_PATH, _clamp_score, _safe_json_loads, validate_agent_id
@@ -370,6 +371,21 @@ def _resolve_knowledge_area(concept, meta: dict) -> str:
         return resolved
 
 
+def _apply_ka_admission_storage_guard(data: dict, resolved_ka: str, *, is_new: bool, now: str) -> str:
+    if not is_new:
+        if resolved_ka == "general":
+            meta = data.get("metadata", {}) if isinstance(data.get("metadata"), dict) else {}
+            if not meta.get("ka_admission_state") and meta.get("knowledge_area_review") != "deterministic_ambiguous":
+                logger.warning("KA admission invariant violation on existing concept update")
+        return resolved_ka
+    guarded_ka, guarded_data = storage_guard_unreviewed_general(data, now=now)
+    if guarded_ka:
+        data.update(guarded_data)
+        logger.warning("KA admission storage guard forced new unreviewed general concept to unclassified")
+        return guarded_ka
+    return resolved_ka
+
+
 def update_concept_data(
     conn, concept_id: str, data: dict, *, extra_sets: str = "", extra_params: tuple = (), require_current: bool = True
 ) -> int:
@@ -577,6 +593,8 @@ def save_concept(concept: Concept) -> bool | None:
         # Check if concept already exists
         exists = conn.execute("SELECT 1 FROM concepts WHERE id = ?", (concept.id,)).fetchone()
 
+        resolved_ka = _apply_ka_admission_storage_guard(data, resolved_ka, is_new=not bool(exists), now=now)
+
         if exists:
             # UPDATE existing — preserves always_activate and other flag columns
             summary_changed, _ = _apply_summary_change_reset(conn, concept.id, data, concept.summary)
@@ -719,8 +737,8 @@ def save_concept(concept: Concept) -> bool | None:
                  staleness_reason, staleness_evaluated_at, staleness_detector_version,
                  staleness_consecutive_hits, superseded_by,
                  epistemic_network, reinforcement_count, content_updated_at,
-                 valid_from, original_date, edit_provenance, subject_key, data)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 valid_from, original_date, edit_provenance, subject_key, provenance, data)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
                 (
                     concept.id,
@@ -753,7 +771,8 @@ def save_concept(concept: Concept) -> bool | None:
                     getattr(concept, "original_date", None),  # 33: TEMPORAL-002
                     getattr(concept, "edit_provenance", None),  # 34: RETRIEVAL-104
                     getattr(concept, "subject_key", None),  # 35: EUNOMIA-040 Fix 3
-                    json.dumps(data),  # 36: data (always last)
+                    getattr(concept, "provenance", "human"),  # 36: A8 provenance (append-before-data)
+                    json.dumps(data),  # 37: data (always last)
                 ),
             )
 
@@ -1184,7 +1203,7 @@ def list_concepts_full(conn: sqlite3.Connection | None = None) -> list[Concept]:
     with context as conn:
         rows = conn.execute(
             """SELECT data, authority_score, currency_score, currency_status,
-                      utility_score, utility_samples, utility_updated
+                      utility_score, utility_samples, utility_updated, last_decayed_at
                FROM concepts WHERE status = 'active' AND is_current = 1 ORDER BY id"""
         ).fetchall()
     concepts = []
@@ -1210,6 +1229,16 @@ def list_concepts_full(conn: sqlite3.Connection | None = None) -> list[Concept]:
                     data["utility_updated"] = r["utility_updated"]
             except (IndexError, KeyError):
                 pass  # Utility columns not yet migrated
+            # REFLECT-024: Make the SQL column authoritative for the decay watermark.
+            # This is the read path _apply_decay uses (callers reflection.py). The stamp
+            # writer writes the SQL column; the REFLECT-022 fallback persists via the JSON
+            # blob. SQL column is monotonic NULL->value, so when set it wins; otherwise the
+            # JSON-blob value (already in `data`) is kept.
+            try:
+                if r["last_decayed_at"] is not None:
+                    data["last_decayed_at"] = r["last_decayed_at"]
+            except (IndexError, KeyError):
+                pass  # Column not yet migrated (forward-safe: model defaults to None)
             concepts.append(Concept(**data))
         except Exception as e:
             logger.warning(f"list_concepts_full: failed to parse concept: {e}")
@@ -1972,6 +2001,7 @@ def save_concept_conn(conn, concept: "Concept") -> None:
     data["knowledge_area"] = resolved_ka
 
     exists = conn.execute("SELECT 1 FROM concepts WHERE id = ?", (concept.id,)).fetchone()
+    resolved_ka = _apply_ka_admission_storage_guard(data, resolved_ka, is_new=not bool(exists), now=now)
 
     if exists:
         summary_changed, _ = _apply_summary_change_reset(conn, concept.id, data, concept.summary)
@@ -2096,8 +2126,8 @@ def save_concept_conn(conn, concept: "Concept") -> None:
              currency_score, currency_status, staleness_state, staleness_score,
              staleness_reason, staleness_evaluated_at, staleness_detector_version,
              staleness_consecutive_hits, superseded_by, epistemic_network,
-             reinforcement_count, original_date, edit_provenance, subject_key, data)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             reinforcement_count, original_date, edit_provenance, subject_key, provenance, data)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
             (
                 concept.id,
@@ -2128,7 +2158,8 @@ def save_concept_conn(conn, concept: "Concept") -> None:
                 getattr(concept, "original_date", None),  # 31: TEMPORAL-002
                 getattr(concept, "edit_provenance", None),  # 32: RETRIEVAL-104
                 getattr(concept, "subject_key", None),  # 33: EUNOMIA-040 Fix 3
-                json.dumps(data),  # 34: data (always last)
+                getattr(concept, "provenance", "human"),  # 34: A8 provenance (append-before-data)
+                json.dumps(data),  # 35: data (always last)
             ),
         )
     if not exists:

@@ -8,8 +8,8 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-VALID_SOURCES = {"conversation_turn", "session_learn", "session_end", "maintenance"}
-VALID_STAGES = {"learn"}
+VALID_SOURCES = {"conversation_turn", "session_learn", "session_end", "maintenance", "reflection_full"}
+VALID_STAGES = {"learn", "reflect"}
 VALID_STATUSES = {"queued", "running", "committed", "retry", "failed", "skipped"}
 
 
@@ -64,6 +64,41 @@ def load_lifecycle_job_by_identity(
         job = _load_job_by_identity(conn, profile, source, idempotency_key)
     if not job:
         return None
+    try:
+        job["payload"] = json.loads(job.get("payload_json") or "{}")
+    except Exception:
+        job["payload"] = {}
+    try:
+        job["result"] = json.loads(job.get("result_json") or "{}")
+    except Exception:
+        job["result"] = {}
+    return job
+
+
+def load_open_lifecycle_job(
+    *,
+    profile: str,
+    source: str,
+    stage: str,
+) -> dict[str, Any] | None:
+    """Load the oldest queued/retry/running job for a source/stage pair."""
+    if source not in VALID_SOURCES:
+        raise ValueError(f"invalid lifecycle job source: {source}")
+    if stage not in VALID_STAGES:
+        raise ValueError(f"invalid lifecycle job stage: {stage}")
+    with _read_db(operation="lifecycle_load_open") as conn:
+        row = conn.execute(
+            """SELECT *
+               FROM lifecycle_jobs
+               WHERE profile=? AND source=? AND stage=?
+                 AND status IN ('queued', 'retry', 'running')
+               ORDER BY updated_at ASC
+               LIMIT 1""",
+            (profile, source, stage),
+        ).fetchone()
+    if not row:
+        return None
+    job = _row_to_dict(row)
     try:
         job["payload"] = json.loads(job.get("payload_json") or "{}")
     except Exception:
@@ -252,6 +287,31 @@ def retry_lifecycle_job(
         )
 
 
+def defer_lifecycle_job(
+    *,
+    profile: str,
+    job_id: str,
+    error: str,
+    next_retry_at: str,
+    now: str | None = None,
+) -> None:
+    """Return a claimed job to retry without spending the claim attempt."""
+    ts = now or _utc_now_iso()
+    with _db(operation="lifecycle_defer") as conn:
+        conn.execute(
+            """UPDATE lifecycle_jobs
+               SET status='retry',
+                   attempts=CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END,
+                   last_error=?,
+                   lease_owner=NULL,
+                   lease_expires_at=NULL,
+                   next_retry_at=?,
+                   updated_at=?
+               WHERE profile=? AND job_id=?""",
+            (error[:1000], next_retry_at, ts, profile, job_id),
+        )
+
+
 def fail_lifecycle_job(
     *,
     profile: str,
@@ -273,45 +333,112 @@ def fail_lifecycle_job(
         )
 
 
+def count_failed_lifecycle_jobs_by_error(
+    *,
+    profile: str,
+    source: str,
+    stage: str,
+    error: str,
+) -> int:
+    """Count failed lifecycle jobs matching an exact error."""
+    if source not in VALID_SOURCES:
+        raise ValueError(f"invalid lifecycle job source: {source}")
+    if stage not in VALID_STAGES:
+        raise ValueError(f"invalid lifecycle job stage: {stage}")
+    with _read_db(operation="lifecycle_count_failed_by_error") as conn:
+        row = conn.execute(
+            """SELECT COUNT(*) AS count
+               FROM lifecycle_jobs
+               WHERE profile=?
+                 AND source=?
+                 AND stage=?
+                 AND status='failed'
+                 AND last_error=?""",
+            (profile, source, stage, error[:1000]),
+        ).fetchone()
+    return int(row["count"] if hasattr(row, "keys") else row[0])
+
+
+def requeue_failed_lifecycle_jobs_by_error(
+    *,
+    profile: str,
+    source: str,
+    stage: str,
+    error: str,
+    next_retry_at: str,
+    now: str | None = None,
+) -> int:
+    """Requeue failed lifecycle jobs matching an exact transient error."""
+    if source not in VALID_SOURCES:
+        raise ValueError(f"invalid lifecycle job source: {source}")
+    if stage not in VALID_STAGES:
+        raise ValueError(f"invalid lifecycle job stage: {stage}")
+    ts = now or _utc_now_iso()
+    with _db(operation="lifecycle_requeue_failed_by_error") as conn:
+        cur = conn.execute(
+            """UPDATE lifecycle_jobs
+               SET status='retry',
+                   attempts=0,
+                   lease_owner=NULL,
+                   lease_expires_at=NULL,
+                   next_retry_at=?,
+                   updated_at=?
+               WHERE profile=?
+                 AND source=?
+                 AND stage=?
+                 AND status='failed'
+                 AND last_error=?""",
+            (next_retry_at, ts, profile, source, stage, error[:1000]),
+        )
+        return int(cur.rowcount or 0)
+
+
+def _lifecycle_summary_row_to_dict(row: Any) -> dict[str, Any]:
+    data = _row_to_dict(row)
+    return {
+        "queued_count": int(data.get("queued_count") or 0),
+        "running_count": int(data.get("running_count") or 0),
+        "retry_count": int(data.get("retry_count") or 0),
+        "failed_count": int(data.get("failed_count") or 0),
+        "committed_count": int(data.get("committed_count") or 0),
+        "skipped_count": int(data.get("skipped_count") or 0),
+        "stale_running_count": int(data.get("stale_running_count") or 0),
+        "oldest_queued_updated_at": data.get("oldest_queued_updated_at"),
+        "oldest_running_updated_at": data.get("oldest_running_updated_at"),
+        "last_committed_updated_at": data.get("last_committed_updated_at"),
+    }
+
+
 def summarize_lifecycle_jobs(*, profile: str, stale_before_iso: str) -> dict[str, Any]:
+    now_iso = _utc_now_iso()
     with _read_db(operation="lifecycle_summary") as conn:
-        rows = conn.execute(
-            """SELECT status, updated_at, lease_expires_at
+        row = conn.execute(
+            """SELECT
+                   SUM(CASE WHEN status='queued' THEN 1 ELSE 0 END) AS queued_count,
+                   SUM(CASE WHEN status='running' THEN 1 ELSE 0 END) AS running_count,
+                   SUM(CASE WHEN status='retry' THEN 1 ELSE 0 END) AS retry_count,
+                   SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed_count,
+                   SUM(CASE WHEN status='committed' THEN 1 ELSE 0 END) AS committed_count,
+                   SUM(CASE WHEN status='skipped' THEN 1 ELSE 0 END) AS skipped_count,
+                   SUM(
+                       CASE
+                           WHEN status='running'
+                            AND (
+                                (lease_expires_at IS NOT NULL AND lease_expires_at < ?)
+                                OR (updated_at IS NOT NULL AND updated_at < ?)
+                            )
+                           THEN 1
+                           ELSE 0
+                       END
+                   ) AS stale_running_count,
+                   MIN(CASE WHEN status IN ('queued', 'retry') THEN updated_at END) AS oldest_queued_updated_at,
+                   MIN(CASE WHEN status='running' THEN updated_at END) AS oldest_running_updated_at,
+                   MAX(CASE WHEN status='committed' THEN updated_at END) AS last_committed_updated_at
                FROM lifecycle_jobs
                WHERE profile=?""",
-            (profile,),
-        ).fetchall()
-    counts = {status: 0 for status in VALID_STATUSES}
-    oldest_queued: str | None = None
-    oldest_running: str | None = None
-    stale_running = 0
-    for row in rows:
-        data = _row_to_dict(row)
-        status = data.get("status")
-        if status in counts:
-            counts[status] += 1
-        updated_at = data.get("updated_at")
-        if status in {"queued", "retry"} and updated_at and (oldest_queued is None or updated_at < oldest_queued):
-            oldest_queued = updated_at
-        if status == "running":
-            if updated_at and (oldest_running is None or updated_at < oldest_running):
-                oldest_running = updated_at
-            lease_expires_at = data.get("lease_expires_at")
-            if (lease_expires_at and lease_expires_at < _utc_now_iso()) or (
-                updated_at and updated_at < stale_before_iso
-            ):
-                stale_running += 1
-    return {
-        "queued_count": counts["queued"],
-        "running_count": counts["running"],
-        "retry_count": counts["retry"],
-        "failed_count": counts["failed"],
-        "committed_count": counts["committed"],
-        "skipped_count": counts["skipped"],
-        "stale_running_count": stale_running,
-        "oldest_queued_updated_at": oldest_queued,
-        "oldest_running_updated_at": oldest_running,
-    }
+            (now_iso, stale_before_iso, profile),
+        ).fetchone()
+    return _lifecycle_summary_row_to_dict(row)
 
 
 def summarize_lifecycle_jobs_by_source(
@@ -322,44 +449,35 @@ def summarize_lifecycle_jobs_by_source(
 ) -> dict[str, Any]:
     if source not in VALID_SOURCES:
         raise ValueError(f"invalid lifecycle job source: {source}")
+    now_iso = _utc_now_iso()
     with _read_db(operation="lifecycle_summary_source") as conn:
-        rows = conn.execute(
-            """SELECT status, updated_at, lease_expires_at
+        row = conn.execute(
+            """SELECT
+                   SUM(CASE WHEN status='queued' THEN 1 ELSE 0 END) AS queued_count,
+                   SUM(CASE WHEN status='running' THEN 1 ELSE 0 END) AS running_count,
+                   SUM(CASE WHEN status='retry' THEN 1 ELSE 0 END) AS retry_count,
+                   SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed_count,
+                   SUM(CASE WHEN status='committed' THEN 1 ELSE 0 END) AS committed_count,
+                   SUM(CASE WHEN status='skipped' THEN 1 ELSE 0 END) AS skipped_count,
+                   SUM(
+                       CASE
+                           WHEN status='running'
+                            AND (
+                                (lease_expires_at IS NOT NULL AND lease_expires_at < ?)
+                                OR (updated_at IS NOT NULL AND updated_at < ?)
+                            )
+                           THEN 1
+                           ELSE 0
+                       END
+                   ) AS stale_running_count,
+                   MIN(CASE WHEN status IN ('queued', 'retry') THEN updated_at END) AS oldest_queued_updated_at,
+                   MIN(CASE WHEN status='running' THEN updated_at END) AS oldest_running_updated_at,
+                   MAX(CASE WHEN status='committed' THEN updated_at END) AS last_committed_updated_at
                FROM lifecycle_jobs
                WHERE profile=? AND source=?""",
-            (profile, source),
-        ).fetchall()
-    counts = {status: 0 for status in VALID_STATUSES}
-    oldest_queued: str | None = None
-    oldest_running: str | None = None
-    stale_running = 0
-    for row in rows:
-        data = _row_to_dict(row)
-        status = data.get("status")
-        if status in counts:
-            counts[status] += 1
-        updated_at = data.get("updated_at")
-        if status in {"queued", "retry"} and updated_at and (oldest_queued is None or updated_at < oldest_queued):
-            oldest_queued = updated_at
-        if status == "running":
-            if updated_at and (oldest_running is None or updated_at < oldest_running):
-                oldest_running = updated_at
-            lease_expires_at = data.get("lease_expires_at")
-            if (lease_expires_at and lease_expires_at < _utc_now_iso()) or (
-                updated_at and updated_at < stale_before_iso
-            ):
-                stale_running += 1
-    return {
-        "queued_count": counts["queued"],
-        "running_count": counts["running"],
-        "retry_count": counts["retry"],
-        "failed_count": counts["failed"],
-        "committed_count": counts["committed"],
-        "skipped_count": counts["skipped"],
-        "stale_running_count": stale_running,
-        "oldest_queued_updated_at": oldest_queued,
-        "oldest_running_updated_at": oldest_running,
-    }
+            (now_iso, stale_before_iso, profile, source),
+        ).fetchone()
+    return _lifecycle_summary_row_to_dict(row)
 
 
 def cleanup_committed_lifecycle_jobs(*, profile: str, retention_days: int, now: str | None = None) -> int:

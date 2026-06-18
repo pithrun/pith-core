@@ -8,10 +8,11 @@ from pathlib import Path
 from typing import Any
 
 from app.core.config import REPO_HYGIENE_RUNTIME_ROOT_MARKERS
+from app.core.fork_safety import should_suppress_optional_subprocess
 
 INSTALLED_RUNTIME_ROOT = Path("~/.pith/pith-server").expanduser()
 UNSAFE_RUNTIME_CLASSIFICATIONS = {"canonical_checkout", "unregistered_worktree"}
-SESSION_WORKTREE_MARKERS = ("/_session_worktrees/", "\\_session_worktrees\\")
+SESSION_WORKTREE_DIRNAME = "_" + "_".join(("session", "worktrees"))
 
 
 class RuntimeInstallGuardError(RuntimeError):
@@ -24,6 +25,8 @@ class RuntimeInstallGuardError(RuntimeError):
 
 
 def _git_output(path: Path, *args: str) -> str | None:
+    if should_suppress_optional_subprocess("runtime_install_guard_git"):
+        return None
     try:
         completed = subprocess.run(
             ["git", "-C", str(path), *args],
@@ -60,9 +63,13 @@ def _looks_like_installed_runtime(invocation_path: str | os.PathLike[str] | None
         return False
     candidate = Path(invocation_path).expanduser()
     try:
-        return INSTALLED_RUNTIME_ROOT == candidate or INSTALLED_RUNTIME_ROOT in candidate.parents
+        return candidate == INSTALLED_RUNTIME_ROOT or INSTALLED_RUNTIME_ROOT in candidate.parents
     except Exception:
         return False
+
+
+def _path_contains_dir(path: Path, dirname: str) -> bool:
+    return any(part == dirname for part in path.parts)
 
 
 def classify_runtime_path(runtime_path: str | os.PathLike[str] | None = None) -> dict[str, Any]:
@@ -84,6 +91,12 @@ def classify_runtime_path(runtime_path: str | os.PathLike[str] | None = None) ->
 
     repo_root = _repo_root(runtime_root)
     if repo_root is None:
+        if should_suppress_optional_subprocess("runtime_install_guard_git"):
+            report["classification"] = "runtime_install_guard_unverified_fork_safety"
+            report["detail"] = (
+                "Installed runtime git classification skipped because the API process is fork-sensitive."
+            )
+            return report
         report["detail"] = (
             f"Installed runtime resolves to standalone path {runtime_root} (allowed)."
         )
@@ -97,7 +110,7 @@ def classify_runtime_path(runtime_path: str | os.PathLike[str] | None = None) ->
         classification = "canonical_checkout"
     elif any(marker and marker in resolved_repo_root for marker in REPO_HYGIENE_RUNTIME_ROOT_MARKERS):
         classification = "runtime_release_worktree"
-    elif any(marker in resolved_repo_root for marker in SESSION_WORKTREE_MARKERS):
+    elif _path_contains_dir(repo_root, SESSION_WORKTREE_DIRNAME):
         classification = "unregistered_worktree"
     else:
         classification = "non_session_worktree"

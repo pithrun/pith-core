@@ -22,6 +22,8 @@ from dataclasses import dataclass
 #   4. If alerts fire: revert flag, investigate, adjust thresholds
 
 FEATURE_FLAGS = {
+    # REFLECT-024 — Idempotent (delta-based) confidence decay (default OFF; enable after verify)
+    "REFLECT_DELTA_DECAY": True,  # REFLECT-024: delta-based decay enabled (validated live A/B; migration GOV-026 applied)
     # Phase 0a — Config Hardening
     "HARDENED_CONSTRAINTS_ENABLED": True,  # Config hardening (§5.6.1)
     # Phase 1 — Write-Path Defense (ENABLED — Phase 1 implementation complete)
@@ -84,6 +86,9 @@ FEATURE_FLAGS = {
     "DYNAMIC_KA_ENABLED": True,         # Gates provisional KA creation in normalize_knowledge_area
     "KA_AUTO_BOOST_ENABLED": False,     # Gates auto-inference KA boost in search_lightweight + _apply_ka_boost
     "KA_CROSS_SESSION_SUPPLEMENT": True, # RETRIEVAL-032: KA-scoped supplement for cross-session coverage
+    "QUERY_INTENT_EXPANSION_ENABLED": True,  # Retrieval-only alias/query expansion
+    "QUERY_INTENT_RESCUE_ENABLED": True,  # Sparse-result re-query with expanded variants
+    "QUERY_INTENT_TRACE_ENABLED": True,  # Trace matched aliases/variants in retrieval diagnostics
     # COVERAGE-001: 4-signal LLM coverage validator
     "COVERAGE_LLM_ENABLED": False,  # Phase 3 rollout — enable after monitoring
     # PRODUCT-002: Episodic fact granularity guard
@@ -121,6 +126,7 @@ FEATURE_FLAGS = {
     "WORKSTREAMS_READ_ENABLED": True,  # Workstreams Phase 0/1: explicit read-only classifier/context actions
     "WORKSTREAMS_WRITE_ENABLED": False,  # Workstreams Phase 2: broad explicit curation/binding writes, disabled by default
     "WORKSTREAMS_ACTIVATION_WRITE_ENABLED": False,  # Activation-only bind/create/skip writes through ensure_workstream_activation
+    "WORKSTREAMS_LIFECYCLE_WRITE_ENABLED": False,  # Production lifecycle verbs: start/adopt/progress/complete/reopen/archive
     "WORKSTREAMS_TURN_CONTEXT_ENABLED": False,  # Workstreams Phase 3: explicit active Workstream injection into conversation_turn
     "WORKSTREAMS_ACTIVATION_HINT_ENABLED": False,  # Workstreams API parity: compact read-only activation state hint
     "WORKSTREAMS_NON_EXACT_RECOMMENDATIONS_ENABLED": False,  # Default-safe: lexical candidates are advisory, not bind authority
@@ -351,6 +357,60 @@ def get_autolearn_maintenance_running_stale_seconds() -> int:
         default=600,
         low=30,
         high=86400,
+    )
+
+
+def get_autolearn_catchup_enabled() -> bool:
+    """Enable starvation-aware autolearn maintenance catch-up under pressure."""
+    return os.environ.get("PITH_AUTOLEARN_CATCHUP_ENABLED", "true").lower() in ("true", "1", "yes")
+
+
+def get_autolearn_maintenance_pressure_starvation_seconds() -> int:
+    """Oldest queued age after which autolearn may drain one row under pressure."""
+    return _env_int_clamped(
+        "PITH_AUTOLEARN_MAINTENANCE_PRESSURE_STARVATION_SECONDS",
+        default=600,
+        low=0,
+        high=86400,
+    )
+
+
+def get_autolearn_maintenance_supervisor_enabled() -> bool:
+    """Enable product-owned autonomous autolearn maintenance catch-up."""
+    return os.environ.get("PITH_AUTOLEARN_MAINTENANCE_SUPERVISOR_ENABLED", "true").lower() in (
+        "true",
+        "1",
+        "yes",
+    )
+
+
+def get_autolearn_maintenance_supervisor_interval_seconds() -> int:
+    """Cadence for the autonomous autolearn maintenance supervisor."""
+    return _env_int_clamped(
+        "PITH_AUTOLEARN_MAINTENANCE_SUPERVISOR_INTERVAL_SECONDS",
+        default=30,
+        low=1,
+        high=3600,
+    )
+
+
+def get_autolearn_maintenance_supervisor_batch_size() -> int:
+    """Row budget per autonomous autolearn maintenance supervisor pass."""
+    return _env_int_clamped(
+        "PITH_AUTOLEARN_MAINTENANCE_SUPERVISOR_BATCH_SIZE",
+        default=25,
+        low=1,
+        high=500,
+    )
+
+
+def get_autolearn_maintenance_supervisor_max_wall_seconds() -> int:
+    """Wall-clock budget per autonomous autolearn maintenance supervisor pass."""
+    return _env_int_clamped(
+        "PITH_AUTOLEARN_MAINTENANCE_SUPERVISOR_MAX_WALL_SECONDS",
+        default=10,
+        low=1,
+        high=600,
     )
 
 
@@ -943,6 +1003,7 @@ BENCHMARK_DISABLE_EVOLVE = os.environ.get("PITH_DISABLE_EVOLVE", "false").lower(
 AUTOLEARN_BUDGET_MS = int(os.environ.get("PITH_AUTOLEARN_BUDGET_MS", str(BENCHMARK.autolearn_budget_ms)))  # ARCH-D03/D06/PERF-036: Base time budget.
 AUTOLEARN_PER_INSIGHT_BUDGET_MS = int(os.environ.get("PITH_AUTOLEARN_PER_INSIGHT_MS", "2000"))
 AUTOLEARN_MAX_BUDGET_MS = int(os.environ.get("PITH_AUTOLEARN_MAX_BUDGET_MS", "15000"))
+AUTOLEARN_WALL_BUDGET_MS = int(os.environ.get("PITH_AUTOLEARN_WALL_BUDGET_MS", str(AUTOLEARN_MAX_BUDGET_MS)))
 SESSION_LEARN_SYNC_WAIT_SECONDS = float(os.environ.get("PITH_SESSION_LEARN_SYNC_WAIT_SECONDS", "8.0"))
 SESSION_LEARN_PROCESSING_RETRY_AFTER_SECONDS = float(
     os.environ.get("PITH_SESSION_LEARN_PROCESSING_RETRY_AFTER_SECONDS", "2.0")
@@ -970,6 +1031,16 @@ KA_PROMOTION_INTERVAL_MINUTES = int(os.environ.get("PITH_KA_PROMOTION_INTERVAL_M
 # Budget taken from similarity (was 0.56). Set to 0.0 to disable.
 RETRIEVAL_WEIGHT_RECENCY = float(os.environ.get("PITH_RETRIEVAL_WEIGHT_RECENCY", "0.10"))
 RETRIEVAL_RECENCY_HALF_LIFE_DAYS = float(os.environ.get("PITH_RETRIEVAL_RECENCY_HALF_LIFE_DAYS", "30"))
+AUTHORITY_ARTIFACT_BOOST_ENABLED = os.environ.get(
+    "PITH_AUTHORITY_ARTIFACT_BOOST_ENABLED", "true"
+).lower() in ("true", "1", "yes")
+AUTHORITY_ARTIFACT_BOOST_WEIGHT = float(os.environ.get(
+    "PITH_AUTHORITY_ARTIFACT_BOOST_WEIGHT", "0.18"
+))
+assert 0.0 <= AUTHORITY_ARTIFACT_BOOST_WEIGHT <= 0.3, (
+    "AUTHORITY_ARTIFACT_BOOST_WEIGHT must be [0.0, 0.3], "
+    f"got {AUTHORITY_ARTIFACT_BOOST_WEIGHT}"
+)
 
 RETRIEVAL_WEIGHT_SIMILARITY = max(0.0, (
     0.56 - RETRIEVAL_WEIGHT_RECENCY  # RETRIEVAL-100: Auto-adjusts when recency weight changes
@@ -1407,6 +1478,23 @@ LIFECYCLE_JOB_LEASE_SECONDS = int(os.environ.get("PITH_LIFECYCLE_JOB_LEASE_SECON
 LIFECYCLE_DRAIN_STUCK_SECONDS = int(
     os.environ.get("PITH_LIFECYCLE_DRAIN_STUCK_SECONDS", str(LIFECYCLE_JOB_LEASE_SECONDS))
 )
+LIFECYCLE_DRAIN_WALL_BUDGET_SECONDS = float(os.environ.get("PITH_LIFECYCLE_DRAIN_WALL_BUDGET_SECONDS", "30"))
 LIFECYCLE_JOB_MAX_ATTEMPTS = int(os.environ.get("PITH_LIFECYCLE_JOB_MAX_ATTEMPTS", "3"))
 LIFECYCLE_JOB_RETRY_SECONDS = int(os.environ.get("PITH_LIFECYCLE_JOB_RETRY_SECONDS", "60"))
 LIFECYCLE_JOB_CLEANUP_DAYS = int(os.environ.get("PITH_LIFECYCLE_JOB_CLEANUP_DAYS", "7"))
+LIFECYCLE_SUPERVISOR_ENABLED = os.environ.get(
+    "PITH_LIFECYCLE_SUPERVISOR_ENABLED",
+    str(LIFECYCLE_JOBS_ENABLED).lower(),
+).lower() in {"1", "true", "yes"}
+LIFECYCLE_SUPERVISOR_INTERVAL_SECONDS = float(os.environ.get("PITH_LIFECYCLE_SUPERVISOR_INTERVAL_SECONDS", "30"))
+LIFECYCLE_SUPERVISOR_BATCH_SIZE = int(os.environ.get("PITH_LIFECYCLE_SUPERVISOR_BATCH_SIZE", "5"))
+LIFECYCLE_SUPERVISOR_MAX_WALL_SECONDS = float(os.environ.get("PITH_LIFECYCLE_SUPERVISOR_MAX_WALL_SECONDS", "10"))
+LIFECYCLE_SUPERVISOR_STARVATION_SECONDS = float(os.environ.get("PITH_LIFECYCLE_SUPERVISOR_STARVATION_SECONDS", "600"))
+REFLECTION_DURABLE_JOBS_ENABLED = os.environ.get(
+    "PITH_REFLECTION_DURABLE_JOBS_ENABLED",
+    str(LIFECYCLE_JOBS_ENABLED).lower(),
+).lower() in {"1", "true", "yes"}
+REFLECTION_COMPLETION_MONITOR_ENABLED = os.environ.get(
+    "PITH_REFLECTION_COMPLETION_MONITOR_ENABLED",
+    str(REFLECTION_DURABLE_JOBS_ENABLED).lower(),
+).lower() in {"1", "true", "yes"}

@@ -212,7 +212,11 @@ def _install_faulthandler_hooks() -> None:
             f"watchdog_interval={_WATCHDOG_REARM_INTERVAL_SECS}s "
             f"watchdog_timeout={_WATCHDOG_TIMEOUT_SECS}s"
         )
-        logger.critical(smoke_msg)
+        # Keep the import-time proof out of public CLI stdout/stderr by default.
+        # The dedicated diagnostic files below preserve the evidence without
+        # contaminating user-facing commands such as `pith maintenance status`.
+        if os.environ.get("PITH_DEADLOCK_WATCHDOG_SMOKE_TO_LOGGER") == "1":
+            logger.critical(smoke_msg)
         try:
             _get_deadlock_diag_logger().critical(smoke_msg)
         except Exception:
@@ -347,6 +351,10 @@ class SQLiteBackend:
         ("resume_snapshots", "topic_keywords", "TEXT DEFAULT ''"),
         # SESSION-012 v0.3: Platform hint for session provenance
         ("sessions", "platform_hint", "TEXT NOT NULL DEFAULT 'unknown'"),
+        # SURFACE-ATTRIBUTION-001: canonical consumer lifecycle surface
+        ("sessions", "surface_id", "TEXT NOT NULL DEFAULT 'unknown'"),
+        # SURFACE-ATTRIBUTION-001: raw capture completeness separate from capture status
+        ("raw_turn_payloads", "payload_completeness", "TEXT NOT NULL DEFAULT 'unknown'"),
         # SESSION-014: stable client/thread origin for checkpoint authority
         ("checkpoints", "origin_id", "TEXT DEFAULT NULL"),
         # SESSION-015: stable client/thread origin for session closeout binding

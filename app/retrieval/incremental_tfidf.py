@@ -260,6 +260,96 @@ class IncrementalTfidfIndex:
 
             return True
 
+    def refresh_concept(self, concept_id: str, text: str) -> bool:
+        """Replace the stored term representation of an EXISTING concept in place.
+
+        RETRIEVAL-125 (design §4.1). ``add_concept(existing_id)`` is an add-only
+        no-op (line ~197), and remove+re-add is a double no-op (lazy delete leaves
+        ``concept_id_to_idx`` populated), so neither can refresh an evolved/edited
+        concept whose searchable text changed. This method updates the existing row
+        in place at its current matrix index.
+
+        Contract (deliberately narrow — DF and the matrix are NOT touched here):
+          * Updates ``document_term_counts[idx]`` and marks the concept dirty.
+          * Does NOT mutate ``document_frequencies`` — DF is global and derived;
+            the engine wrapper recomputes it from scratch over all rows and calls
+            ``force_idf_recalculation`` once per batch (design §4.2 / A1). Calling
+            ``refresh_concept`` without that follow-up leaves the matrix row stale.
+          * Leaves ``document_count``, ``concept_ids``, ``concept_id_to_idx``
+            unchanged, so the pre-save/post-load consistency invariant
+            (count == dtc == cids) is preserved by construction.
+
+        Args:
+            concept_id: ID of an already-indexed concept.
+            text: New searchable text (assemble via build_searchable_text).
+
+        Returns:
+            True if the row was refreshed; False if the concept is not in the
+            index (caller decides add vs skip) or the new text yields no terms
+            (we never blank a live row).
+        """
+        with self.lock:
+            idx = self.concept_id_to_idx.get(concept_id)
+            if idx is None:
+                # Not mapped — caller should add_concept instead.
+                return False
+
+            # A2 — deleted-row revive: a lazily-deleted row is still mapped, so
+            # handing back to add_concept would re-hit the line-197 double-no-op
+            # trap. Revive the row here and refresh it in place.
+            if idx in self.deleted_indices:
+                self.deleted_indices.discard(idx)
+                logger.debug(f"refresh_concept: revived lazily-deleted row for {concept_id}")
+
+            new_counts = self.extract_terms(text)
+            if not new_counts:
+                # Never blank a live row — treat as a skip.
+                logger.warning(f"refresh_concept: no terms extracted from {concept_id}, skipping")
+                return False
+
+            if idx >= len(self.document_term_counts):
+                logger.error(
+                    f"refresh_concept: idx {idx} out of range "
+                    f"(dtc length {len(self.document_term_counts)}) for {concept_id}; skipping"
+                )
+                return False
+
+            # Vocabulary expansion for terms not yet present (mirror add_concept STEP 1).
+            new_terms = set()
+            for term in new_counts.keys():
+                if term not in self.vocabulary:
+                    self.vocabulary[term] = self.next_term_id
+                    self.reverse_vocabulary[self.next_term_id] = term
+                    self.next_term_id += 1
+                    new_terms.add(term)
+            if new_terms:
+                self._expand_for_new_terms(len(new_terms))
+
+            # In-place replacement of stored raw term counts.
+            self.document_term_counts[idx] = dict(new_counts)
+
+            # Mark dirty + bump version. DF / matrix are handled once per batch by
+            # the engine wrapper — intentionally NOT triggering _recalculate_idf here.
+            self.dirty_documents.add(concept_id)
+            self.index_version += 1
+
+            return True
+
+    def stored_terms_stale(self, concept_id: str, text: str) -> bool:
+        """Cheap staleness probe for the steady-state refresh enqueue (Phase C).
+
+        Returns True iff ``concept_id`` is an ACTIVE indexed row whose stored term
+        counts differ from ``extract_terms(text)`` — i.e. an ``add_concept`` no-op
+        just left it stale. False for unknown ids, lazily-deleted rows (must not be
+        revived through the evolve path), and rows whose terms already match (so the
+        drain is not flooded with unchanged concepts).
+        """
+        with self.lock:
+            idx = self.concept_id_to_idx.get(concept_id)
+            if idx is None or idx in self.deleted_indices or idx >= len(self.document_term_counts):
+                return False
+            return self.document_term_counts[idx] != self.extract_terms(text)
+
     def remove_concept(self, concept_id: str) -> bool:
         """
         Remove concept from index.
@@ -646,6 +736,29 @@ class IncrementalTfidfIndex:
         self.deleted_indices.clear()
 
         logger.info(f"Compaction complete: {self.document_count} documents remain")
+
+    def recompute_document_frequencies(self) -> None:
+        """Recompute ``document_frequencies`` from scratch over non-deleted rows.
+
+        RETRIEVAL-125 / A1: DF is GLOBAL and DERIVED. IDF in
+        ``_compute_tfidf_vector_sparse`` reads ``document_frequencies`` for every
+        row, and ``_full_recalculate_idf`` never recomputes DF — so a DF maintained
+        by incremental deltas is load-bearing and un-self-healed (one bug silently
+        poisons IDF corpus-wide). After in-place ``refresh_concept`` calls mutate
+        stored term counts, callers MUST recompute DF from scratch (here) before
+        ``force_idf_recalculation`` rather than maintain a delta. Mirrors the proven
+        ``_compact_matrix`` DF loop, but skips lazily-deleted rows (which are still
+        present in ``document_term_counts`` outside compaction).
+        """
+        with self.lock:
+            self.document_frequencies = np.zeros(len(self.vocabulary), dtype=np.int32)
+            for idx, term_counts in enumerate(self.document_term_counts):
+                if idx in self.deleted_indices:
+                    continue
+                for term in set((term_counts or {}).keys()):
+                    term_id = self.vocabulary.get(term)
+                    if term_id is not None:
+                        self.document_frequencies[term_id] += 1
 
     def force_idf_recalculation(self):
         """
