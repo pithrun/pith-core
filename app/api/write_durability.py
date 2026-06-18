@@ -21,6 +21,18 @@ from app.storage import (
 )
 
 STALE_PROCESSING_TIMEOUT = timedelta(minutes=WRITE_STALE_MINUTES)
+STATUS_ENDPOINT_ALLOWLIST = frozenset({"session_learn", "session_end", "checkpoint"})
+STATUS_SUMMARY_FIELDS = (
+    "learning_events",
+    "concepts_created",
+    "concepts_evolved",
+    "accepted_learning_events",
+    "learning_capture_state",
+    "session_linkage_state",
+    "processing_state",
+    "persistence_state",
+    "status",
+)
 
 # MONITOR-135: write-durability telemetry
 try:
@@ -126,6 +138,47 @@ def commit_write_request(endpoint: str, request_id: str | None, response: dict) 
         commit_write_request_replay(endpoint, profile, request_id, response, now)
     _flush_metrics()
     return response
+
+
+def _redacted_response_summary(response: dict | None) -> dict:
+    if not isinstance(response, dict):
+        return {}
+    return {field: response[field] for field in STATUS_SUMMARY_FIELDS if field in response}
+
+
+def get_write_request_status(endpoint: str, request_id: str | None) -> dict:
+    """Return redacted status for an idempotent write request in the active profile."""
+    if endpoint not in STATUS_ENDPOINT_ALLOWLIST:
+        raise ValueError("unsupported write request endpoint")
+    if not request_id:
+        raise ValueError("request_id is required")
+
+    profile = get_active_profile()
+    row = load_write_request_replay(endpoint, profile, request_id)
+    if not row:
+        return {
+            "endpoint": endpoint,
+            "request_id": request_id,
+            "status": "unknown",
+            "processing_state": "unknown",
+        }
+
+    status = str(row.get("status") or "unknown")
+    response = row.get("response")
+    payload = {
+        "endpoint": endpoint,
+        "request_id": request_id,
+        "status": status,
+        "processing_state": status,
+        "updated_at": row.get("updated_at"),
+        "attempt_count": int(row.get("attempt_count") or 0),
+    }
+    if row.get("last_error"):
+        payload["error_class"] = row.get("last_error")
+    summary = _redacted_response_summary(response)
+    if summary:
+        payload["summary"] = summary
+    return payload
 
 
 def abandon_write_request(endpoint: str, request_id: str | None, *, error_class: str = "unknown") -> None:

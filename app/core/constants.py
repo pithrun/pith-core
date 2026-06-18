@@ -14,6 +14,21 @@ TYPE_AUTHORITY_CAPS = {
     "hypothesis": 0.60,
 }
 
+# A8: Authorship trust tiers. The ONLY values a concept's provenance may take.
+# Unknown values are coerced to 'human' at the request boundary (fail-safe: never
+# mint a new uncapped tier from malformed input). Keep in sync with the
+# ConversationTurnRequest.provenance validator, Concept.provenance docstring, AND
+# the pith_mcp.py:_VALID_PROVENANCE literal (the thin stdio bridge cannot import
+# app internals, so it intentionally duplicates this 2-value set — keep both aligned).
+PROVENANCE_VALUES: frozenset[str] = frozenset({"human", "agent_loop"})
+
+# A8: Provenance-based authority caps (machine/agent authorship trust-tier).
+# effective_authority = min(authority_score, type_cap, provenance_cap).
+# RUNG0 Component C: ARMED for 'agent_loop' at 0.35 — below every TYPE_AUTHORITY_CAPS
+# entry (weakest human tier = hypothesis 0.60), so loop-authored concepts can never
+# outrank human knowledge. 'human' is intentionally absent (None → uncapped).
+PROVENANCE_AUTHORITY_CAPS: dict[str, float] = {"agent_loop": 0.35}
+
 # DEBT-051: Freshness label bucket thresholds (minutes).
 # Used by _compute_freshness() in session.py.
 FRESHNESS_JUST_NOW_MINS = 5

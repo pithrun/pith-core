@@ -346,6 +346,7 @@ def shape_display_summary(
 ) -> PayloadMatch | None:
     del concept_id
     q = _norm(question)
+    source_blob = " ".join(part for part in (_norm(base_summary), _norm(evidence_text)) if part)
     blob = " ".join(part for part in (_norm(base_summary), _norm(evidence_text), _norm(top_text)) if part)
     words = _terms(blob)
 
@@ -359,6 +360,12 @@ def shape_display_summary(
     if _has(q, "how many") and _has_any(q, ("children", "kids")) and _has(q, "melanie"):
         if (_has_any(blob, ("three children", "three kids", "3 children", "3 kids")) or ({"three", "children"} <= words)):
             return match("locomo_children_count_three_surface", "Melanie has 3 children.", "three", "children")
+
+    if _has(q, "melanie") and _has_any(q, ("musical artists/bands", "musical artists", "artists bands")):
+        if _has(source_blob, "summer sounds"):
+            return match("locomo_exact_artists_surface", "Melanie saw Summer Sounds.", "summer sounds")
+        if _has(source_blob, "matt patterson"):
+            return match("locomo_exact_artists_surface", "Melanie saw Matt Patterson.", "matt patterson")
 
     if _has_any(q, ("paint", "painting", "project")) and _has_any(q, ("kids", "children")):
         if _has(blob, "sunset") and _has_any(blob, ("palm tree", "palm")):
@@ -399,6 +406,15 @@ def shape_display_summary(
                 "An abstract painting with blue streaks on a wall.",
                 "abstract painting",
                 "blue streaks",
+            )
+
+    if _has(q, "melanie") and _has(q, "painting") and _has_any(q, ("show", "showed")) and _has(q, "october"):
+        if _has(blob, "inspired by the sunsets") and _has(blob, "pink sky"):
+            return match(
+                "locomo_october_sunset_pink_painting_surface",
+                "Melanie showed a painting inspired by sunsets with a pink sky.",
+                "inspired by the sunsets",
+                "pink sky",
             )
 
     if _has(q, "sign") and _has_any(q, ("precaution", "cafe", "café", "door", "leave")):

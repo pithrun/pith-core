@@ -8,29 +8,37 @@ Interface must match exactly for seamless integration.
 P0.3: Hybrid architecture — embeddings for search, TF-IDF for dedup/auto-association.
 """
 
+import collections
+import contextlib
+import fcntl
 import functools
-import os
 import json
 import logging
 import math
-import time
+import os
+import re
+import shutil
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
 from app.core.datetime_utils import _ensure_aware, _utc_now
+from app.core.deadline import TurnDeadline
 from app.core.foreground_contract import (
     ForegroundContractConfig,
     ForegroundDecision,
     foreground_contract_mode_for_unit,
     get_foreground_contract,
 )
-from app.storage.embedding import EMBEDDING_DIM, EMBEDDING_VERSION, embedding_engine
-from app.retrieval.incremental_tfidf import IncrementalTfidfIndex
-from app.core.deadline import TurnDeadline
 from app.core.models import SearchQuery, SearchResult
+from app.core.profile import resolve_data_dir
+from app.retrieval import refresh_drain as _refresh_drain
+from app.retrieval.incremental_tfidf import IncrementalTfidfIndex
+from app.retrieval.query_intent import QueryIntentExpansion, expand_query_intent
+from app.retrieval.searchable_text import build_searchable_text
 from app.storage import (  # DEBT-022: hoisted from function-level
     INDEX_DIR,
     list_concepts,
@@ -38,10 +46,15 @@ from app.storage import (  # DEBT-022: hoisted from function-level
     load_concept,
     read_snapshot_db,  # T2-3: RLock-free read path for retrieval
 )
+from app.storage.embedding import EMBEDDING_DIM, EMBEDDING_VERSION, embedding_engine
 
 # Import governance scoring config
 try:
     from app.core.config import (
+        AUTHORITY_ARTIFACT_BOOST_ENABLED,
+        AUTHORITY_ARTIFACT_BOOST_WEIGHT,
+        BENCHMARK,
+        CROSS_SESSION_WINDOW_HOURS,  # SESSION-012: Concurrent session time window
         KA_BOOST_WEIGHT,
         MIN_RETRIEVAL_SIMILARITY,  # RETRIEVAL-031
         RETRIEVAL_WEIGHT_AUTHORITY,
@@ -50,14 +63,11 @@ try:
         RETRIEVAL_WEIGHT_CURRENCY,
         RETRIEVAL_WEIGHT_GOAL,
         RETRIEVAL_WEIGHT_RECENCY,  # RETRIEVAL-100: Creation-time recency
-        RETRIEVAL_RECENCY_HALF_LIFE_DAYS,  # RETRIEVAL-100: Decay half-life
         RETRIEVAL_WEIGHT_SESSION_PROXIMITY,  # SESSION-012: Cross-session boost
         RETRIEVAL_WEIGHT_SIMILARITY,  # DEBT-002: renamed from RETRIEVAL_WEIGHT_EMBEDDING
         RETRIEVAL_WEIGHT_STABILITY,
         RETRIEVAL_WEIGHT_UTILITY,  # RETRIEVAL-080: Feedback loop utility weight
-        CROSS_SESSION_WINDOW_HOURS,  # SESSION-012: Concurrent session time window
         UTILITY_COLD_START,  # RETRIEVAL-080: Default utility for concepts without feedback
-        BENCHMARK,
         get_feature_flag,
     )
 
@@ -65,15 +75,19 @@ try:
 except ImportError:
     GOVERNANCE_SCORING = False
     KA_BOOST_WEIGHT = 0.2
+    AUTHORITY_ARTIFACT_BOOST_ENABLED = False
+    AUTHORITY_ARTIFACT_BOOST_WEIGHT = 0.18
 
 # Import activation modules for enhanced retrieval
 # DEBT-242: retrieval must not import features directly (Contract 5).
 # Using importlib to break static dependency while preserving fallback behavior.
 try:
     import importlib as _il
+
     _gd_mod = _il.import_module("app.features.goal_directed")
     goal_directed = _gd_mod.goal_directed
     from app.retrieval.predictive import predictive_activation
+
     ENHANCED_RETRIEVAL = True
 except ImportError:
     ENHANCED_RETRIEVAL = False
@@ -83,13 +97,191 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-def _record_metric(name: str, value: float, labels: dict[str, str] | None = None) -> None:
+def _record_metric(
+    name: str,
+    value: float,
+    labels: dict[str, str | int | float] | None = None,
+    *,
+    flush: bool = False,
+) -> None:
     try:
         from app.core.metrics_facade import metrics
 
         metrics.record(name, value, labels or {})
+        if flush:
+            metrics.flush()
     except Exception:
         pass
+
+
+_AUTHORITY_ARTIFACT_AUTHORITY_TERMS = frozenset(
+    {
+        "active",
+        "approval",
+        "approved",
+        "authoritative",
+        "current",
+        "final",
+        "frozen",
+        "latest",
+        "official",
+    }
+)
+_AUTHORITY_ARTIFACT_DOMAIN_TERMS = frozenset(
+    {
+        "artifact",
+        "branch",
+        "commit",
+        "doc",
+        "docs",
+        "freeze",
+        "frozen",
+        "ledger",
+        "packet",
+        "version",
+    }
+)
+_AUTHORITY_ARTIFACT_SCOPE_TERMS = frozenset(
+    {
+        "copy",
+        "launch",
+        "pith",
+        "public",
+        "release",
+    }
+)
+_AUTHORITY_ARTIFACT_EXPANSION_TERMS = (
+    "official",
+    "current",
+    "docs",
+    "reports",
+    "commit",
+    "freeze",
+    "historical",
+)
+_AUTHORITY_ARTIFACT_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_-]*")
+_AUTHORITY_ARTIFACT_COMMIT_RE = re.compile(r"\b[0-9a-f]{7,40}\b", re.IGNORECASE)
+_AUTHORITY_ARTIFACT_FILE_RE = re.compile(
+    r"(?:\bdocs/|\b[a-z0-9_./-]+\.md\b|\b[A-Z0-9_]+(?:PACKET|LEDGER|REPORT|ARTIFACT)[A-Z0-9_]*\b)",
+    re.IGNORECASE,
+)
+_AUTHORITY_ARTIFACT_VERSION_RE = re.compile(r"\bv\d+(?:\.\d+)*\b", re.IGNORECASE)
+_AUTHORITY_ARTIFACT_SPECIFICITY_WEIGHT = 0.04
+
+
+def _authority_artifact_tokens(text: str) -> set[str]:
+    return set(_AUTHORITY_ARTIFACT_TOKEN_RE.findall((text or "").casefold()))
+
+
+def _is_authority_artifact_query(query_text: str) -> bool:
+    lowered = (query_text or "").casefold()
+    tokens = _authority_artifact_tokens(lowered)
+    has_authority = bool(tokens & _AUTHORITY_ARTIFACT_AUTHORITY_TERMS)
+    has_authority = has_authority or "source of truth" in lowered or "go/no-go" in lowered
+    has_domain = bool(tokens & _AUTHORITY_ARTIFACT_DOMAIN_TERMS)
+    if has_domain and tokens & {"packet", "doc", "docs"}:
+        scoped_domain_terms = _AUTHORITY_ARTIFACT_SCOPE_TERMS | (
+            _AUTHORITY_ARTIFACT_DOMAIN_TERMS - {"packet", "doc", "docs"}
+        )
+        has_domain = bool(tokens & scoped_domain_terms)
+    return has_authority and has_domain
+
+
+def _expand_authority_artifact_query(query_text: str) -> str:
+    if not _is_authority_artifact_query(query_text):
+        return query_text
+    tokens = _authority_artifact_tokens(query_text)
+    missing_terms = [term for term in _AUTHORITY_ARTIFACT_EXPANSION_TERMS if term not in tokens]
+    if not missing_terms:
+        return query_text
+    return f"{query_text} {' '.join(missing_terms)}"
+
+
+def _authority_artifact_evidence_groups(summary: str) -> set[str]:
+    text = summary or ""
+    lowered = text.casefold()
+    tokens = _authority_artifact_tokens(text)
+    groups: set[str] = set()
+
+    if _AUTHORITY_ARTIFACT_FILE_RE.search(text):
+        groups.add("artifact_locator")
+    if (
+        _AUTHORITY_ARTIFACT_COMMIT_RE.search(text)
+        or _AUTHORITY_ARTIFACT_VERSION_RE.search(text)
+        or "source freeze" in lowered
+        or "freeze" in tokens
+        or "frozen" in tokens
+        or "active" in tokens
+    ):
+        groups.add("commit_version_status")
+    if (
+        tokens & {"approved", "approval", "andrew", "current", "official", "authoritative"}
+        or "source of truth" in lowered
+        or "gated execution" in lowered
+    ):
+        groups.add("approval_current_authority")
+    if tokens & {"historical", "older", "baseline", "superseded"} or "not current" in lowered:
+        groups.add("historical_demotion")
+
+    return groups
+
+
+def _qualifies_for_authority_artifact_boost(summary: str) -> bool:
+    groups = _authority_artifact_evidence_groups(summary)
+    return "artifact_locator" in groups and len(groups) >= 2
+
+
+def _authority_artifact_specificity_bonus(query_text: str, summary: str) -> float:
+    query_tokens = _authority_artifact_tokens(query_text)
+    if not (query_tokens & {"approval", "approved", "copy", "packet"}):
+        return 0.0
+
+    summary_tokens = _authority_artifact_tokens(summary)
+    groups = _authority_artifact_evidence_groups(summary)
+    asks_for_approval_packet = bool(query_tokens & {"approval", "approved"}) and bool(query_tokens & {"copy", "packet"})
+    is_current_packet = (
+        asks_for_approval_packet
+        and "packet" in summary_tokens
+        and {"approval_current_authority", "historical_demotion"}.issubset(groups)
+    )
+    if not is_current_packet:
+        return 0.0
+    return _AUTHORITY_ARTIFACT_SPECIFICITY_WEIGHT
+
+
+def _apply_authority_artifact_boost(
+    results: list[SearchResult],
+    query_text: str,
+    *,
+    path: str,
+) -> int:
+    if not AUTHORITY_ARTIFACT_BOOST_ENABLED or not results:
+        return 0
+    if not _is_authority_artifact_query(query_text):
+        return 0
+
+    boosted = 0
+    try:
+        for result in results:
+            if _qualifies_for_authority_artifact_boost(result.summary):
+                result.relevance_score = min(
+                    1.0,
+                    result.relevance_score
+                    + AUTHORITY_ARTIFACT_BOOST_WEIGHT
+                    + _authority_artifact_specificity_bonus(query_text, result.summary),
+                )
+                boosted += 1
+        if boosted:
+            results.sort(key=lambda r: (-r.relevance_score, r.concept_id))
+            _record_metric(
+                "retrieval_authority_artifact_boost_applied_total",
+                float(boosted),
+                {"path": path},
+            )
+    except Exception as exc:
+        logger.debug("authority artifact boost skipped: %s", exc)
+        return 0
+    return boosted
 
 
 def _env_float(name: str, default: float) -> float:
@@ -104,6 +296,7 @@ def _env_flag(name: str, default: bool = False) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in ("1", "true", "yes", "on")
+
 
 _DIAGNOSTIC_SOURCE_METADATA_FLAG = "PITH_RETRIEVAL_DIAGNOSTIC_SOURCE_METADATA"
 _PRIVATE_DIAGNOSTIC_FLAGS = (
@@ -209,8 +402,7 @@ def _mh262_trace_score_sample(
     limit: int = _MH262_CANARY_TRACE_LIMIT,
 ) -> list[dict]:
     return [
-        {"concept_id": str(concept_id), "score": round(float(score or 0.0), 6)}
-        for concept_id, score in scored[:limit]
+        {"concept_id": str(concept_id), "score": round(float(score or 0.0), 6)} for concept_id, score in scored[:limit]
     ]
 
 
@@ -279,11 +471,24 @@ FACT_SEEKING_BOOST = 1.25
 
 # INGEST-015 legacy markers (fallback when structural classifier disabled)
 _FACT_QUERY_MARKERS = [
-    "what is my ", "what's my ", "where do i ", "where am i ",
-    "what do i do", "where do i work", "who is my ", "who's my ",
-    "what is their ", "where does ", "remind me ", "do you know my ",
-    "what's the name", "where do i live", "what city am i",
-    "tell me about my ", "what company", "who do i work",
+    "what is my ",
+    "what's my ",
+    "where do i ",
+    "where am i ",
+    "what do i do",
+    "where do i work",
+    "who is my ",
+    "who's my ",
+    "what is their ",
+    "where does ",
+    "remind me ",
+    "do you know my ",
+    "what's the name",
+    "where do i live",
+    "what city am i",
+    "tell me about my ",
+    "what company",
+    "who do i work",
 ]
 
 
@@ -296,6 +501,7 @@ def _is_fact_seeking_query(query_text: str) -> bool:
     try:
         if get_feature_flag("STRUCTURAL_QUERY_CLASSIFIER_ENABLED", True):
             from app.cognitive.fact_classifier import is_fact_seeking_query
+
             return is_fact_seeking_query(query_text)
     except Exception:
         logger.debug("INGEST-017: structural query classifier unavailable, using marker fallback")
@@ -308,6 +514,7 @@ def _is_fact_seeking_query(query_text: str) -> bool:
 # KA-ARCH-001 Fix 7: Module-level KA inference (lru_cached)
 # ======================================================================
 
+
 @functools.lru_cache(maxsize=128)
 def _infer_query_kas(query_text: str) -> tuple[str, ...]:
     """Infer relevant KAs for a query using keyword + embedding match.
@@ -319,7 +526,7 @@ def _infer_query_kas(query_text: str) -> tuple[str, ...]:
       - search_lightweight() Phase 1.5 (conversation_turn hot path)
       - _apply_ka_boost() in search() path
     """
-    from app.cognitive.taxonomy import infer_knowledge_area, classify_ka_by_embedding
+    from app.cognitive.taxonomy import classify_ka_by_embedding, infer_knowledge_area
 
     kas = set()
 
@@ -337,6 +544,10 @@ def _infer_query_kas(query_text: str) -> tuple[str, ...]:
         pass
 
     return tuple(kas) if kas else ()
+
+
+class QuiesceDrainTimeout(RuntimeError):
+    """Raised when in-flight index writers fail to drain within the quiesce window."""
 
 
 class RetrievalEngine:
@@ -364,7 +575,16 @@ class RetrievalEngine:
         self._embeddings_initialized = False
         self._embeddings_available = False  # Set True only if init succeeds
         self._embedding_init_lock = threading.Lock()
+
+        # Writer-quiesce state. The quiesce window pauses all in-process
+        # index mutators (skip-not-block) so a rebuild+swap can run against a
+        # frozen index_version. Drain waits only for writers already in-flight.
+        self._quiesce = threading.Event()
+        self._inflight_writers = 0
+        self._writer_cv = threading.Condition()
+        self._quiesce_skipped: collections.Counter = collections.Counter()
         self.last_canary_search_lightweight_trace: dict | None = None
+        self.last_query_intent_trace: dict | None = None
 
         # Try to load existing index
         index_dir = Path(self.index_path)
@@ -378,6 +598,55 @@ class RetrievalEngine:
             logger.info("No existing index found, will build on first search/add")
 
         logger.info("RetrievalEngine initialized (incremental TF-IDF + embeddings)")
+
+    @contextlib.contextmanager
+    def _writer_admission(self, op: str):
+        """Admit or skip an index mutation depending on quiesce state.
+
+        Yields True if the caller should proceed with the mutation, False if a
+        quiesce window is active (caller must skip and return a typed no-op).
+        Check+increment happen under the same condition to be TOCTOU-safe.
+        """
+        with self._writer_cv:
+            if self._quiesce.is_set():
+                self._quiesce_skipped[op] += 1
+                admitted = False
+            else:
+                self._inflight_writers += 1
+                admitted = True
+        try:
+            yield admitted
+        finally:
+            if admitted:
+                with self._writer_cv:
+                    self._inflight_writers -= 1
+                    self._writer_cv.notify_all()
+
+    @contextlib.contextmanager
+    def quiesce_writers(self, *, drain_timeout_s: float = 10.0):
+        """Open a quiesce window: set the gate, drain in-flight writers, yield.
+
+        New writers skip immediately (skip-not-block). Drain waits only for
+        writers already in-flight when the gate engaged. On drain timeout the
+        gate is cleared and QuiesceDrainTimeout is raised. The gate is always
+        cleared on exit (normal or exception).
+        """
+        self._quiesce.set()
+        with self._writer_cv:
+            drained = self._writer_cv.wait_for(lambda: self._inflight_writers == 0, timeout=drain_timeout_s)
+        if not drained:
+            self._quiesce.clear()
+            with self._writer_cv:
+                self._writer_cv.notify_all()
+            raise QuiesceDrainTimeout(
+                f"quiesce drain timed out after {drain_timeout_s}s ({self._inflight_writers} writers still in-flight)"
+            )
+        try:
+            yield
+        finally:
+            self._quiesce.clear()
+            with self._writer_cv:
+                self._writer_cv.notify_all()
 
     def _init_embeddings(self):
         """Load or compute embeddings for all active concepts.
@@ -467,6 +736,7 @@ class RetrievalEngine:
 
                 # T2-3: Persist via _db_immediate (write path — needs RLock)
                 from app.storage import _db_immediate
+
                 with _db_immediate() as _w_conn:
                     for i, (cid, _) in enumerate(needs_embedding):
                         emb = new_embeddings[i]
@@ -500,75 +770,50 @@ class RetrievalEngine:
         Args:
             concept_id: ID of concept to add
         """
+        with self._writer_admission("add_concept") as admit:
+            if not admit:
+                return
+            self._add_concept_inner(concept_id)
+
+    def _load_concept_row_for_index(self, concept_id: str) -> dict | None:
+        """Load the minimal current-concept fields for searchable-text assembly.
+
+        Returns a mapping ``{data, summary, fragment_keywords}`` consumable by
+        ``build_searchable_text`` (RETRIEVAL-125, A3), or ``None`` if the concept
+        is not current/present. ``fragment_keywords`` is read defensively because
+        the column may not exist pre-migration.
+        """
+        with read_snapshot_db("index_concept_load") as _conn:  # T2-3
+            try:
+                _row = _conn.execute(
+                    "SELECT data, summary, fragment_keywords FROM concepts WHERE id = ? AND is_current = 1",
+                    (concept_id,),
+                ).fetchone()
+                _frag = _row[2] if _row is not None and len(_row) > 2 else ""
+            except Exception:
+                # fragment_keywords column absent (pre-migration) — fall back.
+                _row = _conn.execute(
+                    "SELECT data, summary FROM concepts WHERE id = ? AND is_current = 1",
+                    (concept_id,),
+                ).fetchone()
+                _frag = ""
+        if not _row:
+            return None
+        return {"data": _row[0], "summary": _row[1], "fragment_keywords": _frag or ""}
+
+    def _add_concept_inner(self, concept_id: str):
         # FIX-2: Direct SQL instead of load_concept() to avoid Pydantic crash
         # on concepts with incomplete data JSON blobs.
         # T2-3: read_snapshot_db — RLock-free read for concept load
-        with read_snapshot_db("add_concept_load") as _conn:
-            _row = _conn.execute(
-                "SELECT data, summary FROM concepts WHERE id = ? AND is_current = 1",
-                (concept_id,),
-            ).fetchone()
-        if not _row:
+        # RETRIEVAL-125 (A3): text assembly is the ONE shared build_searchable_text
+        # helper, so the incremental add path, the in-place refresh path, and the
+        # stale-index audit produce byte-identical searchable text.
+        _row_map = self._load_concept_row_for_index(concept_id)
+        if _row_map is None:
             logger.warning(f"Concept {concept_id} not found, skipping index add")
             return
 
-        try:
-            _data = json.loads(_row[0]) if _row[0] else {}
-        except (json.JSONDecodeError, TypeError):
-            _data = {}
-
-        # Build searchable text from available data (no Pydantic required)
-        _summary = _data.get("summary", "") or (_row[1] if _row[1] else "")
-        _evidence_strs = []
-        for _e in _data.get("evidence") or []:
-            if isinstance(_e, str):
-                _evidence_strs.append(_e)
-            elif isinstance(_e, dict):
-                _evidence_strs.append(_e.get("content", ""))
-        _signals = _data.get("signals", [])
-        _ka = _data.get("metadata", {}).get("knowledge_area", "") if isinstance(_data.get("metadata"), dict) else ""
-        _ctype = _data.get("concept_type", "")
-
-        # RETRIEVAL-057: Include prospective indexing implications
-        _implications = _data.get("implications", [])
-        _implications_text = " ".join(str(imp) for imp in _implications if isinstance(imp, str))
-
-        # INGEST-034: Include event text in searchable content
-        _event_texts = []
-        for _evt in _data.get("events", []):
-            _evt_parts = [_evt.get("action", "")]
-            if _evt.get("cause"):
-                _evt_parts.append(f"because {_evt['cause']}")
-            if _evt.get("consequence"):
-                _evt_parts.append(f"resulting in {_evt['consequence']}")
-            if _evt.get("actors"):
-                _evt_parts.append(f"involving {', '.join(_evt['actors'])}")
-            _event_texts.append(" ".join(_evt_parts))
-
-        # INGEST-037 Layer 4: Include fragment keywords in searchable text
-        _frag_kw = _data.get("fragment_keywords", "") or ""
-        if not _frag_kw:
-            # Fallback: read column directly (fragment_keywords not in JSON blob)
-            try:
-                with read_snapshot_db("add_concept_frag_kw") as _fk_conn:  # T2-3
-                    _fk_row = _fk_conn.execute(
-                        "SELECT fragment_keywords FROM concepts WHERE id = ?",
-                        (concept_id,),
-                    ).fetchone()
-                    _frag_kw = _fk_row[0] if _fk_row and _fk_row[0] else ""
-            except Exception:
-                _frag_kw = ""  # Column may not exist yet (pre-migration)
-
-        searchable_text = " ".join(
-            filter(None, [
-                _summary, _ka, _ctype,
-                " ".join(_evidence_strs),
-                " ".join(str(s) for s in _signals),
-                _implications_text,  # RETRIEVAL-057
-                " ".join(_event_texts),  # INGEST-034
-                _frag_kw,  # INGEST-037 Layer 4
-            ])
-        )
+        searchable_text = build_searchable_text(_row_map)
         if not searchable_text.strip():
             logger.warning(f"Concept {concept_id} has no searchable content, skipping")
             return
@@ -584,6 +829,16 @@ class RetrievalEngine:
                 self._auto_save()
         else:
             logger.debug(f"Concept {concept_id} already in index")
+            # RETRIEVAL-125 Phase C: add_concept no-op'd because the concept is
+            # already indexed. If its searchable text has since changed, the stored
+            # term-counts are stale (and add can never refresh them). Enqueue for a
+            # debounced steady-state refresh. Gated by PITH_TFIDF_REFRESH_DRAIN —
+            # zero hot-path cost (no staleness probe) when disabled.
+            try:
+                if _refresh_drain.drain_enabled() and self.index.stored_terms_stale(concept_id, searchable_text):
+                    _refresh_drain.refresh_queue.enqueue(concept_id)
+            except Exception:
+                pass
 
         # P0.3: Also compute and store embedding
         if self._embeddings_initialized:
@@ -606,10 +861,7 @@ class RetrievalEngine:
                     # has at least one entry. See MEASURE-026 §14.
                     if not self._embeddings_available:
                         self._embeddings_available = True
-                        logger.info(
-                            "COLD-START-FIX: _embeddings_available set True "
-                            f"after add_concept({concept_id})"
-                        )
+                        logger.info(f"COLD-START-FIX: _embeddings_available set True after add_concept({concept_id})")
                     # Persist to SQLite
                     from app.storage import _db_immediate
 
@@ -632,18 +884,21 @@ class RetrievalEngine:
             concept_id: ID of concept to remove
             persist: Force an index checkpoint after successful removal.
         """
-        success = self.index.remove_concept(concept_id)
+        with self._writer_admission("remove_concept") as admit:
+            if not admit:
+                return
+            success = self.index.remove_concept(concept_id)
 
-        if success:
-            logger.debug(f"Removed concept {concept_id} from index (incremental)")
+            if success:
+                logger.debug(f"Removed concept {concept_id} from index (incremental)")
 
-            # Auto-save every 10 operations, or immediately for DB-backed
-            # lifecycle changes where restart resurrection would create ghosts.
-            if persist or self.index.index_version % 10 == 0:
-                self._auto_save()
+                # Auto-save every 10 operations, or immediately for DB-backed
+                # lifecycle changes where restart resurrection would create ghosts.
+                if persist or self.index.index_version % 10 == 0:
+                    self._auto_save()
 
-        # P0.3: Also remove from embedding index
-        embedding_engine.remove_embedding(concept_id)
+            # P0.3: Also remove from embedding index
+            embedding_engine.remove_embedding(concept_id)
 
     def search(self, query: SearchQuery, agent_id: str = None, scope: str = "global") -> list[SearchResult]:
         """
@@ -671,6 +926,51 @@ class RetrievalEngine:
         import time as _time_mod
 
         _search_t0 = _time_mod.perf_counter()
+        self.last_query_intent_trace = None
+
+        intent_expansion: QueryIntentExpansion | None = None
+        if get_feature_flag("QUERY_INTENT_EXPANSION_ENABLED", True):
+            try:
+                intent_expansion = expand_query_intent(
+                    query.query,
+                    input_scope="query_argument",
+                    expansion_input_source="SearchQuery.query",
+                )
+                if intent_expansion.matched_aliases:
+                    self.last_query_intent_trace = intent_expansion.to_trace()
+                    merged_kas = list(getattr(query, "ka_boost", None) or [])
+                    for ka in intent_expansion.inferred_kas:
+                        if ka not in merged_kas:
+                            merged_kas.append(ka)
+                    query_update: dict[str, Any] = {"query": intent_expansion.expanded_query}
+                    if merged_kas:
+                        query_update["ka_boost"] = merged_kas
+                    if hasattr(query, "model_copy"):
+                        query = query.model_copy(update=query_update)
+                    else:
+                        query = query.copy(update=query_update)
+                    _record_metric(
+                        "query_intent.alias_match_total",
+                        float(len(intent_expansion.matched_aliases)),
+                        {"path": "search", "source": intent_expansion.source},
+                    )
+                    if intent_expansion.contamination_guard_blocked:
+                        _record_metric(
+                            "query_intent.contamination_guard_blocked_total",
+                            1.0,
+                            {"path": "search", "source": intent_expansion.source},
+                        )
+            except Exception as _qie:
+                logger.debug("QUERY-INTENT: search expansion failed (non-fatal): %s", _qie)
+
+        authority_expanded_query = _expand_authority_artifact_query(query.query)
+        if authority_expanded_query != query.query:
+            query_update = {"query": authority_expanded_query}
+            if hasattr(query, "model_copy"):
+                query = query.model_copy(update=query_update)
+            else:
+                query = query.copy(update=query_update)
+            _record_metric("retrieval_authority_artifact_query_expanded_total", 1.0, {"path": "search"})
 
         # Build TF-IDF index if empty (first-time migration case)
         if self.index.document_count == 0:
@@ -708,23 +1008,18 @@ class RetrievalEngine:
         # supplement with concepts from the SAME KA(s) that fell below the
         # cosine cutoff. This ensures cross-session facts get surfaced.
         if get_feature_flag("KA_CROSS_SESSION_SUPPLEMENT", False):
-            results, concept_cache = self._supplement_ka_coverage(
-                results, query, concept_cache
-            )
+            results, concept_cache = self._supplement_ka_coverage(results, query, concept_cache)
 
         # ===== Phase 1.5b: Keyword supplement for low-quality embedding results =====
         # RAGAS-DIAG-001: When embedding top score < threshold, supplement with TF-IDF
         # keyword matches. Catches entity-specific queries that embeddings miss.
         from app.core.config import (
             KEYWORD_SUPPLEMENT_ENABLED,
-            KEYWORD_SUPPLEMENT_THRESHOLD,
             KEYWORD_SUPPLEMENT_MAX,
+            KEYWORD_SUPPLEMENT_THRESHOLD,
         )
-        if (
-            KEYWORD_SUPPLEMENT_ENABLED
-            and self._embeddings_available
-            and results
-        ):
+
+        if KEYWORD_SUPPLEMENT_ENABLED and self._embeddings_available and results:
             top_score = max(r.relevance_score for r in results) if results else 0
             if top_score < KEYWORD_SUPPLEMENT_THRESHOLD:
                 logger.info(
@@ -841,6 +1136,7 @@ class RetrievalEngine:
                     knowledge_area=concept.metadata.get("knowledge_area"),
                     ka_relative_authority=getattr(concept, "ka_relative_authority", None),
                     maturity=getattr(concept, "maturity", None),
+                    created_at=getattr(concept, "created_at", None),
                     metadata=_diagnostic_source_metadata(concept),
                 )
             )
@@ -866,7 +1162,10 @@ class RetrievalEngine:
 
         Returns (results, concept_cache) for Phase 2 reuse (PERF-016).
         """
-        raw_results = self.index.search(query.query, top_k=query.max_results)
+        # Bind a local handle so the search runs against one consistent index
+        # snapshot even if a rebuild+swap rebinds self.index concurrently.
+        idx = self.index
+        raw_results = idx.search(query.query, top_k=query.max_results)
 
         results = []
         concept_cache = {}  # PERF-016: Cache for Phase 2 reuse
@@ -911,6 +1210,7 @@ class RetrievalEngine:
                     knowledge_area=concept.metadata.get("knowledge_area"),
                     ka_relative_authority=getattr(concept, "ka_relative_authority", None),
                     maturity=getattr(concept, "maturity", None),
+                    created_at=getattr(concept, "created_at", None),
                     metadata=_diagnostic_source_metadata(concept),
                 )
             )
@@ -943,13 +1243,13 @@ class RetrievalEngine:
 
         # Step 1: Identify dominant KA(s) from Phase 1 results
         from collections import Counter
+
         ka_counts = Counter(r.knowledge_area for r in results if r.knowledge_area)
         if not ka_counts:
             return results, concept_cache
 
         # Only supplement KAs that have 2+ concepts in results (signal of relevance)
-        dominant_kas = [ka for ka, count in ka_counts.items()
-                        if count >= 2 and ka not in ("general", "unclassified")]
+        dominant_kas = [ka for ka, count in ka_counts.items() if count >= 2 and ka not in ("general", "unclassified")]
         if not dominant_kas:
             return results, concept_cache
 
@@ -961,7 +1261,6 @@ class RetrievalEngine:
         # Pre-compute query embedding once (outside loop)
         query_vec = None
         if self._embeddings_available:
-            import numpy as np
             query_vec = embedding_engine.embed_text(query.query)
 
         with read_snapshot_db("supplement_ka") as conn:
@@ -1006,6 +1305,7 @@ class RetrievalEngine:
                             knowledge_area=concept_ka or ka,
                             ka_relative_authority=getattr(concept, "ka_relative_authority", None),
                             maturity=getattr(concept, "maturity", None),
+                            created_at=getattr(concept, "created_at", None),
                             metadata=_diagnostic_source_metadata(concept),
                         )
                     )
@@ -1013,7 +1313,8 @@ class RetrievalEngine:
         if supplement_results:
             logger.info(
                 "RETRIEVAL-032: KA supplement added %d concepts from KA(s) %s",
-                len(supplement_results), dominant_kas,
+                len(supplement_results),
+                dominant_kas,
             )
             # Merge and re-sort
             results = results + supplement_results
@@ -1115,6 +1416,8 @@ class RetrievalEngine:
         except Exception:
             pass  # Non-fatal — retrieval degrades gracefully without the boost
 
+        _apply_authority_artifact_boost(results, query.query, path="search")
+
         # WS2: Metric 7 — retrieval_search_latency_ms
         try:
             from app.core.metrics_facade import metrics as _m7
@@ -1140,11 +1443,13 @@ class RetrievalEngine:
         Returns exponential decay [0.0, 1.0] based on concept age,
         0.0 if recency weighting disabled, 0.5 as neutral fallback on error.
         """
-        from app.core.config import RETRIEVAL_WEIGHT_RECENCY, RETRIEVAL_RECENCY_HALF_LIFE_DAYS
+        from app.core.config import RETRIEVAL_RECENCY_HALF_LIFE_DAYS, RETRIEVAL_WEIGHT_RECENCY
+
         if not (RETRIEVAL_WEIGHT_RECENCY > 0 and concept.created_at):
             return 0.0
         try:
             from datetime import datetime as _dt
+
             _ca_str = concept.created_at if isinstance(concept.created_at, str) else str(concept.created_at)
             _ca_dt = _ensure_aware(_dt.fromisoformat(_ca_str.replace("Z", "+00:00")))
             _age_days = max(0.0, (_utc_now() - _ca_dt).total_seconds() / 86400.0)
@@ -1250,7 +1555,7 @@ class RetrievalEngine:
 
             # Auto-infer if not explicitly provided and auto-boost enabled
             if not ka_boost_list and get_feature_flag("KA_AUTO_BOOST_ENABLED", False):
-                query_text = getattr(query, 'query', '') or ''
+                query_text = getattr(query, "query", "") or ""
                 if query_text:
                     ka_boost_list = _infer_query_kas(query_text)
 
@@ -1276,37 +1581,55 @@ class RetrievalEngine:
         Suppresses intermediate IDF recalculations during bulk add — only
         recalculates once at the end via force_idf_recalculation().
         """
-        logger.info("Building incremental index from all concepts...")
+        with self._writer_admission("build_index") as admit:
+            if not admit:
+                return
+            logger.info("Building incremental index from all concepts...")
 
+            # Build into the live index, then persist.
+            added = self._build_into(self.index)
+
+            # Save
+            self._auto_save()
+
+            logger.info(f"Index built: {added} concepts indexed")
+
+    def _build_into(self, target_index) -> int:
+        """Populate ``target_index`` from all concepts in storage.
+
+        Behavior-preserving extraction of the concept-iteration + add_concept +
+        force_idf_recalculation loop from ``build_index``. Used by both
+        ``build_index`` (target=self.index) and the fresh-rebuild repair
+        routine (target=a throwaway IncrementalTfidfIndex).
+
+        Returns the number of concepts indexed.
+        """
         # Single query for all concepts — eliminates N+1 load_concept calls
         concepts = list_concepts_full()
         added = 0
 
         # Suppress intermediate IDF recalcs during bulk add — we do one
         # final recalculation at the end. Saves O(N) per threshold crossing.
-        original_threshold = self.index.idf_update_threshold
-        self.index.idf_update_threshold = len(concepts) + 100
+        original_threshold = target_index.idf_update_threshold
+        target_index.idf_update_threshold = len(concepts) + 100
 
         try:
             for concept in concepts:
-                if concept.id in self.index.concept_id_to_idx:
+                if concept.id in target_index.concept_id_to_idx:
                     continue  # Already indexed, skip (Fix 1)
                 searchable_text = self._concept_to_document(concept)
-                if self.index.add_concept(concept.id, searchable_text):
+                if target_index.add_concept(concept.id, searchable_text):
                     added += 1
                     if added % 50 == 0:
                         logger.info(f"Indexed {added} concepts...")
         finally:
             # Restore threshold for incremental adds during runtime
-            self.index.idf_update_threshold = original_threshold
+            target_index.idf_update_threshold = original_threshold
 
         # Single IDF recalculation over complete corpus
-        self.index.force_idf_recalculation()
+        target_index.force_idf_recalculation()
 
-        # Save
-        self._auto_save()
-
-        logger.info(f"Index built: {added} concepts indexed")
+        return added
 
     def _concept_to_document(self, concept) -> str:
         """
@@ -1543,15 +1866,15 @@ class RetrievalEngine:
                         "cosine_score": emb_score,
                         "knowledge_area": _dedup_ka,
                         "evidence_count": len(_dedup_data.get("evidence", [])),
-                        "summary": _dedup_data.get("summary", ""),  # CONTRA-018: L1.8 needs summary for opposition check
+                        "summary": _dedup_data.get(
+                            "summary", ""
+                        ),  # CONTRA-018: L1.8 needs summary for opposition check
                     }
                 )
 
         return results
 
-    def search_for_dedup_embedding_batch(
-        self, query_texts: list[str], top_k: int = 3
-    ) -> list[list[dict]]:
+    def search_for_dedup_embedding_batch(self, query_texts: list[str], top_k: int = 3) -> list[list[dict]]:
         """Batch embedding dedup: encode all queries at once, batch DB lookups.
 
         PERF-036: Extends PERF-021 batch pattern to embedding path.
@@ -1565,8 +1888,7 @@ class RetrievalEngine:
         self._init_embeddings()
         if not self._embeddings_available or embedding_engine.index_size == 0:
             logger.warning(
-                "search_for_dedup_embedding_batch: embeddings unavailable, "
-                "falling back to sequential TF-IDF"
+                "search_for_dedup_embedding_batch: embeddings unavailable, falling back to sequential TF-IDF"
             )
             return [self.search_for_dedup_tfidf(q, top_k=top_k) for q in query_texts]
 
@@ -1604,8 +1926,7 @@ class RetrievalEngine:
             placeholders = ",".join("?" * len(all_concept_ids))
             with read_snapshot_db("dedup_embedding_batch") as conn:  # T2-3
                 rows = conn.execute(
-                    f"SELECT id, data, knowledge_area FROM concepts "
-                    f"WHERE id IN ({placeholders}) AND is_current = 1",
+                    f"SELECT id, data, knowledge_area FROM concepts WHERE id IN ({placeholders}) AND is_current = 1",
                     list(all_concept_ids),
                 ).fetchall()
                 for row in rows:
@@ -1629,12 +1950,14 @@ class RetrievalEngine:
             query_results = []
             for cid, score in hits:
                 if cid in concept_data:
-                    query_results.append({
-                        "concept_id": cid,
-                        "cosine_score": score,
-                        "knowledge_area": concept_data[cid]["knowledge_area"],
-                        "evidence_count": concept_data[cid]["evidence_count"],
-                    })
+                    query_results.append(
+                        {
+                            "concept_id": cid,
+                            "cosine_score": score,
+                            "knowledge_area": concept_data[cid]["knowledge_area"],
+                            "evidence_count": concept_data[cid]["evidence_count"],
+                        }
+                    )
             results.append(query_results)
 
         return results
@@ -1654,7 +1977,6 @@ class RetrievalEngine:
             RETRIEVAL_WEIGHT_CONFIDENCE,
             RETRIEVAL_WEIGHT_CURRENCY,
             RETRIEVAL_WEIGHT_RECENCY,  # RETRIEVAL-100
-            RETRIEVAL_RECENCY_HALF_LIFE_DAYS,  # RETRIEVAL-100
             RETRIEVAL_WEIGHT_SIMILARITY,  # DEBT-002
             RETRIEVAL_WEIGHT_STABILITY,
             STALE_RISK_AGING_PENALTY_ENABLED,
@@ -1689,9 +2011,9 @@ class RetrievalEngine:
         )
         # FRESHNESS_UNIFIED_REDESIGN: Exponential decay freshness bonus
         from app.core.config import (
+            RETRIEVAL_FRESHNESS_EVOLUTION_BONUS,
             RETRIEVAL_FRESHNESS_HALF_LIFE_DAYS,
             RETRIEVAL_FRESHNESS_MAX_BONUS,
-            RETRIEVAL_FRESHNESS_EVOLUTION_BONUS,
         )
 
         _freshness_ts = concept.last_organic_access or concept.last_accessed or concept.created_at
@@ -1707,7 +2029,9 @@ class RetrievalEngine:
                 decay = math.exp(-math.log(2) / _hl * age_days)
                 score += decay * RETRIEVAL_FRESHNESS_MAX_BONUS
             except Exception:
-                logger.debug("freshness_bonus_parse_error concept_id=%s ts=%s", getattr(concept, "id", "?"), _freshness_ts)
+                logger.debug(
+                    "freshness_bonus_parse_error concept_id=%s ts=%s", getattr(concept, "id", "?"), _freshness_ts
+                )
 
         # Evolution bonus: evolved concepts get a small additional boost
         if concept.version and concept.version != "v1":
@@ -1717,7 +2041,8 @@ class RetrievalEngine:
         # Deprioritize but don't exclude — stale knowledge is valuable context.
         # RESOLVED is treated as ACTIVE (no penalty). Applied after all additive
         # bonuses, before min(1.0) cap.
-        from app.core.config import STALE_TRANSPARENCY_ENABLED, STALE_PENALTY_CONTRADICTED, STALE_PENALTY_CONTESTED
+        from app.core.config import STALE_PENALTY_CONTESTED, STALE_PENALTY_CONTRADICTED, STALE_TRANSPARENCY_ENABLED
+
         if STALE_TRANSPARENCY_ENABLED and _currency_status:
             if _currency_status == "CONTRADICTED":
                 # RETRIEVAL-056: Hard-filter CONTRADICTED concepts when winner has >2x authority.
@@ -1725,6 +2050,7 @@ class RetrievalEngine:
                 _winner_id = getattr(concept, "superseded_by", None)
                 if _winner_id:
                     from app.storage import load_concept as _load_winner_concept
+
                     _winner = _load_winner_concept(_winner_id, track_access=False)
                     if _winner:
                         _winner_auth = getattr(_winner, "authority_score", None)
@@ -1745,10 +2071,17 @@ class RetrievalEngine:
         return min(1.0, score)
 
     def search_lightweight(
-        self, query_text: str, top_k: int = 10, min_confidence: float = 0.0, agent_id: str = None, scope: str = "global",
+        self,
+        query_text: str,
+        top_k: int = 10,
+        min_confidence: float = 0.0,
+        agent_id: str = None,
+        scope: str = "global",
         include_deprecated: bool = False,
         session_id: str | None = None,  # SESSION-012: Cross-session awareness
         deadline: TurnDeadline | None = None,
+        query_intent_source_query: str | None = None,
+        query_intent_expansion_enabled: bool = True,
     ) -> list[SearchResult]:
         """Fast search without full preload scan.
 
@@ -1788,6 +2121,49 @@ class RetrievalEngine:
             False,
         )
         self.last_canary_search_lightweight_trace = None
+        self.last_query_intent_trace = None
+        intent_expansion: QueryIntentExpansion | None = None
+        effective_query_text = query_text
+        if query_intent_expansion_enabled and get_feature_flag("QUERY_INTENT_EXPANSION_ENABLED", True):
+            try:
+                if query_intent_source_query is not None:
+                    intent_expansion = expand_query_intent(
+                        query_intent_source_query,
+                        assembled_query=query_text,
+                        input_scope="raw_user_message",
+                        expansion_input_source="query_intent_source_query",
+                    )
+                else:
+                    intent_expansion = expand_query_intent(
+                        query_text,
+                        input_scope="query_argument",
+                        expansion_input_source="query_text",
+                    )
+                if intent_expansion.matched_aliases:
+                    effective_query_text = intent_expansion.expanded_query
+                    self.last_query_intent_trace = intent_expansion.to_trace()
+                    _record_metric(
+                        "query_intent.alias_match_total",
+                        float(len(intent_expansion.matched_aliases)),
+                        {"path": "search_lightweight", "source": intent_expansion.source},
+                    )
+                    if intent_expansion.contamination_guard_blocked:
+                        _record_metric(
+                            "query_intent.contamination_guard_blocked_total",
+                            1.0,
+                            {"path": "search_lightweight", "source": intent_expansion.source},
+                        )
+            except Exception as _qie:
+                logger.debug("QUERY-INTENT: search_lightweight expansion failed (non-fatal): %s", _qie)
+                effective_query_text = query_text
+        authority_expanded_query = _expand_authority_artifact_query(effective_query_text)
+        if authority_expanded_query != effective_query_text:
+            effective_query_text = authority_expanded_query
+            _record_metric(
+                "retrieval_authority_artifact_query_expanded_total",
+                1.0,
+                {"path": "search_lightweight"},
+            )
         _slw_trace: dict | None = None
         if _mh262_canary_retrieval_trace_enabled():
             _slw_trace = {
@@ -1798,8 +2174,8 @@ class RetrievalEngine:
                 "predictive_activation": {},
             }
             if ENHANCED_RETRIEVAL and predictive_activation is not None:
-                _slw_trace["predictive_activation"]["entry"] = (
-                    _mh262_predictive_activation_snapshot(predictive_activation)
+                _slw_trace["predictive_activation"]["entry"] = _mh262_predictive_activation_snapshot(
+                    predictive_activation
                 )
             self.last_canary_search_lightweight_trace = _slw_trace
         if deadline and not deadline.can_start(
@@ -1817,11 +2193,7 @@ class RetrievalEngine:
         # Ensure embedding index is ready when already warm. In deadline-bound
         # turn paths, avoid minutes-long foreground hydration; TF-IDF remains
         # available while startup warms semantic embeddings in the background.
-        if (
-            deadline
-            and not self._embeddings_initialized
-            and not _slw_foreground_embedding_init_enabled
-        ):
+        if deadline and not self._embeddings_initialized and not _slw_foreground_embedding_init_enabled:
             deadline.skip(
                 "retrieval.embedding_init",
                 "foreground_embedding_init_disabled",
@@ -1875,6 +2247,7 @@ class RetrievalEngine:
         # OPT-1c: Soft timeout — if Phase 1 exceeds budget, return partial results.
         # Gauntlet A11: Check inside loop, not after. A15: Floor clamp 100ms.
         import time as _time_mod_slw
+
         _slw_start = _time_mod_slw.perf_counter()
         _slw_soft_timeout_ms = _env_float("PITH_SLW_SOFT_TIMEOUT_MS", 500.0)
         if deadline:
@@ -1894,6 +2267,52 @@ class RetrievalEngine:
         else:
             _slw_soft_timeout_s = max(0.1, _slw_soft_timeout_ms) / 1000.0
         _slw_timed_out = False
+        _slw_timeout_metric_recorded = False
+        _slw_timeout_min_results = max(0, int(_env_float("PITH_SLW_TIMEOUT_MIN_RESULTS", 1.0)))
+        _slw_timeout_candidate_limit = max(
+            1,
+            int(_env_float("PITH_SLW_TIMEOUT_CANDIDATE_LIMIT", float(min(max(top_k, 1), 3)))),
+        )
+
+        def _slw_should_check_timeout(candidate_index: int) -> bool:
+            return _slw_timed_out or candidate_index == 0 or candidate_index % 10 == 0
+
+        def _slw_should_stop_for_timeout(candidate_index: int, materialized_count: int) -> bool:
+            if _slw_timeout_min_results <= 0:
+                return True
+            return materialized_count >= _slw_timeout_min_results or candidate_index >= _slw_timeout_candidate_limit
+
+        def _record_slw_soft_timeout(
+            path: str,
+            candidate_index: int,
+            candidate_total: int,
+            elapsed_ms: float,
+            partial_results: int,
+            action: str,
+        ) -> None:
+            nonlocal _slw_timeout_metric_recorded
+            if _slw_timeout_metric_recorded:
+                return
+            _slw_timeout_metric_recorded = True
+            labels = {
+                "path": path,
+                "action": action,
+                "candidate_index": candidate_index,
+                "candidate_total": candidate_total,
+                "partial_results": partial_results,
+            }
+            _record_metric(
+                "search_lightweight.soft_timeout_total",
+                1.0,
+                labels,
+                flush=True,
+            )
+            _record_metric(
+                "search_lightweight.soft_timeout_elapsed_ms",
+                round(elapsed_ms, 2),
+                {"path": path, "action": action},
+                flush=True,
+            )
 
         def _record_slw_fallback_denied(reason: str, mode: str, denied_reason: str) -> None:
             _record_metric(
@@ -1922,7 +2341,7 @@ class RetrievalEngine:
                     _record_slw_fallback_denied(fallback_reason, fallback_mode, "deadline_before_start")
                 return []
             _tfidf_search_start = time.perf_counter()
-            raw_results_tfidf = self.index.search(query_text, top_k=top_k)
+            raw_results_tfidf = self.index.search(effective_query_text, top_k=top_k)
             _record_metric(
                 "search_lightweight.tfidf_search_ms",
                 round((time.perf_counter() - _tfidf_search_start) * 1000.0, 2),
@@ -1945,6 +2364,7 @@ class RetrievalEngine:
                     _record_slw_fallback_denied(fallback_reason, fallback_mode, "batch_deadline_before_start")
                 return []
             from app.storage.concepts import load_concepts_batch
+
             _batch_load_start = time.perf_counter()
             _batch_cache_tfidf = load_concepts_batch(_candidate_ids_tfidf)
             _record_metric(
@@ -1956,13 +2376,28 @@ class RetrievalEngine:
             tfidf_results = []
             for _slw_i, (concept_id, tfidf_score) in enumerate(raw_results_tfidf):
                 # OPT-1c: Check at first iteration then every 10 (PERF-076 tightened)
-                if _slw_i == 0 or (_slw_i % 10 == 0):
-                    if (_time_mod_slw.perf_counter() - _slw_start) > _slw_soft_timeout_s:
-                        logger.warning(
-                            f"OPT-1c: search_lightweight TF-IDF soft timeout at {_slw_i}/{len(raw_results_tfidf)}"
-                        )
+                if _slw_should_check_timeout(_slw_i):
+                    _slw_elapsed_ms = (_time_mod_slw.perf_counter() - _slw_start) * 1000.0
+                    if _slw_elapsed_ms > _slw_soft_timeout_s * 1000.0:
                         _slw_timed_out = True
-                        break
+                        _slw_stop = _slw_should_stop_for_timeout(_slw_i, len(tfidf_results))
+                        _record_slw_soft_timeout(
+                            "tfidf",
+                            _slw_i,
+                            len(raw_results_tfidf),
+                            _slw_elapsed_ms,
+                            len(tfidf_results),
+                            "stop" if _slw_stop else "materialize",
+                        )
+                        logger.warning(
+                            f"OPT-1c: search_lightweight TF-IDF soft timeout at {_slw_i}/{len(raw_results_tfidf)} "
+                            f"({_slw_elapsed_ms:.0f}ms > "
+                            f"{_slw_soft_timeout_s * 1000:.0f}ms) — "
+                            f"{'stopping' if _slw_stop else 'materializing emergency candidate'} with "
+                            f"{len(tfidf_results)} partial results"
+                        )
+                        if _slw_stop:
+                            break
                 if tfidf_score < MIN_RETRIEVAL_SIMILARITY * 0.5:  # RETRIEVAL-031: TF-IDF scale differs
                     continue
                 concept = _batch_cache_tfidf.get(concept_id)  # PERF-076: dict lookup
@@ -1996,9 +2431,13 @@ class RetrievalEngine:
             return tfidf_results
 
         if self._embeddings_available and embedding_engine.index_size > 0:
-            if _slw_embedding_search_admission_enabled and deadline and not deadline.can_start(
-                "retrieval.embedding_search",
-                min_remaining_ms=_slw_min_embedding_search_ms,
+            if (
+                _slw_embedding_search_admission_enabled
+                and deadline
+                and not deadline.can_start(
+                    "retrieval.embedding_search",
+                    min_remaining_ms=_slw_min_embedding_search_ms,
+                )
             ):
                 deadline.skip(
                     "retrieval.embedding_search",
@@ -2066,6 +2505,7 @@ class RetrievalEngine:
                     )
                     results = _run_tfidf_path(_slw_fg_decision.reason, _slw_fg_decision.mode.value)
                 else:
+                    query_text = effective_query_text
                     _embedding_search_start = time.perf_counter()
                     raw_results = embedding_engine.search(query_text, top_k=top_k)
                     _embedding_search_elapsed_ms = round((time.perf_counter() - _embedding_search_start) * 1000.0, 2)
@@ -2097,6 +2537,7 @@ class RetrievalEngine:
                         )
                         return []
                     from app.storage.concepts import load_concepts_batch
+
                     _batch_load_start = time.perf_counter()
                     _batch_cache = load_concepts_batch(_candidate_ids)
                     _record_metric(
@@ -2108,15 +2549,28 @@ class RetrievalEngine:
                     results = []
                     for _slw_i, (concept_id, emb_score) in enumerate(raw_results):
                         # OPT-1c: Check at first iteration then every 10 (PERF-076 tightened)
-                        if _slw_i == 0 or (_slw_i % 10 == 0):
-                            if (_time_mod_slw.perf_counter() - _slw_start) > _slw_soft_timeout_s:
+                        if _slw_should_check_timeout(_slw_i):
+                            _slw_elapsed_ms = (_time_mod_slw.perf_counter() - _slw_start) * 1000.0
+                            if _slw_elapsed_ms > _slw_soft_timeout_s * 1000.0:
+                                _slw_timed_out = True
+                                _slw_stop = _slw_should_stop_for_timeout(_slw_i, len(results))
+                                _record_slw_soft_timeout(
+                                    "embedding",
+                                    _slw_i,
+                                    len(raw_results),
+                                    _slw_elapsed_ms,
+                                    len(results),
+                                    "stop" if _slw_stop else "materialize",
+                                )
                                 logger.warning(
                                     f"OPT-1c: search_lightweight soft timeout at iteration {_slw_i}/{len(raw_results)} "
-                                    f"({(_time_mod_slw.perf_counter() - _slw_start)*1000:.0f}ms > "
-                                    f"{_slw_soft_timeout_s*1000:.0f}ms) — returning {len(results)} partial results"
+                                    f"({_slw_elapsed_ms:.0f}ms > "
+                                    f"{_slw_soft_timeout_s * 1000:.0f}ms) — "
+                                    f"{'stopping' if _slw_stop else 'materializing emergency candidate'} with "
+                                    f"{len(results)} partial results"
                                 )
-                                _slw_timed_out = True
-                                break
+                                if _slw_stop:
+                                    break
                         if emb_score < MIN_RETRIEVAL_SIMILARITY:  # RETRIEVAL-031: raised from 0.15
                             continue
                         concept = _batch_cache.get(concept_id)  # PERF-076: dict lookup, not DB query
@@ -2161,16 +2615,31 @@ class RetrievalEngine:
         # ===== Phase 1.5: KA-aware boost (KA-ARCH-001 Fix 7) =====
         # OPT-1c: Skip enhancement phases if Phase 1 timed out — return core results fast.
         if _slw_timed_out and results:
-            # Still apply KA exclusion (critical for correctness) but skip boosts
+            # Still apply KA exclusion (critical for correctness) but skip expensive boosts.
             from app.core.config import RETRIEVAL_KA_EXCLUDE as _exc_ka
+
             if _exc_ka:
                 if not BENCHMARK.enabled:
                     results = [r for r in results if r.knowledge_area not in _exc_ka]
+            _apply_authority_artifact_boost(
+                results,
+                effective_query_text,
+                path="search_lightweight_timeout",
+            )
             results.sort(key=lambda r: (-r.relevance_score, r.concept_id))
             return results
 
-        if get_feature_flag("KA_AUTO_BOOST_ENABLED", False) and results:
-            inferred_kas = _infer_query_kas(query_text)
+        if results:
+            inferred_kas_set: set[str] = set()
+            if get_feature_flag("KA_AUTO_BOOST_ENABLED", False):
+                inferred_kas_set.update(_infer_query_kas(effective_query_text))
+            if (
+                get_feature_flag("QUERY_INTENT_EXPANSION_ENABLED", True)
+                and intent_expansion
+                and intent_expansion.inferred_kas
+            ):
+                inferred_kas_set.update(intent_expansion.inferred_kas)
+            inferred_kas = tuple(inferred_kas_set)
             if inferred_kas:
                 for result in results:
                     concept_ka = result.knowledge_area
@@ -2181,25 +2650,26 @@ class RetrievalEngine:
         # Exclude benchmark/test KAs from interactive retrieval.
         # Bypassed in benchmark mode. Config: PITH_RETRIEVAL_KA_EXCLUDE env var.
         from app.core.config import RETRIEVAL_KA_EXCLUDE
+
         if RETRIEVAL_KA_EXCLUDE and results:
             if not BENCHMARK.enabled:
                 _pre_exclude = len(results)
                 results = [r for r in results if r.knowledge_area not in RETRIEVAL_KA_EXCLUDE]
                 _excluded = _pre_exclude - len(results)
                 if _excluded > 0:
-                    logger.debug(f'RETRIEVAL-061: Excluded {_excluded} concepts from KAs {RETRIEVAL_KA_EXCLUDE}')
+                    logger.debug(f"RETRIEVAL-061: Excluded {_excluded} concepts from KAs {RETRIEVAL_KA_EXCLUDE}")
 
         # ===== Phase 2: Enhanced retrieval boosts (both paths) =====
         if ENHANCED_RETRIEVAL and results:
             scored = [(r.concept_id, r.relevance_score) for r in results]
             if _slw_trace is not None:
-                _slw_trace["predictive_activation"]["before_boost"] = (
-                    _mh262_predictive_activation_snapshot(predictive_activation)
+                _slw_trace["predictive_activation"]["before_boost"] = _mh262_predictive_activation_snapshot(
+                    predictive_activation
                 )
             scored = predictive_activation.boost_retrieval_scores(scored, boost_weight=0.15)
             if _slw_trace is not None:
-                _slw_trace["predictive_activation"]["after_boost"] = (
-                    _mh262_predictive_activation_snapshot(predictive_activation)
+                _slw_trace["predictive_activation"]["after_boost"] = _mh262_predictive_activation_snapshot(
+                    predictive_activation
                 )
                 _mh262_trace_score_stage(
                     _slw_trace,
@@ -2211,6 +2681,12 @@ class RetrievalEngine:
             for result in results:
                 if result.concept_id in score_dict:
                     result.relevance_score = score_dict[result.concept_id]
+
+        _apply_authority_artifact_boost(
+            results,
+            effective_query_text,
+            path="search_lightweight",
+        )
 
         # RETRIEVAL-037b v4.2: Deterministic tiebreaker — when governance scores
         # tie (common: many MAB facts share identical authority/currency/confidence),
@@ -2241,47 +2717,51 @@ class RetrievalEngine:
         Returns:
             Number of concepts added to the index.
         """
-        # Get all active concept IDs from storage
-        all_concepts = list_concepts_full()
-        storage_ids = {c.id for c in all_concepts}
+        with self._writer_admission("sync_index") as admit:
+            if not admit:
+                return 0
+            # Get all active concept IDs from storage
+            all_concepts = list_concepts_full()
+            storage_ids = {c.id for c in all_concepts}
 
-        # Get indexed concept IDs (exclude logically deleted rows)
-        indexed_ids = set()
-        for i, cid in enumerate(self.index.concept_ids):
-            if i not in self.index.deleted_indices:
-                indexed_ids.add(cid)
+            # Get indexed concept IDs (exclude logically deleted rows)
+            idx = self.index
+            indexed_ids = set()
+            for i, cid in enumerate(idx.concept_ids):
+                if i not in idx.deleted_indices:
+                    indexed_ids.add(cid)
 
-        # Find unindexed concepts
-        missing_ids = storage_ids - indexed_ids
-        if not missing_ids:
-            logger.info("sync_index: all concepts already indexed")
-            return 0
+            # Find unindexed concepts
+            missing_ids = storage_ids - indexed_ids
+            if not missing_ids:
+                logger.info("sync_index: all concepts already indexed")
+                return 0
 
-        logger.info(f"sync_index: {len(missing_ids)} concepts not in index, adding...")
+            logger.info(f"sync_index: {len(missing_ids)} concepts not in index, adding...")
 
-        # Suppress intermediate IDF recalcs during bulk add
-        original_threshold = self.index.idf_update_threshold
-        self.index.idf_update_threshold = len(missing_ids) + 100
+            # Suppress intermediate IDF recalcs during bulk add
+            original_threshold = self.index.idf_update_threshold
+            self.index.idf_update_threshold = len(missing_ids) + 100
 
-        added = 0
-        try:
-            concept_map = {c.id: c for c in all_concepts}
-            for cid in missing_ids:
-                concept = concept_map.get(cid)
-                if concept:
-                    searchable_text = self._concept_to_document(concept)
-                    if self.index.add_concept(cid, searchable_text):
-                        added += 1
-        finally:
-            self.index.idf_update_threshold = original_threshold
+            added = 0
+            try:
+                concept_map = {c.id: c for c in all_concepts}
+                for cid in missing_ids:
+                    concept = concept_map.get(cid)
+                    if concept:
+                        searchable_text = self._concept_to_document(concept)
+                        if self.index.add_concept(cid, searchable_text):
+                            added += 1
+            finally:
+                self.index.idf_update_threshold = original_threshold
 
-        # Single IDF recalculation over complete corpus
-        if added > 0:
-            self.index.force_idf_recalculation()
-            self._auto_save()
+            # Single IDF recalculation over complete corpus
+            if added > 0:
+                self.index.force_idf_recalculation()
+                self._auto_save()
 
-        logger.info(f"sync_index: added {added} concepts to index")
-        return added
+            logger.info(f"sync_index: added {added} concepts to index")
+            return added
 
     def pairwise_similarity(self, threshold: float = 0.12) -> list[tuple[str, str, float]]:
         """Compute all above-threshold concept pairs by cosine similarity.
@@ -2299,15 +2779,19 @@ class RetrievalEngine:
         """
         from sklearn.metrics.pairwise import cosine_similarity as sk_cosine
 
-        if self.index.tfidf_matrix is None or self.index.document_count == 0:
-            logger.warning("pairwise_similarity: empty index")
+        # Bind a local handle once: a concurrent rebuild+swap rebinds
+        # self.index atomically, so all multi-statement reads must use the
+        # same snapshot to avoid mismatched row indices.
+        idx = self.index
+        if idx.tfidf_matrix is None or idx.document_count == 0:
+            logger.debug("pairwise_similarity: empty index")
             return []
 
-        matrix = self.index.tfidf_matrix
+        matrix = idx.tfidf_matrix
         n_docs = matrix.shape[0]
 
         # Build set of valid (non-deleted) row indices
-        valid_indices = [i for i in range(n_docs) if i not in self.index.deleted_indices]
+        valid_indices = [i for i in range(n_docs) if i not in idx.deleted_indices]
         if len(valid_indices) < 2:
             return []
 
@@ -2324,8 +2808,8 @@ class RetrievalEngine:
                 score = float(sim_matrix[i_idx, j_idx])
                 if score >= threshold:
                     # Map back to concept IDs
-                    cid_a = self.index.concept_ids[valid_indices[i_idx]]
-                    cid_b = self.index.concept_ids[valid_indices[j_idx]]
+                    cid_a = idx.concept_ids[valid_indices[i_idx]]
+                    cid_b = idx.concept_ids[valid_indices[j_idx]]
                     # Normalize direction (sorted) to match edge storage normalization
                     source, target = sorted([cid_a, cid_b])
                     pairs.append((source, target, round(score, 4)))
@@ -2354,10 +2838,12 @@ class RetrievalEngine:
         # Active concept IDs from DB
         active_ids = set(list_concepts())
 
+        # Bind a local handle once (reader-safety against a concurrent swap).
+        idx = self.index
         # Indexed concept IDs (excluding logically deleted rows)
         indexed_ids = set()
-        for i, cid in enumerate(self.index.concept_ids):
-            if i not in self.index.deleted_indices:
+        for i, cid in enumerate(idx.concept_ids):
+            if i not in idx.deleted_indices:
                 indexed_ids.add(cid)
 
         ghost_ids = indexed_ids - active_ids  # in index but not active in DB
@@ -2396,6 +2882,23 @@ class RetrievalEngine:
         Returns:
             dict with ghosts_removed, orphans_added, dry_run status.
         """
+        with self._writer_admission("repair_index_drift") as admit:
+            if not admit:
+                # Resolve real integrity first so callers (server.py:4022 echoed
+                # to client; server.py:1166 logged) get an accurate snapshot.
+                post = integrity if integrity is not None else self.verify_index_integrity()
+                return {
+                    "status": "skipped_quiesce",
+                    "ghosts_removed": 0,
+                    "orphans_added": 0,
+                    "failed_ghosts": [],
+                    "failed_orphans": [],
+                    "dry_run": dry_run,
+                    "post_repair_integrity": post,
+                }
+            return self._repair_index_drift_inner(dry_run=dry_run, integrity=integrity)
+
+    def _repair_index_drift_inner(self, dry_run: bool = False, integrity: dict = None) -> dict:
         if integrity is None:
             integrity = self.verify_index_integrity()
 
@@ -2404,53 +2907,479 @@ class RetrievalEngine:
                 "status": "healthy",
                 "ghosts_removed": 0,
                 "orphans_added": 0,
+                "failed_ghosts": [],
+                "failed_orphans": [],
                 "dry_run": dry_run,
+                "post_repair_integrity": integrity,
             }
 
         ghosts_removed = 0
         orphans_added = 0
+        failed_ghosts = []
+        failed_orphans = []
 
         # Remove ghost entries
         for ghost_id in integrity["ghost_ids"]:
             if dry_run:
                 logger.info(f"[DRY RUN] Would remove ghost: {ghost_id}")
             else:
-                self.remove_concept(ghost_id)
-                logger.info(f"Removed ghost from index: {ghost_id}")
-            ghosts_removed += 1
-
-        if not dry_run and ghosts_removed > 0 and not integrity["orphan_ids"]:
-            self._auto_save()
+                try:
+                    self.remove_concept(ghost_id)
+                    ghosts_removed += 1
+                    logger.info(f"Removed ghost from index: {ghost_id}")
+                except Exception as e:
+                    failed_ghosts.append({"id": ghost_id, "error": str(e)})
+                    logger.warning(f"Index repair failed to remove ghost {ghost_id}: {e}")
 
         # Add orphan concepts
         if integrity["orphan_ids"]:
-            concepts = list_concepts_full()
-            concept_map = {c.id: c for c in concepts}
-
-            for orphan_id in integrity["orphan_ids"]:
-                concept = concept_map.get(orphan_id)
-                if not concept:
-                    continue
-                if dry_run:
+            if dry_run:
+                for orphan_id in integrity["orphan_ids"]:
                     logger.info(f"[DRY RUN] Would add orphan: {orphan_id}")
-                else:
-                    searchable_text = self._concept_to_document(concept)
-                    self.index.add_concept(orphan_id, searchable_text)
-                    logger.info(f"Added orphan to index: {orphan_id}")
-                orphans_added += 1
+            else:
+                concepts = list_concepts_full()
+                concept_map = {c.id: c for c in concepts}
 
-            if not dry_run and orphans_added > 0:
+                for orphan_id in integrity["orphan_ids"]:
+                    concept = concept_map.get(orphan_id)
+                    if not concept:
+                        failed_orphans.append({"id": orphan_id, "error": "concept_not_found"})
+                        continue
+                    try:
+                        searchable_text = self._concept_to_document(concept)
+                        added = self.index.add_concept(orphan_id, searchable_text)
+                        if not added:
+                            raise RuntimeError("index.add_concept returned False")
+                        orphans_added += 1
+                        logger.info(f"Added orphan to index: {orphan_id}")
+                    except Exception as e:
+                        failed_orphans.append({"id": orphan_id, "error": str(e)})
+                        logger.warning(f"Index repair failed to add orphan {orphan_id}: {e}")
+
+        if not dry_run and (ghosts_removed > 0 or orphans_added > 0):
+            if orphans_added > 0:
                 self.index.force_idf_recalculation()
-                self._auto_save()
+            self._auto_save()
+
+        post_repair_integrity = integrity if dry_run else self.verify_index_integrity()
+        if not dry_run:
+            failed_ghost_ids = {entry["id"] for entry in failed_ghosts}
+            remaining_ghosts = set(post_repair_integrity.get("ghost_ids", []))
+            for ghost_id in integrity["ghost_ids"]:
+                if ghost_id in remaining_ghosts and ghost_id not in failed_ghost_ids:
+                    failed_ghosts.append({"id": ghost_id, "error": "still_present_after_repair"})
+                    failed_ghost_ids.add(ghost_id)
+
+            failed_orphan_ids = {entry["id"] for entry in failed_orphans}
+            remaining_orphans = set(post_repair_integrity.get("orphan_ids", []))
+            for orphan_id in integrity["orphan_ids"]:
+                if orphan_id in remaining_orphans and orphan_id not in failed_orphan_ids:
+                    failed_orphans.append({"id": orphan_id, "error": "still_missing_after_repair"})
+                    failed_orphan_ids.add(orphan_id)
+
+        if dry_run:
+            status = "dry_run"
+        elif post_repair_integrity["is_healthy"]:
+            status = "repaired"
+        elif failed_ghosts or failed_orphans:
+            status = "partial"
+        else:
+            status = "incomplete"
 
         result = {
-            "status": "repaired" if not dry_run else "dry_run",
+            "status": status,
             "ghosts_removed": ghosts_removed,
             "orphans_added": orphans_added,
+            "failed_ghosts": failed_ghosts,
+            "failed_orphans": failed_orphans,
             "dry_run": dry_run,
+            "post_repair_integrity": post_repair_integrity,
         }
         logger.info(f"Index repair: {result}")
         return result
+
+    @staticmethod
+    def _recount_df_delta(index) -> int:
+        """Recompute document frequencies from per-doc term counts (non-deleted
+        rows only) and return the max absolute deviation from the index's stored
+        document_frequencies. 0 == perfectly consistent."""
+        recount: dict[str, int] = {}
+        for i, counts in enumerate(index.document_term_counts):
+            if i in index.deleted_indices:
+                continue
+            for term in counts or {}:
+                recount[term] = recount.get(term, 0) + 1
+        max_delta = 0
+        for term, term_id in index.vocabulary.items():
+            stored = int(index.document_frequencies[term_id]) if term_id < len(index.document_frequencies) else 0
+            delta = abs(stored - recount.get(term, 0))
+            if delta > max_delta:
+                max_delta = delta
+        return max_delta
+
+    def _count_gold_lexical_stale(self, index) -> int:
+        """Count gold-pair concepts classified lexical_stale against ``index``.
+
+        Reuses the read-only audit's build_audit() with index injected so the
+        verification uses the exact same staleness classifier as the live audit.
+        Returns -1 if the audit harness is unavailable (verification then relies
+        on the structural invariants only)."""
+        try:
+            from scripts.retrieval_stale_index_audit import CLASS_LEXICAL_STALE, build_audit
+        except Exception as exc:  # pragma: no cover - import guard
+            logger.warning(f"rebuild_and_swap_repair: stale audit unavailable: {exc}")
+            return -1
+        try:
+            from app.storage.utils import DB_PATH
+
+            db_path = Path(DB_PATH)
+        except Exception:
+            db_path = Path(resolve_data_dir()) / "pith.db"
+        gold_path = Path(__file__).resolve().parents[2] / "tests" / "eval" / "gold_pairs.json"
+        if not gold_path.exists() or not db_path.exists():
+            return -1
+        report = build_audit(
+            db_path=db_path,
+            gold_path=gold_path,
+            high_authority_limit=0,
+            index=index,
+        )
+        return sum(
+            1
+            for c in report.get("candidates", [])
+            if c.get("classification") == CLASS_LEXICAL_STALE and "gold" in (c.get("sources") or [])
+        )
+
+    def rebuild_and_swap_repair(self, *, dry_run: bool = False) -> dict:
+        """Rebuild the TF-IDF index into a fresh instance and atomically swap.
+
+        Two-layer quiesce:
+          Layer 2 (cross-process): hold the reflection.lock flock (NB) for the
+            whole window; if a reflection writer holds it, defer cleanly.
+          Layer 1 (in-process): quiesce_writers() freezes index_version while a
+            fresh index is built and verified before the atomic rebind.
+
+        MUST run in-process (via the runtime singleton). Restores the on-disk
+        backup on any exception after the backup is taken. Returns a report.
+        """
+        report: dict[str, Any] = {
+            "stale_before": None,
+            "stale_after": None,
+            "df_recount_delta": None,
+            "v0": None,
+            "duration_s": None,
+            "swapped": False,
+            "deferred": None,
+            "dry_run": dry_run,
+        }
+        t0 = time.perf_counter()
+
+        # --- Layer 2: cross-process reflection.lock flock (NB) ---
+        lock_dir = Path(resolve_data_dir()) / "locks"
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        lock_path = lock_dir / "reflection.lock"
+        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                report["deferred"] = "reflection_active"
+                return report
+
+            backup_path = None
+            backup_made = False
+            try:
+                # --- Backup live index dir (skip in dry_run) ---
+                v_for_backup = self.index.index_version
+                backup_path = f"{self.index_path}.repair-backup-{v_for_backup}"
+                if not dry_run and Path(self.index_path).exists():
+                    if Path(backup_path).exists():
+                        shutil.rmtree(backup_path)
+                    shutil.copytree(self.index_path, backup_path)
+                    backup_made = True
+
+                # --- Layer 1: quiesce + build fresh + verify + swap ---
+                with self.quiesce_writers():
+                    v0 = self.index.index_version
+                    report["v0"] = v0
+
+                    stale_before = self._count_gold_lexical_stale(self.index)
+                    report["stale_before"] = stale_before
+
+                    fresh = IncrementalTfidfIndex()
+                    self._build_into(fresh)
+
+                    # Verify the FRESH index before any swap.
+                    stale_after = self._count_gold_lexical_stale(fresh)
+                    report["stale_after"] = stale_after
+                    if stale_after > 0:
+                        raise RuntimeError(
+                            f"verify failed: {stale_after} gold concepts still lexical_stale after rebuild"
+                        )
+
+                    df_delta = self._recount_df_delta(fresh)
+                    report["df_recount_delta"] = df_delta
+                    if df_delta != 0:
+                        raise RuntimeError(f"verify failed: DF recount delta {df_delta} != 0")
+
+                    count = fresh.document_count
+                    dtc = len(fresh.document_term_counts)
+                    cids = len(fresh.concept_ids)
+                    if not (count == dtc == cids):
+                        raise RuntimeError(f"verify failed: consistency invariant count={count} dtc={dtc} cids={cids}")
+
+                    # No-writer assertion: a bypassing writer would have bumped this.
+                    assert self.index.index_version == v0, (
+                        f"no-writer assertion failed: index_version {self.index.index_version} != v0 {v0}"
+                    )
+
+                    if dry_run:
+                        report["swapped"] = False
+                    else:
+                        # Atomic rebind, then persist the fresh index on disk.
+                        self.index = fresh
+                        fresh.save(self.index_path)
+                        report["swapped"] = True
+
+                # Success — drop the (now stale) backup for a real swap.
+                if backup_made and not dry_run:
+                    try:
+                        shutil.rmtree(backup_path)
+                    except Exception:
+                        pass
+                return report
+
+            except BaseException:
+                # Restore the on-disk backup (atomic-ish) if we got that far.
+                if backup_made and backup_path and Path(backup_path).exists():
+                    try:
+                        if Path(self.index_path).exists():
+                            shutil.rmtree(self.index_path)
+                        shutil.move(backup_path, self.index_path)
+                        logger.warning("rebuild_and_swap_repair: restored on-disk backup after failure")
+                    except Exception as restore_exc:
+                        logger.error(f"rebuild_and_swap_repair: backup restore FAILED: {restore_exc}")
+                raise
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+                report["duration_s"] = round(time.perf_counter() - t0, 3)
+
+    def _refresh_concept_embedding(self, concept_id: str, searchable_text: str) -> bool:
+        """Re-embed an existing concept's searchable text and persist it.
+
+        Mirrors the embedding block in ``_add_concept_inner`` (norm guard,
+        ``update_embedding`` overwrite, SQLite persist) but for the refresh path:
+        the concept already has a (now stale) embedding, and
+        ``embedding_engine.update_embedding`` overwrites in place. Best-effort —
+        an embedding failure is logged and does NOT roll back the lexical refresh,
+        exactly as in the add path. Returns True if the embedding was persisted.
+        """
+        if not self._embeddings_initialized:
+            return False
+        try:
+            emb = embedding_engine.embed_text(searchable_text)
+            emb_norm = float(np.linalg.norm(emb))
+            if emb_norm < 0.5:
+                # STABILITY-008: never persist an all-zero/corrupt embedding.
+                logger.warning(f"refresh_concepts: rejecting embedding for {concept_id} (norm={emb_norm:.4f} < 0.5)")
+                return False
+            embedding_engine.update_embedding(concept_id, emb)
+            if not self._embeddings_available:
+                self._embeddings_available = True
+            from app.storage import _db_immediate
+
+            with _db_immediate() as conn:
+                conn.execute(
+                    "UPDATE concepts SET embedding = ?, embedding_version = ? WHERE id = ?",
+                    (emb.tobytes(), EMBEDDING_VERSION, concept_id),
+                )
+            return True
+        except Exception as e:
+            logger.warning(f"refresh_concepts: embedding refresh failed for {concept_id}: {e}")
+            return False
+
+    def refresh_concepts(
+        self,
+        concept_ids,
+        *,
+        persist: bool = True,
+        refresh_embeddings: bool = True,
+    ) -> dict:
+        """Refresh the stored representation of existing concepts in place.
+
+        RETRIEVAL-125 design §4.2 — the steady-state per-concept refresh lane
+        (Mode B), counterpart to the bulk clean-rebuild ``rebuild_and_swap_repair``
+        (Mode A). For each id: assemble searchable text via the shared
+        ``build_searchable_text`` helper, call ``index.refresh_concept`` (in-place
+        DTC update), then recompute DF from scratch (A1 — DF is derived, never
+        delta-maintained) and run one ``force_idf_recalculation`` over the batch.
+
+        Mandatory verify gates run in-memory BEFORE persisting; on any failure the
+        on-disk backup is restored and the in-memory index reloaded from it, so the
+        index is left byte-identical to its pre-refresh state:
+          * DF integrity: ``_recount_df_delta`` == 0 (the primary correctness gate).
+          * Consistency invariant: count == dtc == cids.
+          * Per-id parity: stored term counts == ``extract_terms(text)`` (overlap 1.0
+            by construction — a mismatch means refresh_concept silently no-op'd).
+          * No gold regression: gold lexical_stale count does not increase (sanity).
+          * No-writer assertion: index_version advanced ONLY by our refreshes.
+
+        Writers are quiesced (skip-not-block) for the whole sequence and a
+        cross-process reflection.lock flock prevents a concurrent rebuild; if a
+        reflection writer holds it, we defer cleanly.
+
+        Args:
+            concept_ids: existing concept ids to refresh.
+            persist: write the refreshed index to disk on success. persist=False
+                mutates only the in-memory index (no save, no backup, no rollback)
+                and is intended for throwaway copy-backed harness/offline engines,
+                NOT the live runtime singleton.
+            refresh_embeddings: also re-embed + persist embeddings (live SQLite write;
+                set False for copy/offline harness runs against a read-only DB).
+
+        Returns a report dict (refreshed / skipped / gate metrics / swapped).
+        """
+        report: dict[str, Any] = {
+            "refreshed": [],
+            "skipped": [],
+            "stale_before": None,
+            "stale_after": None,
+            "df_recount_delta": None,
+            "v0": None,
+            "swapped": False,
+            "embeddings_refreshed": 0,
+            "deferred": None,
+        }
+        t0 = time.perf_counter()
+        ids = list(dict.fromkeys(concept_ids))  # de-dup, preserve order
+        if not ids:
+            report["duration_s"] = 0.0
+            return report
+
+        lock_dir = Path(resolve_data_dir()) / "locks"
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        lock_path = lock_dir / "reflection.lock"
+        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                report["deferred"] = "reflection_active"
+                return report
+
+            backup_path = None
+            backup_made = False
+            try:
+                v_for_backup = self.index.index_version
+                backup_path = f"{self.index_path}.refresh-backup-{v_for_backup}"
+                if persist and Path(self.index_path).exists():
+                    if Path(backup_path).exists():
+                        shutil.rmtree(backup_path)
+                    shutil.copytree(self.index_path, backup_path)
+                    backup_made = True
+
+                with self.quiesce_writers():
+                    v0 = self.index.index_version
+                    report["v0"] = v0
+                    report["stale_before"] = self._count_gold_lexical_stale(self.index)
+
+                    # --- Refresh each id in place; remember texts for embeddings ---
+                    texts: dict[str, str] = {}
+                    for cid in ids:
+                        row = self._load_concept_row_for_index(cid)
+                        if row is None:
+                            report["skipped"].append({"id": cid, "reason": "not_current"})
+                            continue
+                        text = build_searchable_text(row)
+                        if not text.strip():
+                            report["skipped"].append({"id": cid, "reason": "empty_text"})
+                            continue
+                        if self.index.refresh_concept(cid, text):
+                            report["refreshed"].append(cid)
+                            texts[cid] = text
+                        else:
+                            report["skipped"].append({"id": cid, "reason": "not_in_index"})
+
+                    # --- A1: DF derived from scratch, then one IDF recalc over batch ---
+                    self.index.recompute_document_frequencies()
+                    self.index.force_idf_recalculation()
+
+                    # --- Mandatory verify gates (in-memory, before persist) ---
+                    report["stale_after"] = self._count_gold_lexical_stale(self.index)
+
+                    df_delta = self._recount_df_delta(self.index)
+                    report["df_recount_delta"] = df_delta
+                    if df_delta != 0:
+                        raise RuntimeError(f"verify failed: DF recount delta {df_delta} != 0")
+
+                    count = self.index.document_count
+                    dtc = len(self.index.document_term_counts)
+                    cids = len(self.index.concept_ids)
+                    if not (count == dtc == cids):
+                        raise RuntimeError(f"verify failed: consistency invariant count={count} dtc={dtc} cids={cids}")
+
+                    # Per-id parity: stored counts must equal a fresh extract of the
+                    # text we fed in (overlap 1.0). A mismatch means a silent no-op.
+                    for cid, text in texts.items():
+                        ridx = self.index.concept_id_to_idx.get(cid)
+                        if ridx is None or self.index.document_term_counts[ridx] != self.index.extract_terms(text):
+                            raise RuntimeError(f"verify failed: per-id parity mismatch for {cid}")
+
+                    # No gold regression (sanity; -1 == audit unavailable).
+                    sb, sa = report["stale_before"], report["stale_after"]
+                    if sb is not None and sa is not None and sb >= 0 and sa > sb:
+                        raise RuntimeError(f"verify failed: gold lexical_stale regressed {sb} -> {sa}")
+
+                    # No-writer assertion: only our N refreshes bumped the version.
+                    expected_v = v0 + len(report["refreshed"])
+                    if self.index.index_version != expected_v:
+                        raise RuntimeError(
+                            f"no-writer assertion failed: index_version "
+                            f"{self.index.index_version} != expected {expected_v}"
+                        )
+
+                    if persist:
+                        self.index.save(self.index_path)  # STABILITY-020 atomic swap
+                        report["swapped"] = True
+                    else:
+                        report["swapped"] = False
+
+                # --- Embeddings (best-effort, outside the quiesce window) ---
+                if persist and refresh_embeddings:
+                    for cid, text in texts.items():
+                        if self._refresh_concept_embedding(cid, text):
+                            report["embeddings_refreshed"] += 1
+
+                if backup_made:
+                    try:
+                        shutil.rmtree(backup_path)
+                    except Exception:
+                        pass
+                return report
+
+            except BaseException:
+                # Restore on-disk backup AND reload in-memory (it was mutated).
+                if backup_made and backup_path and Path(backup_path).exists():
+                    try:
+                        if Path(self.index_path).exists():
+                            shutil.rmtree(self.index_path)
+                        shutil.move(backup_path, self.index_path)
+                        restored = IncrementalTfidfIndex()
+                        if restored.load(self.index_path):
+                            self.index = restored
+                        logger.warning("refresh_concepts: restored on-disk backup + reloaded after failure")
+                    except Exception as restore_exc:
+                        logger.error(f"refresh_concepts: backup restore FAILED: {restore_exc}")
+                raise
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+                report["duration_s"] = round(time.perf_counter() - t0, 3)
 
 
 # Global instance - EXACT MATCH of original retrieval.py

@@ -45,6 +45,17 @@ _SELECTION_EXPLORATION_COUNT_RE = re.compile(
     r".{0,140}\b(?:want(?:ing|ed)?|planned|planning|plans?|goals?|explor(?:e|ing)|read(?:ing)?)\b",
     re.IGNORECASE,
 )
+_CLAIM_SUPPORT_SOURCE_RE = re.compile(
+    r"\b(?:(?:which|what)\s+source-backed\s+concept\s+supports?\s+this\s+claim(?:\s+set)?|"
+    r"source-backed\s+concept\s+supports?\s+this\s+claim(?:\s+set)?|"
+    r"supports?\s+this\s+claim\s+set)\b",
+    re.IGNORECASE,
+)
+_CLAIM_RELATION_SOURCE_RE = re.compile(
+    r"\b(?:(?:connect|show)\s+(?:the\s+)?related\s+concepts?\s+around\s+this\s+claim|"
+    r"related\s+concepts?\s+around\s+this\s+claim)\b",
+    re.IGNORECASE,
+)
 _PREFERENCE_NEGATIVE_RE = re.compile(
     r"\b(?:dislike|dislikes|don't like|do not like|not prefer|doesn't like|does not like|"
     r"hate|hates|avoid|avoids|tired of)\b",
@@ -269,6 +280,14 @@ class SourceSetTrace:
             }
             for c in payload["coverage"]
         ]
+        admission_miss_count = len(payload.get("debts") or ())
+        payload["admission_miss_count"] = admission_miss_count
+        if not payload.get("source_set_required"):
+            payload["row_break_class"] = "not_source_set_required"
+        elif admission_miss_count:
+            payload["row_break_class"] = "source_set_admission_gap"
+        else:
+            payload["row_break_class"] = "satisfied"
         return payload
 
 
@@ -552,6 +571,42 @@ def _plan_selection_slots(query: str, anchors: tuple[str, ...], cls: str) -> lis
     ]
 
 
+def _claim_payload_anchors(query: str, match: re.Match[str] | None) -> tuple[str, ...]:
+    if not match:
+        return ()
+    tail = (query or "")[match.end() :].lstrip()
+    if tail.startswith(":"):
+        tail = tail[1:].lstrip()
+    return _extract_anchors(tail)
+
+
+def _plan_claim_source_slots(query: str, cls: str) -> list[EvidenceSlot]:
+    """Plan source-set slots for explicit source-backed claim support queries."""
+    _ = cls
+    slots: list[EvidenceSlot] = []
+    support_match = _CLAIM_SUPPORT_SOURCE_RE.search(query or "")
+    support_anchors = _claim_payload_anchors(query, support_match)
+    if support_anchors:
+        slots.extend(
+            [
+                EvidenceSlot("claim_support_fact", "fact", True, support_anchors, ("claim_support",)),
+                EvidenceSlot("claim_support_source", "source", True, support_anchors, ("claim_support", "source")),
+            ]
+        )
+
+    relation_match = _CLAIM_RELATION_SOURCE_RE.search(query or "")
+    relation_anchors = _claim_payload_anchors(query, relation_match)
+    if relation_anchors:
+        slots.extend(
+            [
+                EvidenceSlot("claim_relation_anchor", "fact", True, relation_anchors, ("claim_relation",)),
+                EvidenceSlot("claim_relation_source", "source", True, relation_anchors, ("claim_relation", "source")),
+                EvidenceSlot("claim_relation_context", "fact", False, relation_anchors, ("claim_relation", "context")),
+            ]
+        )
+    return slots
+
+
 def _candidate_identity(item: Any, key: str) -> Any:
     direct = _value_get(item, key)
     if direct is not None and direct != "":
@@ -603,6 +658,7 @@ def plan_evidence_slots(query: str, classification: dict[str, Any] | None = None
     slots.extend(_plan_preference_slots(query, anchors, cls))
     slots.extend(_plan_advice_slots(query, anchors, cls))
     slots.extend(_plan_selection_slots(query, anchors, cls))
+    slots.extend(_plan_claim_source_slots(query, cls))
     slots.extend(_plan_aggregate_quantity_slots(query, anchors, cls))
 
     # Guard common marker-only activations. If the query is essentially just a

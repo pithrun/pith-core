@@ -79,7 +79,7 @@ def _bootstrap_mcp_imports():
                 "claude_desktop_config.json to point at an interpreter with "
                 "`mcp>=1.0.0,<2.0.0` installed (e.g. ~/.pith/venv/bin/python3)."
             ),
-            "doctor_command": "bash ~/.pith/scripts/pith_mcp_doctor.sh --auto-repair",
+            "doctor_command": "bash ~/.pith/pith-server/scripts/pith_mcp_doctor.sh --auto-repair",
         }
         diag_path = Path.home() / ".pith" / "diagnostics" / "mcp_bridge_failure.json"
         try:
@@ -164,6 +164,48 @@ logger = logging.getLogger("pith_mcp")
 
 BRIDGE_NAME = "python_mcp"
 BRIDGE_PROFILE = os.getenv("PITH_PROFILE") or os.getenv("BRAIN_PROFILE") or "default"
+SURFACE_ID_VALUES = frozenset(
+    {
+        "claude_code",
+        "codex_local_api",
+        "claude_desktop_mcp",
+        "cursor_mcp",
+        "cline_mcp",
+        "local_api_cli",
+        "vscode_copilot_mcp",
+        "windsurf_mcp",
+    }
+)
+
+
+def _normalize_bridge_surface_id(value: str | None) -> str:
+    cleaned = (value or "").strip().lower()
+    return cleaned if cleaned in SURFACE_ID_VALUES else ""
+
+
+BRIDGE_SURFACE_ID = _normalize_bridge_surface_id(os.getenv("PITH_SURFACE_ID"))
+BRIDGE_PLATFORM_HINT = os.getenv("PITH_PLATFORM_HINT", "").strip()
+MCP_CONVERSATION_TURN_COMPACT_MAX_CHARS = 12000
+MCP_CONVERSATION_TURN_FULL_MAX_CHARS = 50000
+
+# RUNG0 Component C (A8): per-origin authorship trust-tier. The Rung-0 loop's launchd
+# unit sets PITH_PROVENANCE=agent_loop on ITS bridge process only; the human's bridge
+# leaves it unset → 'human'. This is a transport-level marker, deliberately NOT a
+# conversation_turn tool argument, so the in-turn model cannot read or forge it.
+# Must match app.core.constants.PROVENANCE_VALUES (intentional duplication: the thin
+# bridge must not import app internals — keep the two sets in sync).
+_VALID_PROVENANCE = {"human", "agent_loop"}
+_raw_provenance = os.getenv("PITH_PROVENANCE", "").strip()
+if _raw_provenance and _raw_provenance not in _VALID_PROVENANCE:
+    print(
+        f"PITH_PROVENANCE='{_raw_provenance}' is not a recognized trust-tier "
+        f"{sorted(_VALID_PROVENANCE)} — ignoring (concepts will be tagged 'human'). "
+        f"This silently disables the Rung-0 authority cap; fix the env value.",
+        file=sys.stderr,
+        flush=True,
+    )
+    _raw_provenance = ""
+BRIDGE_PROVENANCE = _raw_provenance or "human"
 BRIDGE_OUTBOX_DIR = Path.home() / ".pith" / "state" / "bridge_outbox" / BRIDGE_NAME
 _bridge_outbox_drain_lock: asyncio.Lock | None = None
 
@@ -613,10 +655,64 @@ Pith gets smarter with every conversation. Your job is to feed it quality knowle
 # --- Client-side state (C1, L3, L4) ---
 SESSION_IDLE_TIMEOUT_S = 2 * 60 * 60  # 2 hours
 
+
+def _lifecycle_seconds_env(name: str, default: int, *, min_value: int, max_value: int, allow_zero: bool = False) -> int:
+    """Read a bounded lifecycle seconds override from the environment."""
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("LIFECYCLE: Ignoring invalid %s=%r; using %ss", name, raw, default)
+        return default
+    if allow_zero and value == 0:
+        return 0
+    if value < min_value:
+        logger.warning("LIFECYCLE: Clamping %s=%ss up to %ss", name, value, min_value)
+        return min_value
+    if value > max_value:
+        logger.warning("LIFECYCLE: Clamping %s=%ss down to %ss", name, value, max_value)
+        return max_value
+    return value
+
+
+def _lifecycle_bool_env(name: str, default: bool) -> bool:
+    """Read a lifecycle boolean override from the environment."""
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
 # --- Process lifecycle (separate from session lifecycle) ---
 # Session timeout controls the Pith logical session; process timeout controls the OS process.
-PROCESS_IDLE_TIMEOUT_S = 600  # 10 min no tool call -> self-exit
-PROCESS_MAX_AGE_S = 14400  # 4 hour hard ceiling
+CONNECTED_IDLE_TIMEOUT_S = _lifecycle_seconds_env(
+    "PITH_MCP_CONNECTED_IDLE_TIMEOUT_S",
+    0,
+    min_value=15 * 60,
+    max_value=24 * 60 * 60,
+    allow_zero=True,
+)  # 0 disables connected idle self-exit; max-age remains bounded.
+CONNECTED_MAX_AGE_S = _lifecycle_seconds_env(
+    "PITH_MCP_CONNECTED_MAX_AGE_S",
+    72 * 60 * 60,
+    min_value=60 * 60,
+    max_value=7 * 24 * 60 * 60,
+)
+CONNECTED_MAX_AGE_FORCE_EXIT = _lifecycle_bool_env("PITH_MCP_FORCE_MAX_AGE_EXIT", False)
+HOST_SIGNAL_DEFERRAL_ENABLED = _lifecycle_bool_env("PITH_MCP_DEFER_HOST_SIGNALS", True)
+REAP_STALE_IDLE_S = _lifecycle_seconds_env(
+    "PITH_MCP_REAP_STALE_IDLE_S",
+    60 * 60,
+    min_value=15 * 60,
+    max_value=24 * 60 * 60,
+)
+LEGACY_REAP_AGE_S = _lifecycle_seconds_env(
+    "PITH_MCP_LEGACY_REAP_AGE_S",
+    60 * 60,
+    min_value=15 * 60,
+    max_value=24 * 60 * 60,
+)
 WATCHDOG_INTERVAL_S = 30  # check frequency
 HEARTBEAT_DIR = os.path.expanduser("~/.pith/run")
 CONVERSATION_BOUNDARY_S = 2 * 60  # 2 minutes — new conversation detection
@@ -668,6 +764,11 @@ _state = {
     "bridge_start_time": None,
     "original_ppid": None,
     "shutdown_initiated": False,
+    "host_transport_open": False,
+    "deferred_signal_counts": {},
+    "deferred_signal_total": 0,
+    "last_deferred_signal": None,
+    "connected_max_age_reported": False,
 }
 
 BLOCKING_WORKSPACE_FINDING_CODES = {"DUPLICATE_BRANCH_OWNER", "REGISTRY_NOT_LIVE", "MISSING_PATH"}
@@ -1200,6 +1301,20 @@ def _reset_client():
     logger.info("HTTP client reset — next call will create fresh connection")
 
 
+def _api_timeout_for_endpoint(endpoint: str) -> float:
+    """Per-endpoint bridge timeout. Reflection is the one synchronous endpoint
+    that can exceed the 30s default at scale, so it gets longer, env-tunable
+    budgets while every other endpoint keeps the 30s default."""
+    if endpoint.startswith("/pith_reflect"):
+        if "mode=full" in endpoint:
+            return float(os.environ.get("PITH_MCP_FULL_REFLECT_TIMEOUT_S", "180"))
+        # STOPGAP (REFLECT-INCR): incremental reflection is synchronous and can
+        # approach the 30s default at ~26k concepts. The durable fix is the
+        # forgetting SQL pushdown (A1); this env override is short-term headroom.
+        return float(os.environ.get("PITH_MCP_INCREMENTAL_REFLECT_TIMEOUT_S", "60"))
+    return 30.0
+
+
 async def call_pith_api(
     endpoint: str,
     method: str = "GET",
@@ -1215,10 +1330,17 @@ async def call_pith_api(
     for attempt in range(max_retries):
         client = _get_client()
         try:
+            request_timeout = _api_timeout_for_endpoint(endpoint)
             if method == "GET":
-                resp = await client.get(endpoint)
+                if request_timeout == 30.0:
+                    resp = await client.get(endpoint)
+                else:
+                    resp = await client.get(endpoint, timeout=request_timeout)
             else:
-                resp = await client.post(endpoint, json=body)
+                if request_timeout == 30.0:
+                    resp = await client.post(endpoint, json=body)
+                else:
+                    resp = await client.post(endpoint, json=body, timeout=request_timeout)
 
             if not resp.is_success:
                 error_text = resp.text
@@ -1992,6 +2114,31 @@ TOOL_DEFINITIONS: list[dict] = [
                     "enum": ["strict", "balanced", "permissive"],
                     "description": "How conservatively the server should present candidate working context.",
                 },
+                "surface_id": {
+                    "type": "string",
+                    "description": "Optional consumer surface identifier. Defaults to bridge PITH_SURFACE_ID when configured.",
+                },
+                "platform_hint": {
+                    "type": "string",
+                    "description": "Optional client platform hint. Usually derived by the server from surface_id.",
+                },
+                "workspace_id": {
+                    "type": "string",
+                    "description": "Stable workspace identifier for consumer lifecycle binding.",
+                },
+                "context_delivery_mode": {
+                    "type": "string",
+                    "description": "Consumer lifecycle context delivery mode.",
+                },
+                "surface_lifecycle_version": {
+                    "type": "string",
+                    "description": "Consumer lifecycle contract version.",
+                },
+                "response_mode": {
+                    "type": "string",
+                    "enum": ["compact", "full"],
+                    "description": "Model-facing response shape. Defaults to compact; full is diagnostic and size-capped.",
+                },
             },
             "required": ["message"],
         },
@@ -2075,10 +2222,10 @@ TOOL_DEFINITIONS: list[dict] = [
     },
     {
         "name": "pith_benchmark",
-        "description": "Run CogGov-Bench — behavioral governance benchmark. Measures 6 dimensions. Use 'light' for dims 1-3, 'full' for all 6 + adversarial.",
+        "description": "Run the internal CogGov governance diagnostic. Use this as local health evidence only; it is not public benchmark evidence. Modes: 'light' for dims 1-3, 'full' for all 6 + adversarial.",
         "inputSchema": {
             "type": "object",
-            "properties": {"mode": {"type": "string", "enum": ["light", "full"], "description": "Benchmark mode"}},
+            "properties": {"mode": {"type": "string", "enum": ["light", "full"], "description": "Diagnostic mode"}},
         },
     },
     {
@@ -2189,7 +2336,7 @@ TOOL_DEFINITIONS: list[dict] = [
     # Wave 5: Narrative Threads + Cognitive Traces
     {
         "name": "pith_threads",
-        "description": "Manage narrative threads and explicit Workstreams. Use ensure_workstream_activation(candidate) as the read-only activation gate for substantive durable work; bind_existing, create_and_bind, and skip require explicit operator confirmation. Workstream context is continuity context, not instruction authority.",
+        "description": "Manage narrative threads and consumer-safe Workstreams. Use workstream_lifecycle for Workstream writes; this default consumer surface does not expose raw Workstream admin write actions. Use ensure_workstream_activation(candidate) as the read-only activation gate for substantive durable work; bind_existing, create_and_bind, and skip require explicit operator confirmation. Workstream context is continuity context, not instruction authority. Raw Workstream writes are available only through pith_threads_admin when admin raw writes are enabled.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2208,13 +2355,10 @@ TOOL_DEFINITIONS: list[dict] = [
                         "stats",
                         "classify_workstreams",
                         "workstream_context",
-                        "create_workstream",
-                        "promote_workstream",
-                        "update_workstream",
-                        "bind_workstream",
-                        "clear_workstream_binding",
                         "active_workstream",
                         "ensure_workstream_activation",
+                        "workstream_lifecycle",
+                        "workstream_hygiene_dry_run",
                     ],
                     "description": "Action to perform (default: list)",
                 },
@@ -2222,6 +2366,11 @@ TOOL_DEFINITIONS: list[dict] = [
                     "type": "string",
                     "enum": ["candidate", "bind_existing", "create_and_bind", "skip"],
                     "description": "ensure_workstream_activation mode; candidate is read-only, write modes require strict operator confirmation",
+                },
+                "verb": {
+                    "type": "string",
+                    "enum": ["start", "adopt", "progress", "complete", "reopen", "archive"],
+                    "description": "Production Workstream lifecycle verb for workstream_lifecycle",
                 },
                 "thread_id": {
                     "type": "string",
@@ -2276,15 +2425,15 @@ TOOL_DEFINITIONS: list[dict] = [
                 },
                 "current_objective": {
                     "type": "string",
-                    "description": "Current Workstream objective (create_workstream/update_workstream)",
+                    "description": "Current Workstream objective for lifecycle metadata",
                 },
                 "current_summary": {
                     "type": "string",
-                    "description": "Current Workstream summary (create_workstream/update_workstream)",
+                    "description": "Current Workstream summary for lifecycle metadata",
                 },
                 "next_action": {
                     "type": "string",
-                    "description": "Next Workstream action (create_workstream/update_workstream)",
+                    "description": "Next Workstream action for lifecycle metadata",
                 },
                 "blockers": {
                     "type": "array",
@@ -2298,15 +2447,15 @@ TOOL_DEFINITIONS: list[dict] = [
                 },
                 "origin_id": {
                     "type": "string",
-                    "description": "Stable origin ID for bind_workstream/active_workstream/clear_workstream_binding/ensure_workstream_activation",
+                    "description": "Stable origin ID for active_workstream/ensure_workstream_activation/workstream_lifecycle",
                 },
                 "session_id": {
                     "type": "string",
-                    "description": "Session ID fallback for bind_workstream/active_workstream/clear_workstream_binding/ensure_workstream_activation",
+                    "description": "Session ID fallback for active_workstream/ensure_workstream_activation/workstream_lifecycle",
                 },
                 "current_task_id": {
                     "type": "string",
-                    "description": "Current task ID for bind_workstream/active_workstream/clear_workstream_binding/ensure_workstream_activation exact authority",
+                    "description": "Current task ID for exact Workstream authority",
                 },
                 "metadata": {
                     "type": "object",
@@ -2326,14 +2475,67 @@ TOOL_DEFINITIONS: list[dict] = [
                 },
                 "op_id": {
                     "type": "number",
-                    "description": "Optional monotonic operation ID for idempotent bind_workstream writes",
+                    "description": "Optional monotonic operation ID for idempotent lifecycle writes",
                 },
                 "payload_hash": {
                     "type": "string",
-                    "description": "Optional payload hash for idempotent bind_workstream writes",
+                    "description": "Optional payload hash for idempotent lifecycle writes",
+                },
+                "request_id": {
+                    "type": "string",
+                    "description": "Optional lifecycle trace ID; Phase 1 does not provide durable request-id replay protection",
                 },
                 "created_by": {"type": "string", "description": "Workstream creator marker (default: user)"},
                 "updated_by": {"type": "string", "description": "Workstream updater marker (default: user)"},
+            },
+            "required": ["action"],
+        },
+    },
+    {
+        "name": "pith_threads_admin",
+        "description": "Admin/debug Workstream raw write surface. Use only for explicit repair or operator-controlled curation when WORKSTREAMS_WRITE_ENABLED/admin_raw_writes_enabled is true. Default consumers should use pith_threads with workstream_lifecycle instead.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": [
+                        "create_workstream",
+                        "promote_workstream",
+                        "update_workstream",
+                        "bind_workstream",
+                        "clear_workstream_binding",
+                        "workstream_hygiene_apply",
+                        "workstream_hygiene_rollback",
+                        "workstream_promote_discovery_candidate",
+                        "workstream_demote_discovery_candidate",
+                    ],
+                    "description": "Raw admin Workstream action",
+                },
+                "thread_id": {"type": "string", "description": "Thread ID for raw admin Workstream actions"},
+                "title": {"type": "string", "description": "Workstream title for create_workstream"},
+                "description": {"type": "string", "description": "Thread description (optional)"},
+                "urgency": {"type": "string", "enum": ["low", "normal", "high"], "description": "Thread urgency tier"},
+                "goal_ids": {"type": "array", "items": {"type": "string"}, "description": "Goal IDs to associate"},
+                "knowledge_areas": {"type": "array", "items": {"type": "string"}, "description": "Knowledge areas to associate"},
+                "current_objective": {"type": "string", "description": "Current Workstream objective"},
+                "current_summary": {"type": "string", "description": "Current Workstream summary"},
+                "next_action": {"type": "string", "description": "Next Workstream action"},
+                "blockers": {"type": "array", "items": {"type": "string"}, "description": "Current Workstream blockers"},
+                "quality_state": {"type": "string", "enum": ["ok", "needs_review", "blocked"], "description": "Workstream quality state"},
+                "origin_id": {"type": "string", "description": "Stable origin ID for raw binding repair"},
+                "session_id": {"type": "string", "description": "Session ID fallback for raw binding repair"},
+                "current_task_id": {"type": "string", "description": "Current task ID for exact binding repair"},
+                "operator_confirmed": {"type": "boolean", "description": "Strict operator confirmation for admin/hygiene writes"},
+                "evaluated_at": {"type": "string", "description": "Dry-run evaluated_at timestamp required for workstream_hygiene_apply"},
+                "fingerprints": {"type": "object", "description": "Dry-run fingerprints required for workstream_hygiene_apply"},
+                "proposed_states": {"type": "object", "description": "Dry-run proposed discovery states required for workstream_hygiene_apply"},
+                "promotion_reason": {"type": "string", "description": "Required reason for workstream_promote_discovery_candidate"},
+                "reason": {"type": "string", "description": "Required reason for workstream_demote_discovery_candidate"},
+                "op_id": {"type": "number", "description": "Optional monotonic operation ID for idempotent raw binding writes"},
+                "payload_hash": {"type": "string", "description": "Optional payload hash for idempotent raw binding writes"},
+                "created_by": {"type": "string", "description": "Workstream creator marker"},
+                "updated_by": {"type": "string", "description": "Workstream updater marker"},
             },
             "required": ["action"],
         },
@@ -2714,10 +2916,23 @@ async def _handle_tool(name: str, args: dict) -> dict:
         violation = _workspace_protocol_violation(workspace_context)
         if violation is not None:
             return violation
-        await ensure_session("conversation_turn")
+        try:
+            origin_id = _infer_origin_id(args)
+        except ValueError as exc:
+            return {"error": str(exc)}
+        surface_id = _normalize_bridge_surface_id(args.get("surface_id")) or BRIDGE_SURFACE_ID
+        requested_session_id = args.get("session_id") or None
+        explicit_claude_code_origin = surface_id == "claude_code" and bool(origin_id)
+        if not requested_session_id and not explicit_claude_code_origin:
+            await ensure_session("conversation_turn")
         # Idle timeout check
         now = time.time()
-        if _state["last_session_activity"] and (now - _state["last_session_activity"]) > SESSION_IDLE_TIMEOUT_S:
+        if (
+            not requested_session_id
+            and not explicit_claude_code_origin
+            and _state["last_session_activity"]
+            and (now - _state["last_session_activity"]) > SESSION_IDLE_TIMEOUT_S
+        ):
             if _state["learning_debt"] > 0:
                 logger.warning(f"L3: Idle timeout (conversation_turn) with debt {_state['learning_debt']}")
             await call_pith_api("/session_end", "POST")
@@ -2727,14 +2942,17 @@ async def _handle_tool(name: str, args: dict) -> dict:
             _state["total_calls_since_session_start"] = 0
             _state["last_conv_turn_args"] = None
 
-        session_id = args.get("session_id")
-        if session_id is None:
+        session_id = requested_session_id
+        if session_id is None and not explicit_claude_code_origin:
             session_id = _state.get("cached_session_id")
-
-        try:
-            origin_id = _infer_origin_id(args)
-        except ValueError as exc:
-            return {"error": str(exc)}
+        if session_id is None and explicit_claude_code_origin:
+            _transport_event(
+                "cached_session_ignored_for_explicit_surface_origin",
+                tool_name="pith_conversation_turn",
+                cached_session_id=_state.get("cached_session_id"),
+                requested_surface_id=surface_id,
+                origin_id_present=True,
+            )
 
         ct_payload = {
             "message": args["message"],
@@ -2746,6 +2964,18 @@ async def _handle_tool(name: str, args: dict) -> dict:
             "current_task_id": args.get("current_task_id"),
             "context_authority_mode": args.get("context_authority_mode", "balanced"),
         }
+        if surface_id:
+            ct_payload["surface_id"] = surface_id
+        platform_hint = (args.get("platform_hint") or BRIDGE_PLATFORM_HINT).strip()
+        if platform_hint:
+            ct_payload["platform_hint"] = platform_hint
+        for lifecycle_key in ("workspace_id", "context_delivery_mode", "surface_lifecycle_version"):
+            if args.get(lifecycle_key):
+                ct_payload[lifecycle_key] = args[lifecycle_key]
+        # RUNG0 Component C (A8): stamp this origin's trust-tier. Only sent when non-default
+        # so human bridges keep the wire payload unchanged and rely on the server default.
+        if BRIDGE_PROVENANCE != "human":
+            ct_payload["provenance"] = BRIDGE_PROVENANCE
         inferred_context_telemetry = _infer_codex_context_telemetry(args)
         if "compaction_detected" in args:
             ct_payload["compaction_detected"] = args.get("compaction_detected")
@@ -2780,6 +3010,9 @@ async def _handle_tool(name: str, args: dict) -> dict:
         result = await call_pith_api("/conversation_turn", "POST", ct_payload)
         _apply_active_workstream_render_decision(result, args)
         if result and not result.get("error"):
+            resolved_session_id = result.get("resolved_session_id")
+            if requested_session_id and resolved_session_id == requested_session_id:
+                _state["cached_session_id"] = resolved_session_id
             _state["last_session_activity"] = time.time()
         return result
 
@@ -2809,6 +3042,11 @@ async def _handle_tool(name: str, args: dict) -> dict:
             "knowledge_area": args.get("knowledge_area", "conversation"),
             "auto_associate": args.get("auto_associate", True),
         }
+        # RUNG0 Component C (A8): same per-origin tier for the direct-learn surface.
+        # No-op for Stage 1 (session_learn is not in the loop allowlist) — present so a
+        # future allowlist widening cannot silently bypass the cap.
+        if BRIDGE_PROVENANCE != "human":
+            learn_payload["provenance"] = BRIDGE_PROVENANCE
 
         # P0.2: Dual-format extracted_concepts
         concepts, source = _parse_extracted_concepts(args)
@@ -2948,6 +3186,9 @@ async def _handle_tool(name: str, args: dict) -> dict:
     if name == "pith_threads":
         return await call_pith_api("/pith_threads", "POST", args)
 
+    if name == "pith_threads_admin":
+        return await call_pith_api("/pith_threads", "POST", args)
+
     if name == "pith_traces":
         return await call_pith_api("/pith_traces", "POST", args)
 
@@ -3044,6 +3285,99 @@ async def list_tools() -> list[Tool]:
     ]
 
 
+def _compact_concepts(concepts: Any) -> list[dict[str, Any]]:
+    if not isinstance(concepts, list):
+        return []
+    compacted: list[dict[str, Any]] = []
+    for concept in concepts[:3]:
+        if not isinstance(concept, dict):
+            continue
+        compacted.append(
+            {
+                "concept_id": concept.get("concept_id") or concept.get("id"),
+                "summary": str(concept.get("summary") or "")[:500],
+            }
+        )
+    return compacted
+
+
+def _conversation_turn_identity_envelope(
+    result: dict[str, Any],
+    *,
+    request_args: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    request_args = request_args or {}
+    return {
+        "resolved_session_id": result.get("resolved_session_id"),
+        "bind_status": result.get("bind_status"),
+        "binding_source": result.get("binding_source"),
+        "origin_id": result.get("origin_id") or request_args.get("origin_id"),
+        "surface_id": result.get("surface_id") or request_args.get("surface_id") or BRIDGE_SURFACE_ID,
+        "platform_hint": result.get("platform_hint") or request_args.get("platform_hint") or BRIDGE_PLATFORM_HINT,
+        "workspace_id": result.get("workspace_id") or request_args.get("workspace_id"),
+        "context_delivery_mode": result.get("context_delivery_mode") or request_args.get("context_delivery_mode"),
+        "surface_lifecycle_version": result.get("surface_lifecycle_version")
+        or request_args.get("surface_lifecycle_version"),
+    }
+
+
+def _compact_conversation_turn_result(
+    result: dict[str, Any],
+    *,
+    request_args: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    request_args = request_args or {}
+    identity = _conversation_turn_identity_envelope(result, request_args=request_args)
+    return {
+        "response_mode": "compact",
+        "full_response_omitted": True,
+        **identity,
+        "is_first_call": result.get("is_first_call"),
+        "is_resumption": result.get("is_resumption"),
+        "activation_count": result.get("activation_count"),
+        "activated_concepts": _compact_concepts(result.get("activated_concepts")),
+        "auto_learned": result.get("auto_learned"),
+        "checkpoint_suggested": result.get("checkpoint_suggested"),
+        "active_workstream_render": result.get("active_workstream_render"),
+        "workstream_activation_gate": result.get("workstream_activation_gate"),
+        "_protocol": result.get("_protocol"),
+    }
+
+
+def _render_tool_json(name: str, arguments: dict, result: Any) -> str:
+    if name != "pith_conversation_turn" or not isinstance(result, dict):
+        return json.dumps(result, indent=2, default=str)
+    response_mode = str((arguments or {}).get("response_mode") or "compact").lower()
+    if response_mode == "full":
+        full_payload = {
+            "response_mode": "full",
+            "identity": _conversation_turn_identity_envelope(result, request_args=arguments),
+            "result": result,
+            **result,
+        }
+        rendered = json.dumps(full_payload, indent=2, default=str)
+        if len(rendered) <= MCP_CONVERSATION_TURN_FULL_MAX_CHARS:
+            return rendered
+        return json.dumps(
+            {
+                "response_mode": "full",
+                "truncated": True,
+                "truncated_at_chars": MCP_CONVERSATION_TURN_FULL_MAX_CHARS,
+                **_conversation_turn_identity_envelope(result, request_args=arguments),
+                "text": rendered[:MCP_CONVERSATION_TURN_FULL_MAX_CHARS],
+            },
+            indent=2,
+            default=str,
+        )
+    compact = _compact_conversation_turn_result(result, request_args=arguments)
+    rendered = json.dumps(compact, indent=2, default=str)
+    if len(rendered) <= MCP_CONVERSATION_TURN_COMPACT_MAX_CHARS:
+        return rendered
+    compact["truncated"] = True
+    compact["activated_concepts"] = []
+    return json.dumps(compact, indent=2, default=str)
+
+
 @mcp_server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     """Handle tool call with protocol enforcement and bootstrap injection."""
@@ -3123,7 +3457,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         active_workstream_block = _active_workstream_rendered_block_for_response(name, result)
         if active_workstream_block:
             content_blocks.append(TextContent(type="text", text=active_workstream_block))
-        content_blocks.append(TextContent(type="text", text=json.dumps(result, indent=2, default=str)))
+        content_blocks.append(TextContent(type="text", text=_render_tool_json(name, arguments, result)))
 
         # L4: Cognitive bootstrap injection (one-shot)
         if _state["pending_bootstrap_orientation"] and name != "pith_session_start":
@@ -3171,6 +3505,11 @@ def _bridge_status() -> dict[str, Any]:
         "current_pid": os.getpid(),
         "current_ppid": os.getppid(),
         "api_url": PITH_API_URL,
+        "host_transport_open": bool(_state.get("host_transport_open")),
+        "deferred_signal_counts": dict(_state.get("deferred_signal_counts") or {}),
+        "deferred_signal_total": int(_state.get("deferred_signal_total") or 0),
+        "last_deferred_signal": _state.get("last_deferred_signal"),
+        "connected_max_age_exit_enabled": bool(CONNECTED_MAX_AGE_FORCE_EXIT),
         "runtime_path": str(runtime_path),
         "transport_log_path": TRANSPORT_LOG_PATH,
         "transport_state_path": TRANSPORT_STATE_PATH,
@@ -3256,11 +3595,81 @@ def _parse_etime(etime: str) -> float | None:
     return None
 
 
+def _heartbeat_freshness_s(hb: dict[str, Any], fpath: str, now: float) -> float | None:
+    heartbeat_at = hb.get("heartbeat_at")
+    if heartbeat_at is not None:
+        try:
+            return now - float(heartbeat_at)
+        except (TypeError, ValueError):
+            pass
+    try:
+        return now - os.path.getmtime(fpath)
+    except OSError:
+        return None
+
+
+def _heartbeat_parent_attached(hb: dict[str, Any]) -> bool:
+    ppid = hb.get("ppid")
+    original_ppid = hb.get("original_ppid")
+    return bool(ppid and original_ppid and ppid == original_ppid and ppid != 1)
+
+
+def _host_parent_attached(current_ppid: int | None = None, original_ppid: int | None = None) -> bool:
+    """Return whether this bridge is still attached to the original host process."""
+    if current_ppid is None:
+        current_ppid = os.getppid()
+    if original_ppid is None:
+        original_ppid = _state.get("original_ppid")
+    return bool(current_ppid and original_ppid and current_ppid == original_ppid and current_ppid != 1)
+
+
+def _should_defer_host_signal(
+    sig_name: str,
+    *,
+    state: dict[str, Any] | None = None,
+    current_ppid: int | None = None,
+) -> bool:
+    """Return whether a host signal should be treated as advisory while attached."""
+    if not HOST_SIGNAL_DEFERRAL_ENABLED:
+        return False
+    if sig_name not in {"SIGTERM", "SIGHUP"}:
+        return False
+    state = state or _state
+    if state.get("shutdown_initiated"):
+        return False
+    if not state.get("host_transport_open"):
+        return False
+    return _host_parent_attached(current_ppid=current_ppid, original_ppid=state.get("original_ppid"))
+
+
+def _record_deferred_host_signal(sig_name: str) -> None:
+    """Persist a benign host signal without closing the MCP transport."""
+    now = _transport_iso_now()
+    counts = dict(_state.get("deferred_signal_counts") or {})
+    counts[sig_name] = int(counts.get(sig_name) or 0) + 1
+    _state["deferred_signal_counts"] = counts
+    _state["deferred_signal_total"] = int(_state.get("deferred_signal_total") or 0) + 1
+    _state["last_deferred_signal"] = {
+        "signal": sig_name,
+        "observed_at": now,
+        "ppid": os.getppid(),
+        "reason": "host_attached_transport_open",
+    }
+    logger.info("LIFECYCLE: Deferred %s while host transport remains attached", sig_name)
+    _transport_event("host_signal_deferred", signal=sig_name, deferred_signal_total=_state["deferred_signal_total"])
+    _update_bridge_health(
+        host_transport_open=bool(_state.get("host_transport_open")),
+        deferred_signal_counts=counts,
+        deferred_signal_total=_state["deferred_signal_total"],
+        last_deferred_signal=_state["last_deferred_signal"],
+    )
+
+
 def _reap_stale_bridges():
     """On startup, kill bridge processes that have been idle too long.
 
     Reads heartbeat files written by other bridge instances.
-    Safe for multi-session: only kills bridges that exceed PROCESS_IDLE_TIMEOUT_S.
+    Safe for multi-session: skips fresh, apparently attached sibling heartbeats.
     """
     os.makedirs(HEARTBEAT_DIR, exist_ok=True)
     my_pid = os.getpid()
@@ -3291,12 +3700,23 @@ def _reap_stale_bridges():
             # Check idle time from heartbeat
             last_call = hb.get("last_tool_call", hb.get("start_time", 0))
             idle_s = now - last_call
-            if idle_s > PROCESS_IDLE_TIMEOUT_S:
-                logger.info(f"REAPER: Killing stale bridge PID {pid} (idle {idle_s:.0f}s > {PROCESS_IDLE_TIMEOUT_S}s)")
+            heartbeat_age_s = _heartbeat_freshness_s(hb, fpath, now)
+            fresh_attached = (
+                heartbeat_age_s is not None
+                and heartbeat_age_s <= WATCHDOG_INTERVAL_S * 3
+                and _heartbeat_parent_attached(hb)
+            )
+            if fresh_attached:
+                continue
+            if idle_s > REAP_STALE_IDLE_S:
+                logger.info(
+                    f"REAPER: Killing stale bridge PID {pid} "
+                    f"(idle {idle_s:.0f}s > {REAP_STALE_IDLE_S}s; heartbeat_age={heartbeat_age_s})"
+                )
                 try:
                     os.kill(pid, signal.SIGTERM)
                     reaped += 1
-                except ProcessLookupError:
+                except (ProcessLookupError, PermissionError):
                     pass
                 try:
                     os.unlink(fpath)
@@ -3329,11 +3749,11 @@ def _reap_stale_bridges():
                 )
                 etime = ps_result.stdout.strip()
                 age_s = _parse_etime(etime)
-                if age_s and age_s > PROCESS_IDLE_TIMEOUT_S:
+                if age_s and age_s > LEGACY_REAP_AGE_S:
                     logger.info(f"REAPER: Killing legacy bridge PID {pid} (no heartbeat, age {age_s:.0f}s)")
                     os.kill(pid, signal.SIGTERM)
                     reaped += 1
-            except (subprocess.TimeoutExpired, ProcessLookupError, ValueError):
+            except (subprocess.TimeoutExpired, ProcessLookupError, PermissionError, ValueError):
                 pass
     except (subprocess.TimeoutExpired, FileNotFoundError):
         pass
@@ -3347,6 +3767,10 @@ def _install_signal_handlers(loop: asyncio.AbstractEventLoop):
 
     def _signal_handler(sig_name: str):
         logger.info(f"LIFECYCLE: Received {sig_name}")
+        _transport_event("host_signal_received", signal=sig_name, host_transport_open=_state.get("host_transport_open"))
+        if _should_defer_host_signal(sig_name):
+            _record_deferred_host_signal(sig_name)
+            return
         asyncio.ensure_future(_graceful_shutdown(f"signal_{sig_name}"))
 
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
@@ -3410,7 +3834,7 @@ async def _graceful_shutdown(reason: str, *, force_exit: bool = True):
 
 
 async def _watchdog():
-    """Background task: self-terminate on idle, max-age, or orphaning.
+    """Background task: self-terminate on orphaning, optional idle, or max-age.
 
     This is the PRIMARY defense against zombie bridge accumulation.
     """
@@ -3437,32 +3861,58 @@ async def _watchdog():
                             "original_ppid": original_ppid,
                             "start_time": start_time,
                             "last_tool_call": last_call,
+                            "heartbeat_at": now,
                             "idle_s": round(idle_s),
                             "age_s": round(age_s),
+                            "host_transport_open": bool(_state.get("host_transport_open")),
+                            "deferred_signal_counts": dict(_state.get("deferred_signal_counts") or {}),
+                            "deferred_signal_total": int(_state.get("deferred_signal_total") or 0),
+                            "last_deferred_signal": _state.get("last_deferred_signal"),
+                            "connected_max_age_exit_enabled": bool(CONNECTED_MAX_AGE_FORCE_EXIT),
                         },
                         f,
                     )
             except OSError:
                 pass
 
-            # Check 1 (P0): Idle timeout
-            if idle_s > PROCESS_IDLE_TIMEOUT_S:
-                logger.info(f"LIFECYCLE: Idle timeout ({idle_s:.0f}s > {PROCESS_IDLE_TIMEOUT_S}s). Exiting.")
-                await _graceful_shutdown("idle_timeout")
-                return
-
-            # Check 2 (P0): Max age
-            if age_s > PROCESS_MAX_AGE_S:
-                logger.info(f"LIFECYCLE: Max age reached ({age_s:.0f}s > {PROCESS_MAX_AGE_S}s). Exiting.")
-                await _graceful_shutdown("max_age")
-                return
-
-            # Check 3 (P1): Reparented to init (orphaned)
+            # Check 1 (P0): Reparented to init (orphaned)
             current_ppid = os.getppid()
             if current_ppid == 1 or (original_ppid and current_ppid != original_ppid):
                 logger.warning(f"LIFECYCLE: Parent changed ({original_ppid} -> {current_ppid}). Orphaned. Exiting.")
                 await _graceful_shutdown("orphaned")
                 return
+
+            # Check 2 (P1): Optional connected idle timeout
+            if CONNECTED_IDLE_TIMEOUT_S and idle_s > CONNECTED_IDLE_TIMEOUT_S:
+                logger.info(
+                    f"LIFECYCLE: Connected idle timeout ({idle_s:.0f}s > {CONNECTED_IDLE_TIMEOUT_S}s). Exiting."
+                )
+                await _graceful_shutdown("connected_idle_timeout")
+                return
+
+            # Check 3 (P1): Bounded connected max age
+            if age_s > CONNECTED_MAX_AGE_S:
+                if CONNECTED_MAX_AGE_FORCE_EXIT:
+                    logger.info(
+                        f"LIFECYCLE: Connected max age reached ({age_s:.0f}s > {CONNECTED_MAX_AGE_S}s). Exiting."
+                    )
+                    await _graceful_shutdown("connected_max_age")
+                    return
+                if not _state.get("connected_max_age_reported"):
+                    _state["connected_max_age_reported"] = True
+                    logger.info(
+                        "LIFECYCLE: Connected max age reached "
+                        f"({age_s:.0f}s > {CONNECTED_MAX_AGE_S}s); attached bridge remains resident."
+                    )
+                    _transport_event(
+                        "connected_max_age_reached_attached",
+                        age_s=round(age_s),
+                        connected_max_age_s=CONNECTED_MAX_AGE_S,
+                    )
+                    _update_bridge_health(
+                        connected_max_age_reached_at=_transport_iso_now(),
+                        connected_max_age_exit_enabled=False,
+                    )
 
             # Check 4 (P1): Stdin closed
             try:
@@ -3493,6 +3943,11 @@ async def main():
     _state["bridge_start_time"] = time.time()
     _state["last_tool_call_time"] = time.time()  # Grace period from startup
     _state["original_ppid"] = os.getppid()
+    _state["host_transport_open"] = False
+    _state["deferred_signal_counts"] = {}
+    _state["deferred_signal_total"] = 0
+    _state["last_deferred_signal"] = None
+    _state["connected_max_age_reported"] = False
 
     # Phase 2: C4 — Generate instructions before connecting
     instructions = await generate_descriptive_instructions()
@@ -3572,7 +4027,14 @@ async def main():
     except RuntimeError as exc:
         logger.critical(f"Startup auth validation failed: {exc}")
         raise
-    _update_bridge_health(transport_state="open")
+    _update_bridge_health(
+        transport_state="open",
+        host_transport_open=False,
+        deferred_signal_counts={},
+        deferred_signal_total=0,
+        last_deferred_signal=None,
+        connected_max_age_exit_enabled=bool(CONNECTED_MAX_AGE_FORCE_EXIT),
+    )
 
     # Phase 4: Install signal handlers
     loop = asyncio.get_running_loop()
@@ -3586,6 +4048,8 @@ async def main():
     shutdown_reason = "stdio_teardown"
     try:
         async with stdio_server() as (read_stream, write_stream):
+            _state["host_transport_open"] = True
+            _update_bridge_health(host_transport_open=True)
             await mcp_server.run(
                 read_stream,
                 write_stream,
@@ -3595,6 +4059,8 @@ async def main():
         shutdown_reason = "stdio_run_error"
         raise
     finally:
+        _state["host_transport_open"] = False
+        _update_bridge_health(host_transport_open=False)
         if not _state["shutdown_initiated"]:
             await _graceful_shutdown(shutdown_reason, force_exit=False)
 

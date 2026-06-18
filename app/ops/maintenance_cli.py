@@ -3,6 +3,7 @@
 Usage:
   python -m app.ops.maintenance_cli run [--phases 1,2,3] [--dry-run]
   python -m app.ops.maintenance_cli autolearn-drain [--dry-run] [--max-rows N] [--max-seconds N] [--task-type TYPE]
+  python -m app.ops.maintenance_cli reflection-requeue-pressure-deferrals [--dry-run]
   python -m app.ops.maintenance_cli status
   python -m app.ops.maintenance_cli install   # Install optional launchd scheduler
   python -m app.ops.maintenance_cli uninstall # Remove optional launchd scheduler
@@ -32,8 +33,26 @@ except ImportError:
 
 PLIST_NAME = "com.pith.maintenance"
 PLIST_SOURCE = Path(__file__).parent.parent.parent / "scripts" / f"{PLIST_NAME}.plist"
-PLIST_DEST = Path.home() / "Library" / "LaunchAgents" / f"{PLIST_NAME}.plist"
 LOCK_FILE = "/tmp/pith_maintenance.lock"
+REFLECTION_PRESSURE_DEFERRAL_ERROR = "ReflectionDeferredError: pressure_protected_reflection_deferred"
+
+
+def _launch_agents_dir() -> Path:
+    override = os.environ.get("PITH_LAUNCH_AGENTS_DIR")
+    if override:
+        return Path(override)
+    return Path.home() / "Library" / "LaunchAgents"
+
+
+def _plist_dest() -> Path:
+    return _launch_agents_dir() / f"{PLIST_NAME}.plist"
+
+
+def _resolved_data_dir() -> str:
+    from app.core.profile import resolve_data_dir
+
+    return str(resolve_data_dir())
+
 
 # Amendment 9: Dynamic plist template — resolved at install time
 PLIST_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
@@ -93,9 +112,32 @@ def cmd_run(args):
     """Run maintenance cycle."""
     # Amendment 1: Mutex lock — prevent parallel maintenance runs
     lock_fd = _acquire_maintenance_lock()
+    lease = None
     try:
+        try:
+            from app.ops.maintenance import PHASE_TIMEOUT_SECONDS
+            from app.ops.pressure_state import write_maintenance_lease
+
+            source = os.environ.get("PITH_MAINTENANCE_SOURCE", "manual_cli")
+            if source == "manual":
+                source = "manual_cli"
+            lease = write_maintenance_lease(
+                source=source,
+                phase="maintenance",
+                expected_timeout_seconds=float(PHASE_TIMEOUT_SECONDS),
+                dry_run=bool(getattr(args, "dry_run", False)),
+            )
+        except Exception as lease_err:
+            print(f"Warning: maintenance active lease write failed: {lease_err}")
         return _cmd_run_inner(args)
     finally:
+        if lease is not None:
+            try:
+                from app.ops.pressure_state import clear_maintenance_lease
+
+                clear_maintenance_lease(run_id=lease.run_id, pid=os.getpid())
+            except Exception as lease_err:
+                print(f"Warning: maintenance active lease clear failed: {lease_err}")
         _release_maintenance_lock(lock_fd)
 
 
@@ -103,7 +145,7 @@ def _rotate_logs():
     """Amendment 11: Rotate maintenance logs if they exceed 10 MB."""
     MAX_LOG_SIZE = 10 * 1024 * 1024  # 10 MB
     MAX_ROTATIONS = 3
-    data_dir = os.environ.get("PITH_DATA_DIR", "data")
+    data_dir = _resolved_data_dir()
     log_dir = os.path.join(data_dir, "logs")
 
     for log_name in ("maintenance_stdout.log", "maintenance_stderr.log"):
@@ -196,7 +238,7 @@ def _print_scheduler_summary(health: dict | None) -> None:
         )
         return
 
-    external_label = "installed" if PLIST_DEST.exists() else "not installed"
+    external_label = "installed" if _plist_dest().exists() else "not installed"
     print("\nServer maintenance state: unavailable")
     print(
         "External launchd scheduler: "
@@ -255,13 +297,22 @@ def cmd_autolearn_drain(args):
     try:
         with owned_connection() as conn:
             if args.dry_run:
+                plan = get_autolearn_maintenance_drain_plan(conn, batch_size, task_type=args.task_type)
                 result = {
                     "success": True,
                     "dry_run": True,
                     "max_rows": max_rows,
                     "max_seconds": max_seconds,
                     "task_type_filter": args.task_type,
-                    "plan": get_autolearn_maintenance_drain_plan(conn, batch_size, task_type=args.task_type),
+                    "ready_before": plan["ready_total"],
+                    "ready_after": plan["ready_total"],
+                    "ready_delta": 0,
+                    "processed_by_task": {task_type: 0 for task_type in plan["ready_by_task"]},
+                    "oldest_ready_age_before_seconds": plan.get("oldest_ready_age_seconds"),
+                    "oldest_ready_age_after_seconds": plan.get("oldest_ready_age_seconds"),
+                    "oldest_ready_age_delta_seconds": 0,
+                    "drain_rate_rows_per_second": 0.0,
+                    "plan": plan,
                 }
             else:
                 result = asyncio.run(
@@ -279,6 +330,47 @@ def cmd_autolearn_drain(args):
         _release_maintenance_lock(lock_fd)
 
 
+def cmd_reflection_requeue_pressure_deferrals(args):
+    """Requeue failed full-reflection jobs caused by pressure deferral."""
+    from app.core.datetime_utils import _utc_now_iso
+    from app.core.profile import get_active_profile
+    from app.storage.lifecycle_jobs import (
+        count_failed_lifecycle_jobs_by_error,
+        requeue_failed_lifecycle_jobs_by_error,
+    )
+
+    profile = get_active_profile()
+    error = args.error
+    matching_count = count_failed_lifecycle_jobs_by_error(
+        profile=profile,
+        source="reflection_full",
+        stage="reflect",
+        error=error,
+    )
+
+    result = {
+        "success": True,
+        "dry_run": bool(args.dry_run),
+        "profile": profile,
+        "source": "reflection_full",
+        "stage": "reflect",
+        "matched_failed_rows": matching_count,
+        "requeued_rows": 0,
+        "error": error,
+    }
+    if not args.dry_run and matching_count:
+        now = _utc_now_iso()
+        result["requeued_rows"] = requeue_failed_lifecycle_jobs_by_error(
+            profile=profile,
+            source="reflection_full",
+            stage="reflect",
+            error=error,
+            next_retry_at=now,
+            now=now,
+        )
+    print(json.dumps(result, indent=2, sort_keys=True))
+
+
 def cmd_install(args):
     """Install optional launchd scheduler for automatic maintenance.
 
@@ -290,7 +382,7 @@ def cmd_install(args):
 
     # Resolve paths dynamically
     pith_dir = Path(__file__).parent.parent.parent.resolve()
-    data_dir = os.environ.get("PITH_DATA_DIR", str(pith_dir / "data"))
+    data_dir = _resolved_data_dir()
     log_dir = os.path.join(data_dir, "logs")
     python_path = sys.executable  # Use the CURRENT Python interpreter
     profile = os.environ.get("PITH_PROFILE", "default")
@@ -315,14 +407,15 @@ def cmd_install(args):
         sys.exit(1)
 
     # Ensure LaunchAgents directory exists
-    PLIST_DEST.parent.mkdir(parents=True, exist_ok=True)
+    plist_dest = _plist_dest()
+    plist_dest.parent.mkdir(parents=True, exist_ok=True)
 
     # Unload old plist if present, write new one, load it
-    subprocess.run(["launchctl", "unload", str(PLIST_DEST)], capture_output=True)
-    PLIST_DEST.write_text(plist_content)
-    print(f"✓ Generated plist at {PLIST_DEST}")
+    subprocess.run(["launchctl", "unload", str(plist_dest)], capture_output=True)
+    plist_dest.write_text(plist_content)
+    print(f"✓ Generated plist at {plist_dest}")
 
-    result = subprocess.run(["launchctl", "load", str(PLIST_DEST)], capture_output=True)
+    result = subprocess.run(["launchctl", "load", str(plist_dest)], capture_output=True)
 
     if result.returncode == 0:
         print("✓ Optional external launchd scheduler loaded")
@@ -341,10 +434,11 @@ def cmd_install(args):
 
 def cmd_uninstall(args):
     """Remove launchd scheduler."""
-    if PLIST_DEST.exists():
-        subprocess.run(["launchctl", "unload", str(PLIST_DEST)], capture_output=True)
-        PLIST_DEST.unlink()
-        print(f"✓ Uninstalled scheduler from {PLIST_DEST}")
+    plist_dest = _plist_dest()
+    if plist_dest.exists():
+        subprocess.run(["launchctl", "unload", str(plist_dest)], capture_output=True)
+        plist_dest.unlink()
+        print(f"✓ Uninstalled scheduler from {plist_dest}")
     else:
         print("Scheduler was not installed.")
 
@@ -375,6 +469,19 @@ def main():
         help="Only drain one autolearn task type",
     )
     drain_parser.set_defaults(func=cmd_autolearn_drain)
+
+    # reflection-requeue-pressure-deferrals
+    reflection_requeue_parser = sub.add_parser(
+        "reflection-requeue-pressure-deferrals",
+        help="Requeue failed full-reflection jobs caused by pressure deferral",
+    )
+    reflection_requeue_parser.add_argument("--dry-run", action="store_true", help="Count matching rows only")
+    reflection_requeue_parser.add_argument(
+        "--error",
+        default=REFLECTION_PRESSURE_DEFERRAL_ERROR,
+        help="Exact failed lifecycle error to requeue",
+    )
+    reflection_requeue_parser.set_defaults(func=cmd_reflection_requeue_pressure_deferrals)
 
     # install
     install_parser = sub.add_parser("install", help="Install optional launchd scheduler (daily 3:00 AM)")

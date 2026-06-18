@@ -3,55 +3,85 @@
 import asyncio
 import concurrent.futures
 import copy
+import csv
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
 import time
 import uuid
+from contextlib import nullcontext
+from datetime import datetime
 from pathlib import Path
 
+from app.core.fork_safety import should_suppress_optional_subprocess
+
 _REPO_ROOT = Path(__file__).parent.parent.parent
+_DEPLOY_METADATA_PATH = _REPO_ROOT / ".pith-deploy.json"
+
+
+def _short_commit(value: str) -> str:
+    cleaned = (value or "").strip()
+    return cleaned[:7] if cleaned else "unknown"
+
+
+def _read_deploy_metadata() -> dict:
+    try:
+        if not _DEPLOY_METADATA_PATH.exists():
+            return {}
+        payload = json.loads(_DEPLOY_METADATA_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+_DEPLOY_METADATA = _read_deploy_metadata()
+
+
+def _deploy_metadata_value(*keys: str) -> str:
+    for key in keys:
+        value = os.environ.get(key)
+        if value:
+            return value
+    for key in keys:
+        value = _DEPLOY_METADATA.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return ""
 
 
 # OPS-051: Capture git commit at startup for deployed-commit verification.
 def _get_git_commit() -> str:
-    try:
-        return subprocess.check_output(
-            ["git", "rev-parse", "--short", "HEAD"],
-            cwd=_REPO_ROOT,
-            stderr=subprocess.DEVNULL,
-            text=True,
-        ).strip()
-    except Exception:
-        return "unknown"
+    deployed_commit = _deploy_metadata_value("PITH_DEPLOYED_SOURCE_COMMIT", "source_commit", "git_commit")
+    if deployed_commit:
+        return _short_commit(deployed_commit)
+    return _short_commit(_read_git_head_commit())
 
 
 def _get_git_branch() -> str:
-    try:
-        return subprocess.check_output(
-            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-            cwd=_REPO_ROOT,
-            stderr=subprocess.DEVNULL,
-            text=True,
-        ).strip()
-    except Exception:
-        return "unknown"
+    deployed_branch = _deploy_metadata_value("PITH_DEPLOYED_SOURCE_BRANCH", "source_branch", "git_branch")
+    if deployed_branch:
+        return deployed_branch
+    return _read_git_head_ref()
 
 
 def _get_git_dirty() -> bool | None:
-    try:
-        output = subprocess.check_output(
-            ["git", "status", "--porcelain"],
-            cwd=_REPO_ROOT,
-            stderr=subprocess.DEVNULL,
-            text=True,
-        )
-    except Exception:
-        return None
-    return bool(output.strip())
+    env_dirty = os.environ.get("PITH_DEPLOYED_SOURCE_DIRTY")
+    if env_dirty is not None:
+        return env_dirty.strip().lower() in {"1", "true", "yes", "on"}
+    deployed_dirty = _DEPLOY_METADATA.get("source_dirty")
+    if isinstance(deployed_dirty, bool):
+        return deployed_dirty
+    return None
+
+
+def _get_git_commit_source() -> str:
+    if _DEPLOY_METADATA or _deploy_metadata_value("PITH_DEPLOYED_SOURCE_COMMIT", "source_commit", "git_commit"):
+        return "deploy_metadata"
+    return "git_head_file"
 
 
 def _resolve_git_dir(repo_root: Path = _REPO_ROOT) -> Path | None:
@@ -99,12 +129,12 @@ def _read_git_head_commit(repo_root: Path = _REPO_ROOT) -> str:
         if not head:
             return "unknown"
         if not head.startswith("ref:"):
-            return head[:7]
+            return head
         ref_name = head.split(" ", 1)[1].strip()
         for ref_path in (git_dir / ref_name, common_git_dir / ref_name):
             if ref_path.exists():
                 commit = ref_path.read_text(encoding="utf-8", errors="replace").strip()
-                return commit[:7] if commit else "unknown"
+                return commit if commit else "unknown"
         for packed_refs in (git_dir / "packed-refs", common_git_dir / "packed-refs"):
             if not packed_refs.exists():
                 continue
@@ -116,16 +146,54 @@ def _read_git_head_commit(repo_root: Path = _REPO_ROOT) -> str:
                 except ValueError:
                     continue
                 if packed_ref.strip() == ref_name:
-                    return commit[:7]
+                    return commit
     except Exception:
         return "unknown"
     return "unknown"
 
 
+def _read_git_head_ref(repo_root: Path = _REPO_ROOT) -> str:
+    git_dir = _resolve_git_dir(repo_root)
+    if git_dir is None:
+        return "unknown"
+    try:
+        head = (git_dir / "HEAD").read_text(encoding="utf-8", errors="replace").strip()
+        if head.startswith("ref:"):
+            ref_name = head.split(":", 1)[1].strip()
+            return Path(ref_name).name or "unknown"
+    except Exception:
+        return "unknown"
+    return "HEAD" if head else "unknown"
+
+
+def _git_commits_match(startup_commit: str, current_head: str) -> bool | None:
+    if startup_commit == "unknown" or current_head == "unknown":
+        return None
+    return startup_commit == current_head or startup_commit.startswith(current_head) or current_head.startswith(startup_commit)
+
+
 _GIT_COMMIT = _get_git_commit()
 _GIT_BRANCH = _get_git_branch()
 _GIT_DIRTY = _get_git_dirty()
+_GIT_COMMIT_SOURCE = _get_git_commit_source()
 _GIT_MISMATCH_REASON = "runtime_git_commit_mismatch"
+_CANONICAL_MISMATCH_REASON = "runtime_canonical_commit_mismatch"
+_DEFAULT_CANONICAL_REPO_ROOT = Path(__file__).resolve().parents[2]
+_CANONICAL_REPO_ROOT = Path(
+    os.environ.get("PITH_CANONICAL_REPO_ROOT")
+    or _DEPLOY_METADATA.get("source_repo")
+    or str(_DEFAULT_CANONICAL_REPO_ROOT)
+).expanduser()
+
+
+def _git_commit_matches_head(startup_commit: str, current_head: str) -> bool | None:
+    if startup_commit == "unknown" or current_head == "unknown":
+        return None
+    if startup_commit == current_head:
+        return True
+    if len(startup_commit) < len(current_head) and current_head.startswith(startup_commit):
+        return True
+    return len(current_head) < len(startup_commit) and startup_commit.startswith(current_head)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -148,42 +216,533 @@ _FAST_STATS_OBSERVABILITY: dict[str, int | float | str | None] = {
     "refresh_success_count": 0,
     "refresh_failure_count": 0,
     "stale_served_count": 0,
+    "slot_acquire_timeout_count": 0,
     "last_refresh_duration_ms": None,
     "last_refresh_error": None,
+    "last_success_monotonic": None,  # internal; surfaced as last_success_age_ms
 }
 _FAST_HEALTH_CACHE_TTL_S = float(os.environ.get("PITH_FAST_HEALTH_CACHE_TTL_S", "5"))
+_FAST_HEALTH_COLD_BUDGET_S = float(os.environ.get("PITH_FAST_HEALTH_COLD_BUDGET_S", "0.5"))
 _FAST_HEALTH_CACHE_LOCK = threading.Lock()
 _FAST_HEALTH_CACHE: tuple[float, dict] | None = None
+# EUNOMIA-125: fast_health now has its own background refresh worker (mirrors fast_stats)
+# so a single one-shot pith_health call schedules an async refresh instead of refreshing
+# inline-only and leaving the cache silently stale for hours.
+_FAST_HEALTH_REFRESH_LOCK = threading.Lock()
+_FAST_HEALTH_REFRESH_FUTURE: concurrent.futures.Future | None = None
+_FAST_HEALTH_REFRESH_ERROR: str | None = None
+_FAST_HEALTH_OBSERVABILITY: dict[str, int | float | str | None] = {
+    "refresh_success_count": 0,
+    "refresh_failure_count": 0,
+    "stale_served_count": 0,
+    "slot_acquire_timeout_count": 0,
+    "last_refresh_duration_ms": None,
+    "last_refresh_error": None,
+    "last_success_monotonic": None,  # internal; surfaced as last_success_age_ms
+}
 _KNOWLEDGE_AREAS_CACHE_TTL_S = float(os.environ.get("PITH_KNOWLEDGE_AREAS_CACHE_TTL_S", "5"))
 _KNOWLEDGE_AREAS_CACHE_LOCK = threading.Lock()
 _KNOWLEDGE_AREAS_CACHE: tuple[float, dict] | None = None
-_DIAGNOSTIC_ENDPOINT_SEMAPHORE = threading.Semaphore(max(1, _env_int("PITH_DIAGNOSTIC_ENDPOINT_SLOTS", 1)))
+# TOOLING-100: knowledge_areas fast-path joins the EUNOMIA-125 background-refresh lane
+# (mirror of the stats/health lanes) instead of acquiring the single slot inline.
+_KNOWLEDGE_AREAS_COLD_BUDGET_S = float(os.environ.get("PITH_KNOWLEDGE_AREAS_COLD_BUDGET_S", "0.5"))
+_KNOWLEDGE_AREAS_REFRESH_LOCK = threading.Lock()
+_KNOWLEDGE_AREAS_REFRESH_FUTURE: concurrent.futures.Future | None = None
+_KNOWLEDGE_AREAS_REFRESH_ERROR: str | None = None
+_FAST_KNOWLEDGE_AREAS_OBSERVABILITY: dict[str, int | float | str | None] = {
+    "refresh_success_count": 0,
+    "refresh_failure_count": 0,
+    "stale_served_count": 0,
+    "slot_acquire_timeout_count": 0,
+    "last_refresh_duration_ms": None,
+    "last_refresh_error": None,
+    "last_success_monotonic": None,  # internal; surfaced as last_success_age_ms
+}
+# EUNOMIA-128 (saturation gate): the diagnostic-endpoint slot count stays 1 BY DEFAULT.
+# The former "do NOT raise until fast-build compute reduction (deferred fix E) lands"
+# rationale is RETIRED — it was contradicted by live measurement (rose, 1.65GB WAL DB /
+# 35,378 concepts, 2026-06-16): every diagnostic build is already sub-second (stats ~99ms,
+# health ~819ms cold-once/~70ms warm, knowledge_areas ~30ms, integrity probe ~762ms), so
+# compute cost is not the gate. A 2-slot experiment measured slot=2 SAFE (heaviest read
+# +33% sub-linear, still <1s, 1.51x throughput, no EUNOMIA-116 WAL lock contention).
+# Raising is intentionally NOT taken here: the pool is unsaturated
+# (slot_acquire_timeout_count == 0 across all lanes), so 1->2 would change production DB
+# concurrency for a benefit not realized at current scale. The real gate to raise is
+# SUSTAINED pool saturation — delta(slot_acquire_timeout_total) > 0 over consecutive
+# windows — surfaced read-only as `diagnostic_slot_saturation` in the /health?detail=full
+# warmer snapshot and watched by the dev.pith.monitor-diagnostic-slot-saturation launchd
+# job. Re-run the 2-slot experiment at the then-current DB size before flipping.
+_DIAGNOSTIC_ENDPOINT_SLOT_COUNT = max(1, _env_int("PITH_DIAGNOSTIC_ENDPOINT_SLOTS", 1))
+_DIAGNOSTIC_ENDPOINT_SEMAPHORE = threading.Semaphore(_DIAGNOSTIC_ENDPOINT_SLOT_COUNT)
+# 50ms timeout for SYNCHRONOUS / user-facing acquires — never block a user on a stale cache.
+# TOOLING-100: no synchronous acquirer remains (stats/health/knowledge_areas all moved to the
+# background-refresh executor). Retained — env-wired and reserved for any future inline acquire.
 _DIAGNOSTIC_ENDPOINT_SLOT_TIMEOUT_S = float(os.environ.get("PITH_DIAGNOSTIC_ENDPOINT_SLOT_TIMEOUT_S", "0.05"))
+# EUNOMIA-125: BACKGROUND refresh workers patiently wait for the single slot instead of
+# bailing at 50ms (~45% of refreshes were failing, leaving caches silently stale for hours).
+_DIAGNOSTIC_REFRESH_SLOT_TIMEOUT_S = float(os.environ.get("PITH_DIAGNOSTIC_REFRESH_SLOT_TIMEOUT_S", "5.0"))
+# 2 worker threads so stats and health refresh lanes don't head-of-line-block each other.
+# DB concurrency is still gated to 1 by _DIAGNOSTIC_ENDPOINT_SEMAPHORE (respects EUNOMIA-116).
 _DIAGNOSTIC_REFRESH_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
-    max_workers=1,
+    max_workers=max(1, _env_int("PITH_DIAGNOSTIC_REFRESH_WORKERS", 2)),
     thread_name_prefix="pith-diagnostic-refresh",
 )
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    """Parse a boolean env var (mirror of _env_int). _env_bool did not exist before EUNOMIA-126."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+# EUNOMIA-126: timer-driven warmer + starvation watchdog. One daemon thread keeps the
+# diagnostic caches within TTL so a single cold pith_health/pith_stats call after idle
+# reads fresh (partial=false). Reuses the EUNOMIA-125 single-slot refresh path — slot
+# count stays 1 (raising it is EUNOMIA-128). Kill switch defaults OFF.
+_DIAGNOSTIC_WARMER_ENABLED = _env_bool("PITH_DIAGNOSTIC_WARMER_ENABLED", False)
+# Interval (s). 0/unset => auto = 0.8 * min(TTL) so raising TTL auto-widens the interval.
+_DIAGNOSTIC_WARMER_INTERVAL_S_RAW = float(os.environ.get("PITH_DIAGNOSTIC_WARMER_INTERVAL_S", "0") or 0)
+# Watchdog: alert when a lane's last_success_age_ms exceeds N * max_stale_ms.
+_DIAGNOSTIC_WATCHDOG_BREACH_MULT = max(1, _env_int("PITH_DIAGNOSTIC_WATCHDOG_BREACH_MULT", 3))
+# Watchdog may enqueue a normal refresh on breach (never a slot reset). Default ON when warmer on.
+_DIAGNOSTIC_WATCHDOG_ENQUEUE_REFRESH = _env_bool("PITH_DIAGNOSTIC_WATCHDOG_ENQUEUE_REFRESH", True)
+
+_diagnostic_warmer_stop_event = threading.Event()
+_diagnostic_warmer_thread: threading.Thread | None = None
+_DIAGNOSTIC_WARMER_LOCK = threading.Lock()
+_DIAGNOSTIC_WARMER_OBSERVABILITY: dict[str, int | float | str | bool | None] = {
+    "enabled": _DIAGNOSTIC_WARMER_ENABLED,
+    "alive": False,
+    "tick_count": 0,
+    "warm_submitted_count": 0,
+    "watchdog_breach_count": 0,
+    "last_tick_monotonic": None,  # internal; surfaced as last_tick_age_ms
+    "last_breach_lane": None,
+    "interval_s": None,
+}
+
+# EUNOMIA-127: contention-immune read-only concept-integrity probe.
+# Orthogonal to _DIAGNOSTIC_ENDPOINT_SEMAPHORE: the probe NEVER blocking-acquires the
+# diagnostic slot (so it cannot be starved by EUNOMIA-113/125), but bounds its own
+# concurrency to avoid stacking heavy reads against the 1.65GB DB (EUNOMIA-116).
+_INTEGRITY_PROBE_ENABLED = _env_bool("PITH_INTEGRITY_PROBE_ENABLED", True)
+_INTEGRITY_PROBE_SEMAPHORE = threading.Semaphore(max(1, _env_int("PITH_INTEGRITY_PROBE_SLOTS", 1)))
+_INTEGRITY_PROBE_SLOT_TIMEOUT_S = float(os.environ.get("PITH_INTEGRITY_PROBE_SLOT_TIMEOUT_S", "2.0"))
+# A6: min inter-probe interval. Within the interval, serve the last cached result
+# (served_cached=true) instead of re-scanning, so probe+refresh overlap stays rare.
+_INTEGRITY_PROBE_MIN_INTERVAL_S = float(os.environ.get("PITH_INTEGRITY_PROBE_MIN_INTERVAL_S", "15"))
+
+_INTEGRITY_PROBE_RESULT_LOCK = threading.Lock()
+# (monotonic_ts, payload_dict) of the last successfully computed probe, or None.
+_INTEGRITY_PROBE_LAST_RESULT: tuple[float, dict] | None = None
+
+_INTEGRITY_PROBE_OBSERVABILITY: dict[str, int | float | str | bool | None] = {
+    "enabled": _INTEGRITY_PROBE_ENABLED,
+    "probe_duration_ms": None,  # last successful compute duration
+    "probe_slot_acquire_timeout_count": 0,
+    "probe_degraded_return_count": 0,
+    "probe_refresh_overlap_count": 0,  # times the probe ran while a diagnostic refresh held the slot
+    "served_cached_count": 0,
+    "last_success_monotonic": None,  # internal; surfaced as last_success_age_ms
+}
+_INTEGRITY_PROBE_OBSERVABILITY_LOCK = threading.Lock()
+
+
+def _record_integrity_probe_obs(key: str, *, inc: int = 0, set_value=None) -> None:
+    with _INTEGRITY_PROBE_OBSERVABILITY_LOCK:
+        if set_value is not None:
+            _INTEGRITY_PROBE_OBSERVABILITY[key] = set_value
+        if inc:
+            _INTEGRITY_PROBE_OBSERVABILITY[key] = int(_INTEGRITY_PROBE_OBSERVABILITY[key] or 0) + inc
+
+
+def _integrity_probe_observability_snapshot() -> dict:
+    """Public snapshot of the probe observability dict.
+
+    A1 (gauntlet2 binding): inline age derivation — do NOT reference the
+    non-existent _observability_snapshot_locked_generic and do NOT mutate the
+    existing _observability_snapshot_locked. Derive last_success_age_ms from the
+    stored last_success_monotonic here.
+    """
+    with _INTEGRITY_PROBE_OBSERVABILITY_LOCK:
+        snapshot = dict(_INTEGRITY_PROBE_OBSERVABILITY)
+    last_success = snapshot.pop("last_success_monotonic", None)
+    if last_success is not None:
+        snapshot["last_success_age_ms"] = round((time.monotonic() - last_success) * 1000)
+    else:
+        snapshot["last_success_age_ms"] = None
+    return snapshot
+
+
+def _probe_version_chain_integrity(conn) -> dict:
+    """Read-only version-chain integrity on the probe's mode=ro conn.
+
+    Mirrors app/ops/diagnostics.py:check_version_chain_integrity() (def line 19)
+    queries, but runs on the passed-in read-only connection and returns a dict
+    (the diagnostics function takes no args, uses the RW owned conn, and returns
+    list[str] — unsuitable for the read-only probe; EUNOMIA-127 spec §2.2/§5 Fix 4).
+    """
+    violations: list[str] = []
+    mismatches = conn.execute("""
+        SELECT c.id, c.version as concepts_version, cv.max_version
+        FROM concepts c
+        LEFT JOIN (
+            SELECT id, MAX(version) as max_version
+            FROM concept_versions
+            GROUP BY id
+        ) cv ON c.id = cv.id
+        WHERE c.version != cv.max_version OR cv.max_version IS NULL
+    """).fetchall()
+    for row in mismatches:
+        if row["max_version"] is None:
+            violations.append(f"Orphaned concept {row['id']}: in concepts table but no version history")
+        else:
+            violations.append(
+                f"Version mismatch {row['id']}: concepts={row['concepts_version']}, latest_history={row['max_version']}"
+            )
+    all_ids = conn.execute("SELECT DISTINCT id FROM concept_versions").fetchall()
+    for id_row in all_ids:
+        concept_id = id_row["id"]
+        versions = conn.execute(
+            "SELECT version FROM concept_versions WHERE id = ? ORDER BY version", (concept_id,)
+        ).fetchall()
+        version_nums = []
+        for v in versions:
+            try:
+                version_nums.append(int(v["version"][1:]))
+            except (ValueError, IndexError):
+                violations.append(f"Malformed version {concept_id}: '{v['version']}' is not v<N> format")
+        if version_nums:
+            expected = list(range(1, max(version_nums) + 1))
+            missing = set(expected) - set(version_nums)
+            if missing:
+                violations.append(
+                    f"Version gap {concept_id}: missing {sorted(missing)} in chain {sorted(version_nums)}"
+                )
+    return {"violation_count": len(violations), "is_healthy": len(violations) == 0, "violations": violations[:50]}
+
+
+def _run_concept_integrity_probe() -> dict:
+    """Read-only, single-flight, min-interval-cached integrity probe.
+
+    Never raises. On any failure path returns {"degraded": True, "reason": ...}.
+    Acquires ONLY _INTEGRITY_PROBE_SEMAPHORE, NEVER (blocking) _DIAGNOSTIC_ENDPOINT_SEMAPHORE.
+    """
+    global _INTEGRITY_PROBE_LAST_RESULT
+
+    from app.storage.connection import diagnostic_read_db
+    from app.storage.stats import compute_concept_integrity
+
+    if not _INTEGRITY_PROBE_ENABLED:
+        _record_integrity_probe_obs("probe_degraded_return_count", inc=1)
+        return {
+            "source": "read_only_probe",
+            "slot_contended": False,
+            "computed_at": None,
+            "duration_ms": None,
+            "served_cached": False,
+            "degraded": True,
+            "reason": "disabled",
+            "integrity": None,
+            "version_chain_integrity": None,
+        }
+
+    # A6 min-interval: serve last cached result if within the interval.
+    now = time.monotonic()
+    with _INTEGRITY_PROBE_RESULT_LOCK:
+        last = _INTEGRITY_PROBE_LAST_RESULT
+    if last is not None and (now - last[0]) < _INTEGRITY_PROBE_MIN_INTERVAL_S:
+        _record_integrity_probe_obs("served_cached_count", inc=1)
+        cached = dict(last[1])
+        cached["served_cached"] = True
+        return cached
+
+    acquired = _INTEGRITY_PROBE_SEMAPHORE.acquire(timeout=_INTEGRITY_PROBE_SLOT_TIMEOUT_S)
+    if not acquired:
+        _record_integrity_probe_obs("probe_slot_acquire_timeout_count", inc=1)
+        _record_integrity_probe_obs("probe_degraded_return_count", inc=1)
+        return {
+            "source": "read_only_probe",
+            "slot_contended": True,
+            "computed_at": None,
+            "duration_ms": None,
+            "served_cached": False,
+            "degraded": True,
+            "reason": "slot_timeout",
+            "integrity": None,
+            "version_chain_integrity": None,
+        }
+    try:
+        # Re-check the interval after acquiring (another thread may have just refreshed).
+        now = time.monotonic()
+        with _INTEGRITY_PROBE_RESULT_LOCK:
+            last = _INTEGRITY_PROBE_LAST_RESULT
+        if last is not None and (now - last[0]) < _INTEGRITY_PROBE_MIN_INTERVAL_S:
+            _record_integrity_probe_obs("served_cached_count", inc=1)
+            cached = dict(last[1])
+            cached["served_cached"] = True
+            return cached
+
+        # A7 overlap counter: detect probe running while a diagnostic refresh holds the slot.
+        # Non-blocking probe of the diagnostic slot's availability (does NOT acquire/hold it).
+        if _DIAGNOSTIC_ENDPOINT_SEMAPHORE.acquire(blocking=False):
+            _DIAGNOSTIC_ENDPOINT_SEMAPHORE.release()  # available -> no refresh in flight
+        else:
+            _record_integrity_probe_obs("probe_refresh_overlap_count", inc=1)
+
+        started = time.perf_counter()
+        with diagnostic_read_db("concept_integrity_probe") as conn:
+            integrity = compute_concept_integrity(conn)
+            version_chain = _probe_version_chain_integrity(conn)
+        duration_ms = round((time.perf_counter() - started) * 1000)
+        payload = {
+            "source": "read_only_probe",
+            "slot_contended": False,
+            "computed_at": _utc_now_iso(),
+            "duration_ms": duration_ms,
+            "served_cached": False,
+            "degraded": False,
+            "integrity": integrity,
+            "version_chain_integrity": version_chain,
+        }
+        with _INTEGRITY_PROBE_RESULT_LOCK:
+            _INTEGRITY_PROBE_LAST_RESULT = (time.monotonic(), dict(payload))
+        _record_integrity_probe_obs("probe_duration_ms", set_value=duration_ms)
+        _record_integrity_probe_obs("last_success_monotonic", set_value=time.monotonic())
+        return payload
+    except Exception as e:
+        _record_integrity_probe_obs("probe_degraded_return_count", inc=1)
+        logger.warning("concept_integrity_probe failed: %s", e, exc_info=True)
+        return {
+            "source": "read_only_probe",
+            "slot_contended": False,
+            "computed_at": None,
+            "duration_ms": None,
+            "served_cached": False,
+            "degraded": True,
+            "reason": "error",
+            "integrity": None,
+            "version_chain_integrity": None,
+        }
+    finally:
+        _INTEGRITY_PROBE_SEMAPHORE.release()
+
+
+def _diagnostic_warmer_interval_s() -> float:
+    """Resolve the warm interval. interval MUST be < min(TTL) so a reader's max cache age
+    (~interval) stays within the fresh window. Auto = 0.8 * min(TTL) when unset/<=0."""
+    min_ttl = min(_FAST_STATS_CACHE_TTL_S, _FAST_HEALTH_CACHE_TTL_S, _KNOWLEDGE_AREAS_CACHE_TTL_S)
+    if _DIAGNOSTIC_WARMER_INTERVAL_S_RAW and _DIAGNOSTIC_WARMER_INTERVAL_S_RAW > 0:
+        interval = _DIAGNOSTIC_WARMER_INTERVAL_S_RAW
+    else:
+        interval = 0.8 * min_ttl
+    # Clamp: keep strictly under the fresh window (90% of min TTL ceiling) and >= 0.5s floor.
+    ceiling = max(0.5, 0.9 * min_ttl)
+    return max(0.5, min(interval, ceiling))
+
+
+def _warm_one_tick() -> None:
+    """One warm pass: for each lane, if the cache is older than the just-in-time
+    threshold (TTL - interval), trigger the EXISTING background refresh (dedupes on
+    in-flight). Then run the starvation watchdog. All exceptions are contained."""
+    interval_ms = _diagnostic_warmer_interval_s() * 1000
+    lanes = (
+        (
+            "fast_stats",
+            _FAST_STATS_CACHE_LOCK,
+            lambda: _FAST_STATS_CACHE,
+            _FAST_STATS_CACHE_TTL_S,
+            _ensure_fast_stats_refresh_started,
+            _fast_stats_observability_snapshot,
+        ),
+        (
+            "fast_health",
+            _FAST_HEALTH_CACHE_LOCK,
+            lambda: _FAST_HEALTH_CACHE,
+            _FAST_HEALTH_CACHE_TTL_S,
+            _ensure_fast_health_refresh_started,
+            _fast_health_observability_snapshot,
+        ),
+        (
+            "knowledge_areas",
+            _KNOWLEDGE_AREAS_CACHE_LOCK,
+            lambda: _KNOWLEDGE_AREAS_CACHE,
+            _KNOWLEDGE_AREAS_CACHE_TTL_S,
+            _ensure_knowledge_areas_refresh_started,
+            _knowledge_areas_observability_snapshot,
+        ),
+    )
+    now = time.monotonic()
+    for name, lock, get_cache, ttl_s, ensure_refresh, obs_snapshot in lanes:
+        try:
+            ttl_ms = ttl_s * 1000
+            jit_threshold_ms = max(0.0, ttl_ms - interval_ms)  # refresh just before the window closes
+            with lock:
+                cache = get_cache()
+                age_ms = None if cache is None else int((now - cache[0]) * 1000)
+            if age_ms is None or age_ms >= jit_threshold_ms:
+                ensure_refresh()  # de-dupes against in-flight; single slot preserved
+                with _DIAGNOSTIC_WARMER_LOCK:
+                    _DIAGNOSTIC_WARMER_OBSERVABILITY["warm_submitted_count"] = (
+                        int(_DIAGNOSTIC_WARMER_OBSERVABILITY["warm_submitted_count"] or 0) + 1
+                    )
+            # Watchdog: starvation = last_success_age_ms > N * max_stale_ms
+            snap = obs_snapshot()
+            age_success = snap.get("last_success_age_ms")
+            max_stale_ms = _fast_stats_max_stale_ms()  # shared 60s SLO bound
+            if age_success is not None and age_success > _DIAGNOSTIC_WATCHDOG_BREACH_MULT * max_stale_ms:
+                logger.error(
+                    "diagnostic_warmer watchdog breach lane=%s last_success_age_ms=%s "
+                    "threshold_ms=%s slot_acquire_timeout_count=%s last_refresh_error=%s",
+                    name,
+                    age_success,
+                    _DIAGNOSTIC_WATCHDOG_BREACH_MULT * max_stale_ms,
+                    snap.get("slot_acquire_timeout_count"),
+                    snap.get("last_refresh_error"),
+                )
+                with _DIAGNOSTIC_WARMER_LOCK:
+                    _DIAGNOSTIC_WARMER_OBSERVABILITY["watchdog_breach_count"] = (
+                        int(_DIAGNOSTIC_WARMER_OBSERVABILITY["watchdog_breach_count"] or 0) + 1
+                    )
+                    _DIAGNOSTIC_WARMER_OBSERVABILITY["last_breach_lane"] = name
+                if _DIAGNOSTIC_WATCHDOG_ENQUEUE_REFRESH:
+                    ensure_refresh()  # normal refresh only — NEVER a semaphore reset (gauntlet1 A4)
+        except Exception:
+            logger.debug("diagnostic_warmer tick error lane=%s", name, exc_info=True)
+
+
+def _diagnostic_warmer_loop() -> None:
+    interval = _diagnostic_warmer_interval_s()
+    with _DIAGNOSTIC_WARMER_LOCK:
+        _DIAGNOSTIC_WARMER_OBSERVABILITY["alive"] = True
+        _DIAGNOSTIC_WARMER_OBSERVABILITY["interval_s"] = interval
+    try:
+        while not _diagnostic_warmer_stop_event.is_set():
+            _warm_one_tick()
+            with _DIAGNOSTIC_WARMER_LOCK:
+                _DIAGNOSTIC_WARMER_OBSERVABILITY["tick_count"] = (
+                    int(_DIAGNOSTIC_WARMER_OBSERVABILITY["tick_count"] or 0) + 1
+                )
+                _DIAGNOSTIC_WARMER_OBSERVABILITY["last_tick_monotonic"] = time.monotonic()
+            _diagnostic_warmer_stop_event.wait(timeout=interval)  # interruptible sleep
+    finally:
+        with _DIAGNOSTIC_WARMER_LOCK:
+            _DIAGNOSTIC_WARMER_OBSERVABILITY["alive"] = False
+
+
+def start_diagnostic_warmer() -> None:
+    """Start the warmer daemon thread if enabled. Idempotent."""
+    global _diagnostic_warmer_thread
+    if not _DIAGNOSTIC_WARMER_ENABLED:
+        logger.info("diagnostic_warmer disabled (PITH_DIAGNOSTIC_WARMER_ENABLED off)")
+        return
+    with _DIAGNOSTIC_WARMER_LOCK:
+        if _diagnostic_warmer_thread is not None and _diagnostic_warmer_thread.is_alive():
+            return
+        _diagnostic_warmer_stop_event.clear()
+        _diagnostic_warmer_thread = threading.Thread(
+            target=_diagnostic_warmer_loop, name="pith-diagnostic-warmer", daemon=True
+        )
+        _diagnostic_warmer_thread.start()
+    logger.info(
+        "diagnostic_warmer started interval_s=%.2f breach_mult=%d",
+        _diagnostic_warmer_interval_s(),
+        _DIAGNOSTIC_WATCHDOG_BREACH_MULT,
+    )
+
+
+def shutdown_diagnostic_warmer(wait: bool = True, timeout: float = 5.0) -> None:
+    """Stop the warmer thread (kill switch / graceful shutdown)."""
+    _diagnostic_warmer_stop_event.set()
+    thread = _diagnostic_warmer_thread
+    if wait and thread is not None and thread.is_alive():
+        thread.join(timeout=timeout)
+
+
+def _diagnostic_warmer_snapshot() -> dict:
+    """Public health block. Surfaces warmer liveness + per-lane refresh_worker_last_success_age_ms.
+
+    EUNOMIA-128: also surfaces a read-only ``diagnostic_slot_saturation`` summary — the
+    configured slot count, the measured-safe ceiling (annotated with the DB scale it was
+    validated at), and the cumulative slot-acquire-timeout total summed across the three
+    background-refresh lanes. This is the signal the saturation monitor reads to decide
+    whether raising PITH_DIAGNOSTIC_ENDPOINT_SLOTS is justified. Pure aggregation of
+    existing per-lane counters: no SQL, no slot/semaphore behavior change.
+    """
+    with _DIAGNOSTIC_WARMER_LOCK:
+        snap = dict(_DIAGNOSTIC_WARMER_OBSERVABILITY)
+    last_tick = snap.pop("last_tick_monotonic", None)
+    snap["last_tick_age_ms"] = None if last_tick is None else round((time.monotonic() - last_tick) * 1000)
+    fast_stats_obs = _fast_stats_observability_snapshot()
+    fast_health_obs = _fast_health_observability_snapshot()
+    knowledge_areas_obs = _knowledge_areas_observability_snapshot()
+    snap["refresh_worker_last_success_age_ms"] = {
+        "fast_stats": fast_stats_obs.get("last_success_age_ms"),
+        "fast_health": fast_health_obs.get("last_success_age_ms"),
+        "knowledge_areas": knowledge_areas_obs.get("last_success_age_ms"),
+    }
+    # EUNOMIA-128: read-only saturation summary. Sums the per-lane slot-acquire-timeout
+    # counters. The integrity probe's distinct ``probe_slot_acquire_timeout_count`` is
+    # intentionally EXCLUDED — it has its own single-flight slot (mode=ro). The counter is
+    # monotonic and reset only on process restart, so ``saturated`` is a cumulative-since-
+    # start signal; the live raise-trigger is the monitor's delta-over-window, not this bool.
+    slot_acquire_timeout_total = (
+        int(fast_stats_obs.get("slot_acquire_timeout_count") or 0)
+        + int(fast_health_obs.get("slot_acquire_timeout_count") or 0)
+        + int(knowledge_areas_obs.get("slot_acquire_timeout_count") or 0)
+    )
+    snap["diagnostic_slot_saturation"] = {
+        "slot_count": _DIAGNOSTIC_ENDPOINT_SLOT_COUNT,
+        # validated SAFE at 1.65GB WAL DB / 35,378 concepts (EUNOMIA-128, 2026-06-16);
+        # re-run the 2-slot experiment before raising if the DB has grown materially.
+        "validated_max_slots": 2,
+        "validated_at_db_bytes": 1_650_000_000,
+        "validated_at_concept_count": 35_378,
+        "slot_acquire_timeout_total": slot_acquire_timeout_total,
+        "saturated": slot_acquire_timeout_total > 0,
+    }
+    return snap
+
+
 def _build_git_provenance() -> dict:
     """Compare imported runtime code against the current worktree HEAD."""
-    current_head = _read_git_head_commit()
-    matches_head = None
-    if _GIT_COMMIT != "unknown" and current_head != "unknown":
-        matches_head = current_head == _GIT_COMMIT
+    runtime_git_head = _read_git_head_commit()
+    code_identity_head = _GIT_COMMIT if _GIT_COMMIT_SOURCE == "deploy_metadata" else runtime_git_head
+    matches_head = _git_commits_match(_GIT_COMMIT, code_identity_head)
+    canonical_head = _read_canonical_head(code_identity_head)
+    matches_canonical = _git_commits_match(code_identity_head, canonical_head)
     return {
         "git_commit": _GIT_COMMIT,
+        "git_commit_source": _GIT_COMMIT_SOURCE,
         "git_branch": _GIT_BRANCH,
         "git_dirty": _GIT_DIRTY,
-        "git_current_head": current_head,
+        "git_current_head": code_identity_head,
         "git_commit_matches_head": matches_head,
+        "canonical_head": canonical_head,
+        "runtime_head": code_identity_head,
+        "runtime_git_head": runtime_git_head,
+        "runtime_matches_canonical": matches_canonical,
+        "canonical_repo_root": str(_CANONICAL_REPO_ROOT),
+        "deploy_metadata_path": str(_DEPLOY_METADATA_PATH),
     }
+
+
+def _read_canonical_head(runtime_head: str) -> str:
+    if not _CANONICAL_REPO_ROOT.exists() or _CANONICAL_REPO_ROOT == _REPO_ROOT:
+        return runtime_head
+    try:
+        return _read_git_head_commit(_CANONICAL_REPO_ROOT)
+    except Exception:
+        return runtime_head
 
 from app.api.write_durability import (
     abandon_write_request,
     begin_write_request,
     commit_write_request,
     fail_write_request,
+    get_write_request_status,
 )
 from app.core.brain_lock import BrainLockError, acquire_brain_lock, release_brain_lock
 from app.core.datetime_utils import _ensure_aware, _utc_now, _utc_now_iso
@@ -235,6 +794,9 @@ _cfg.LIFECYCLE_JOB_LEASE_SECONDS = int(
 _cfg.LIFECYCLE_DRAIN_STUCK_SECONDS = int(
     os.environ.get("PITH_LIFECYCLE_DRAIN_STUCK_SECONDS", str(_cfg.LIFECYCLE_DRAIN_STUCK_SECONDS))
 )
+_cfg.LIFECYCLE_DRAIN_WALL_BUDGET_SECONDS = float(
+    os.environ.get("PITH_LIFECYCLE_DRAIN_WALL_BUDGET_SECONDS", str(_cfg.LIFECYCLE_DRAIN_WALL_BUDGET_SECONDS))
+)
 _cfg.LIFECYCLE_JOB_MAX_ATTEMPTS = int(
     os.environ.get("PITH_LIFECYCLE_JOB_MAX_ATTEMPTS", str(_cfg.LIFECYCLE_JOB_MAX_ATTEMPTS))
 )
@@ -244,6 +806,39 @@ _cfg.LIFECYCLE_JOB_RETRY_SECONDS = int(
 _cfg.LIFECYCLE_JOB_CLEANUP_DAYS = int(
     os.environ.get("PITH_LIFECYCLE_JOB_CLEANUP_DAYS", str(_cfg.LIFECYCLE_JOB_CLEANUP_DAYS))
 )
+_cfg.LIFECYCLE_SUPERVISOR_ENABLED = os.environ.get(
+    "PITH_LIFECYCLE_SUPERVISOR_ENABLED",
+    str(_cfg.LIFECYCLE_JOBS_ENABLED).lower(),
+).lower() in ("1", "true", "yes")
+_cfg.LIFECYCLE_SUPERVISOR_INTERVAL_SECONDS = float(
+    os.environ.get(
+        "PITH_LIFECYCLE_SUPERVISOR_INTERVAL_SECONDS",
+        str(_cfg.LIFECYCLE_SUPERVISOR_INTERVAL_SECONDS),
+    )
+)
+_cfg.LIFECYCLE_SUPERVISOR_BATCH_SIZE = int(
+    os.environ.get("PITH_LIFECYCLE_SUPERVISOR_BATCH_SIZE", str(_cfg.LIFECYCLE_SUPERVISOR_BATCH_SIZE))
+)
+_cfg.LIFECYCLE_SUPERVISOR_MAX_WALL_SECONDS = float(
+    os.environ.get(
+        "PITH_LIFECYCLE_SUPERVISOR_MAX_WALL_SECONDS",
+        str(_cfg.LIFECYCLE_SUPERVISOR_MAX_WALL_SECONDS),
+    )
+)
+_cfg.LIFECYCLE_SUPERVISOR_STARVATION_SECONDS = float(
+    os.environ.get(
+        "PITH_LIFECYCLE_SUPERVISOR_STARVATION_SECONDS",
+        str(_cfg.LIFECYCLE_SUPERVISOR_STARVATION_SECONDS),
+    )
+)
+_cfg.REFLECTION_DURABLE_JOBS_ENABLED = os.environ.get(
+    "PITH_REFLECTION_DURABLE_JOBS_ENABLED",
+    str(_cfg.LIFECYCLE_JOBS_ENABLED).lower(),
+).lower() in ("1", "true", "yes")
+_cfg.REFLECTION_COMPLETION_MONITOR_ENABLED = os.environ.get(
+    "PITH_REFLECTION_COMPLETION_MONITOR_ENABLED",
+    str(_cfg.REFLECTION_DURABLE_JOBS_ENABLED).lower(),
+).lower() in ("1", "true", "yes")
 
 
 import logging
@@ -252,9 +847,9 @@ from dataclasses import asdict, dataclass
 from importlib import import_module
 from typing import Any
 
-from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import (
     BaseModel as PydanticBaseModel,
 )
@@ -275,11 +870,16 @@ from app.core.models import (
     ConceptProposal,
     ConversationTurnRequest,
     SearchQuery,
+    SearchResult,
     SessionEndRequest,
+    SessionInfo,
     SessionLearnRequest,
     SessionLearnResponse,
 )
 from app.storage import (
+    _db,
+    _db_immediate,
+    _invalidate_associations_cache,
     add_association,
     count_associations,
     get_distribution_report,
@@ -293,6 +893,7 @@ from app.storage import (
     restore_concept,
     run_storage_migration,
     save_concept,
+    update_concept_data,
 )
 from app.storage.connection import read_snapshot_db, request_db_scope
 
@@ -502,13 +1103,13 @@ install_route_compat_middleware(app)
 def _ensure_api_key() -> str:
     """Ensure an API key exists — read from env, or auto-generate and persist.
 
-    Priority: PITH_API_KEY env > BRAIN_API_KEY env > auto-generate.
+    Priority: PITH_API_KEY env > auto-generate.
     A3: If persistence to ~/.pith/.env fails, still sets os.environ (session-only)
     and logs a warning so operators know the key won't survive restart.
     """
     import secrets
 
-    key = os.environ.get("PITH_API_KEY") or os.environ.get("BRAIN_API_KEY", "")
+    key = os.environ.get("PITH_API_KEY", "")
     if key:
         return key
 
@@ -696,13 +1297,25 @@ def _set_degraded_reason(reason: str | None) -> None:
 
 
 def _build_auth_status(request: Request | None = None) -> dict:
+    import hmac
+
     caller_key = request.headers.get("X-API-Key", "") if request else ""
     key_configured = bool(API_KEY)
-    caller_authenticated = key_configured and caller_key == API_KEY
+    caller_authenticated = (
+        key_configured and bool(caller_key) and hmac.compare_digest(caller_key, API_KEY)
+    )
+    if caller_authenticated:
+        write_path = "ok"
+    elif not key_configured:
+        write_path = "no_key_configured"
+    elif not caller_key:
+        write_path = "not_provided"
+    else:
+        write_path = "invalid_key"
     return {
         "key_configured": key_configured,
         "caller_authenticated": caller_authenticated,
-        "write_path": "ok" if caller_authenticated else ("no_key_configured" if not key_configured else "invalid_key"),
+        "write_path": write_path,
     }
 
 
@@ -715,6 +1328,7 @@ def _build_ready_state() -> dict:
     warnings = list(getattr(app.state, "startup_warnings", []) or [])
     git_provenance = _build_git_provenance()
     commit_matches_head = git_provenance["git_commit_matches_head"]
+    runtime_matches_canonical = git_provenance.get("runtime_matches_canonical")
     if commit_matches_head is False:
         if degraded_reason is None:
             degraded_reason = _GIT_MISMATCH_REASON
@@ -724,13 +1338,32 @@ def _build_ready_state() -> dict:
         )
         if warning not in warnings:
             warnings.append(warning)
+    if runtime_matches_canonical is False:
+        if degraded_reason is None:
+            degraded_reason = _CANONICAL_MISMATCH_REASON
+        warning = (
+            f"{_CANONICAL_MISMATCH_REASON}: runtime_head={git_provenance['runtime_head']} "
+            f"canonical_head={git_provenance['canonical_head']}"
+        )
+        if warning not in warnings:
+            warnings.append(warning)
     mode = "ready"
     if process_state == "blocked" or write_state == "blocked":
         mode = "blocked"
     elif process_state != "running":
         mode = "recovering"
-    elif degraded_reason or retrieval_state in {"recovering", "degraded"} or commit_matches_head is False:
+    elif (
+        degraded_reason
+        or retrieval_state in {"recovering", "degraded"}
+        or commit_matches_head is False
+        or runtime_matches_canonical is False
+    ):
         mode = "degraded"
+    try:
+        retrieval_index = retrieval_engine.index.get_stats()
+        retrieval_index["state"] = retrieval_state
+    except Exception as exc:
+        retrieval_index = {"state": "unknown", "error": _safe_error(exc)}
     return {
         "status": "healthy" if process_state in {"starting", "running"} else "stopping",
         "service": "pith",
@@ -741,12 +1374,29 @@ def _build_ready_state() -> dict:
         "process_state": process_state,
         "write_state": write_state,
         "retrieval_state": retrieval_state,
+        "retrieval_index": retrieval_index,
         "maintenance_state": maintenance_state,
         "degraded_reason": degraded_reason,
         "last_successful_write_at": getattr(app.state, "last_successful_write_at", None),
         "outbox_depth": getattr(app.state, "outbox_depth", 0),
         "startup_warnings": warnings,
     }
+
+
+def _apply_memory_durability_health(ready: dict, *, lifecycle_jobs: dict, session_learn_queue: dict) -> None:
+    """Surface durable-memory debt in overall readiness without marking the process dead."""
+    for name, metric in (
+        ("lifecycle_jobs", lifecycle_jobs),
+        ("session_learn_queue", session_learn_queue),
+    ):
+        status = metric.get("status")
+        if status != "critical":
+            continue
+        if ready.get("mode") == "ready":
+            ready["mode"] = "degraded"
+        if not ready.get("degraded_reason"):
+            ready["degraded_reason"] = f"memory_durability_{name}_{status}"
+        return
 
 
 def _external_maintenance_freshness_threshold_hours(scheduler_installed: bool) -> float:
@@ -762,7 +1412,8 @@ def _build_external_maintenance_health() -> dict[str, Any]:
     from app.core.profile import resolve_data_dir
 
     heartbeat_path = Path(resolve_data_dir()) / "maintenance_heartbeat.json"
-    scheduler_path = Path.home() / "Library" / "LaunchAgents" / "com.pith.maintenance.plist"
+    scheduler_dir = Path(os.environ.get("PITH_LAUNCH_AGENTS_DIR", Path.home() / "Library" / "LaunchAgents"))
+    scheduler_path = scheduler_dir / "com.pith.maintenance.plist"
     scheduler_installed = scheduler_path.exists()
 
     base = {
@@ -1206,6 +1857,105 @@ async def _run_deferred_startup_warmups(
         await _warm_reranker_for_startup()
 
 
+def _run_conversation_turn_lifecycle_job(job: dict) -> dict:
+    payload = job.get("payload") or {}
+    request_payload = payload.get("learn_request") if isinstance(payload, dict) else None
+    if not isinstance(request_payload, dict):
+        raise ValueError("conversation_turn lifecycle job missing learn_request payload")
+    learn_request = SessionLearnRequest(**request_payload)
+    bound_session_payload = payload.get("bound_session")
+    bound_session = SessionInfo(**bound_session_payload) if bound_session_payload else None
+    result = session_manager._background_autolearn(
+        learn_request,
+        payload.get("extracted"),
+        payload.get("request_message", ""),
+        payload.get("prev_msg", ""),
+        payload.get("prev_response", ""),
+        bound_session,
+        payload.get("raw_capture_ref"),
+        payload.get("active_binding_snapshot"),
+    )
+    return {"status": "committed", "result": result}
+
+
+def _register_lifecycle_job_runners() -> None:
+    from app.ops.reflection_runner import run_reflection_lifecycle_job
+    from app.session.lifecycle_jobs_runtime import register_lifecycle_job_runner
+
+    register_lifecycle_job_runner("conversation_turn", _run_conversation_turn_lifecycle_job)
+    register_lifecycle_job_runner("session_learn", _run_session_learn_lifecycle_job)
+    register_lifecycle_job_runner("reflection_full", run_reflection_lifecycle_job)
+
+
+def _start_lifecycle_supervisor_if_enabled() -> None:
+    if os.environ.get("PITH_BENCHMARK_READONLY", "").lower() in ("1", "true"):
+        app.state.lifecycle_supervisor_state = "disabled_readonly"
+        return
+    if not _cfg.LIFECYCLE_JOBS_ENABLED:
+        app.state.lifecycle_supervisor_state = "disabled_lifecycle_jobs"
+        return
+    if not _cfg.LIFECYCLE_SUPERVISOR_ENABLED:
+        app.state.lifecycle_supervisor_state = "disabled_flag"
+        return
+    try:
+        from app.session.lifecycle_jobs_runtime import start_lifecycle_supervisor
+
+        _register_lifecycle_job_runners()
+        started = start_lifecycle_supervisor(
+            interval_seconds=_cfg.LIFECYCLE_SUPERVISOR_INTERVAL_SECONDS,
+            batch_size=_cfg.LIFECYCLE_SUPERVISOR_BATCH_SIZE,
+            max_wall_seconds=_cfg.LIFECYCLE_SUPERVISOR_MAX_WALL_SECONDS,
+            starvation_seconds=_cfg.LIFECYCLE_SUPERVISOR_STARVATION_SECONDS,
+        )
+        app.state.lifecycle_supervisor_state = "running" if started else "already_running"
+        logger.info("Lifecycle supervisor state: %s", app.state.lifecycle_supervisor_state)
+    except Exception as exc:
+        app.state.lifecycle_supervisor_state = "degraded"
+        app.state.startup_warnings.append(
+            {
+                "component": "lifecycle_supervisor",
+                "severity": "degraded",
+                "message": f"Lifecycle supervisor failed to start: {exc}",
+            }
+        )
+        logger.warning("Lifecycle supervisor failed to start: %s", exc, exc_info=True)
+
+
+def _start_autolearn_maintenance_supervisor_if_enabled() -> None:
+    if os.environ.get("PITH_BENCHMARK_READONLY", "").lower() in ("1", "true"):
+        app.state.autolearn_maintenance_supervisor_state = "disabled_readonly"
+        return
+    if not _cfg.get_autolearn_maintenance_enabled():
+        app.state.autolearn_maintenance_supervisor_state = "disabled_autolearn_maintenance"
+        return
+    if not _cfg.get_autolearn_maintenance_supervisor_enabled():
+        app.state.autolearn_maintenance_supervisor_state = "disabled_flag"
+        return
+    try:
+        from app.session.autolearn_maintenance import start_autolearn_maintenance_supervisor
+
+        started = start_autolearn_maintenance_supervisor(
+            interval_seconds=_cfg.get_autolearn_maintenance_supervisor_interval_seconds(),
+            batch_size=_cfg.get_autolearn_maintenance_supervisor_batch_size(),
+            max_wall_seconds=_cfg.get_autolearn_maintenance_supervisor_max_wall_seconds(),
+        )
+        app.state.autolearn_maintenance_supervisor_state = "running" if started else "already_running"
+        logger.info(
+            "Autolearn maintenance supervisor state: %s",
+            app.state.autolearn_maintenance_supervisor_state,
+        )
+    except Exception as exc:
+        app.state.autolearn_maintenance_supervisor_state = "degraded"
+        app.state.startup_warnings.append(
+            {
+                "component": "autolearn_maintenance_supervisor",
+                "severity": "degraded",
+                "message": f"Autolearn maintenance supervisor failed to start: {exc}",
+            }
+        )
+        logger.warning("Autolearn maintenance supervisor failed to start: %s", exc, exc_info=True)
+
+
 async def _complete_startup_initialization():
     """Finish non-critical startup work after the API is live.
 
@@ -1223,6 +1973,8 @@ async def _complete_startup_initialization():
             await asyncio.to_thread(get_backend)
             app.state.write_state = "accepting"
             _schedule_all_write_replay_reclaimers("startup")
+            _start_lifecycle_supervisor_if_enabled()
+            _start_autolearn_maintenance_supervisor_if_enabled()
         except Exception as e:
             app.state.process_state = "blocked"
             app.state.write_state = "blocked"
@@ -1430,6 +2182,18 @@ async def _complete_startup_initialization():
                     }
                 )
 
+        # RETRIEVAL-125 Phase C: steady-state TF-IDF/embedding refresh drain
+        # (gated OFF by default via PITH_TFIDF_REFRESH_DRAIN).
+        try:
+            from app.retrieval.refresh_drain import start_refresh_drain
+
+            _drain_task = await start_refresh_drain()
+            if _drain_task is not None:
+                app.state.refresh_drain_task = _drain_task
+                logger.info("Startup: TF-IDF refresh drain started")
+        except Exception as e:
+            logger.warning(f"Startup: TF-IDF refresh drain failed to start (non-fatal): {e}")
+
         if getattr(app.state, "retrieval_state", "recovering") != "degraded":
             app.state.retrieval_state = "ready"
         if app.state.write_state != "blocked":
@@ -1469,6 +2233,7 @@ async def startup_event():
     app.state.write_state = "queued"
     app.state.retrieval_state = "recovering"
     app.state.maintenance_state = "disabled"
+    app.state.lifecycle_supervisor_state = "disabled"
     app.state.degraded_reason = None
 
     try:
@@ -1535,6 +2300,7 @@ async def startup_event():
     _register_signal_handlers()
     app.state.startup_task = asyncio.create_task(_complete_startup_initialization())
     logger.info("Startup: Deferred initialization scheduled")
+    start_diagnostic_warmer()  # EUNOMIA-126: no-op when PITH_DIAGNOSTIC_WARMER_ENABLED is off
 
 
 @app.on_event("shutdown")
@@ -1568,6 +2334,24 @@ async def shutdown_event():
     except Exception as e:
         logger.warning(f"Shutdown: Association index refresh shutdown failed: {e}")
 
+    try:
+        from app.session.lifecycle_jobs_runtime import shutdown_lifecycle_runtime
+
+        shutdown_lifecycle_runtime(wait=True)
+        app.state.lifecycle_supervisor_state = "stopped"
+        logger.info("Shutdown: Lifecycle runtime stopped")
+    except Exception as e:
+        logger.warning(f"Shutdown: Lifecycle runtime shutdown failed: {e}")
+
+    try:
+        from app.session.autolearn_maintenance import stop_autolearn_maintenance_supervisor
+
+        stop_autolearn_maintenance_supervisor(wait=True)
+        app.state.autolearn_maintenance_supervisor_state = "stopped"
+        logger.info("Shutdown: Autolearn maintenance supervisor stopped")
+    except Exception as e:
+        logger.warning(f"Shutdown: Autolearn maintenance supervisor shutdown failed: {e}")
+
     # STABILITY-037 Fix 3b: Wait for autolearn executor to finish
     try:
         _executor = getattr(session_manager, "_learn_executor", None)
@@ -1595,6 +2379,18 @@ async def shutdown_event():
         await stop_maintenance_scheduler()
     except Exception as e:
         logger.warning(f"Shutdown: Scheduler stop failed: {e}")
+    # RETRIEVAL-125 Phase C: stop the steady-state refresh drain
+    try:
+        from app.retrieval.refresh_drain import stop_refresh_drain
+
+        await stop_refresh_drain()
+    except Exception as e:
+        logger.warning(f"Shutdown: TF-IDF refresh drain stop failed: {e}")
+    try:
+        shutdown_diagnostic_warmer(wait=True)  # EUNOMIA-126
+        logger.info("Shutdown: diagnostic warmer stopped")
+    except Exception as e:
+        logger.warning(f"Shutdown: diagnostic warmer shutdown failed: {e}")
     release_brain_lock()
     logger.info("Pith Server shutting down...")
 
@@ -1620,10 +2416,10 @@ def _register_signal_handlers():
                 _source = "launchd"
             elif _ppid == os.getpid():
                 _source = "self"
+            elif should_suppress_optional_subprocess("shutdown_parent_process_name"):
+                _source = f"pid={_ppid}"
             else:
                 try:
-                    import subprocess
-
                     _pname = subprocess.check_output(["ps", "-p", str(_ppid), "-o", "comm="], timeout=1).decode().strip()
                     _source = f"parent:{_pname}(pid={_ppid})"
                 except Exception:
@@ -1644,6 +2440,18 @@ def _register_signal_handlers():
                 logger.warning("OPS-075/T1-3: Stack at %s:\n%s", sig_name, stack)
             except Exception:
                 pass
+            try:
+                from app.ops.reflection_runner import reflection_runner
+
+                active_reflection = reflection_runner.get_active_run()
+                if active_reflection:
+                    logger.warning(
+                        "Reflection run active during %s shutdown signal: %s",
+                        sig_name,
+                        active_reflection,
+                    )
+            except Exception:
+                logger.debug("Unable to capture active reflection snapshot during shutdown", exc_info=True)
             app.state.process_state = "stopping"
             if callable(previous_handler):
                 return previous_handler(signum, frame)
@@ -1675,7 +2483,12 @@ def _get_feature_flags() -> dict:
     not just config.py defaults. Uses get_feature_flag() per flag."""
     from app.core.config import FEATURE_FLAGS, get_feature_flag
 
-    return {name: get_feature_flag(name, default) for name, default in FEATURE_FLAGS.items()}
+    flags = {name: get_feature_flag(name, default) for name, default in FEATURE_FLAGS.items()}
+    flags["LIFECYCLE_JOBS_ENABLED"] = bool(_cfg.LIFECYCLE_JOBS_ENABLED)
+    flags["LIFECYCLE_SUPERVISOR_ENABLED"] = bool(_cfg.LIFECYCLE_SUPERVISOR_ENABLED)
+    flags["REFLECTION_DURABLE_JOBS_ENABLED"] = bool(_cfg.REFLECTION_DURABLE_JOBS_ENABLED)
+    flags["REFLECTION_COMPLETION_MONITOR_ENABLED"] = bool(_cfg.REFLECTION_COMPLETION_MONITOR_ENABLED)
+    return flags
 
 
 def _read_only_aggregates_enabled() -> bool:
@@ -1743,7 +2556,10 @@ def _get_pricing_health() -> dict:
         return {
             "budget_zone": status.get("budget_zone", "unknown"),
             "turns_used": status.get("turns_used", 0),
+            "turns_remaining": status.get("turns_remaining", 0),
             "daily_limit": status.get("daily_limit", 0),
+            "usage_limits_enabled": status.get("usage_limits_enabled"),
+            "unlimited_usage": status.get("unlimited_usage"),
             "capped_at": status.get("capped_at"),
         }
     except Exception:
@@ -1868,9 +2684,137 @@ def reset_answer_path_policy(
     return _answer_path_policy_response(snapshot)
 
 
+def _resolve_health_detail(request: Request, detail: str | None = None) -> str:
+    values: list[str] = []
+    query_params = getattr(request, "query_params", None)
+    if query_params is not None and hasattr(query_params, "getlist"):
+        values = list(query_params.getlist("detail"))
+    if len(values) > 1:
+        raise HTTPException(status_code=400, detail="detail must be one of: summary, full, auto")
+    raw_detail = detail if detail is not None else (values[0] if values else os.environ.get("PITH_HEALTH_DEFAULT_DETAIL", "summary"))
+    resolved = str(raw_detail or "summary").strip().lower()
+    if resolved not in {"summary", "full", "auto"}:
+        raise HTTPException(status_code=400, detail="detail must be one of: summary, full, auto")
+    return resolved
+
+
+def _pressure_state_active_contention(pressure_state: Any | None) -> bool:
+    payload = pressure_state.to_dict() if hasattr(pressure_state, "to_dict") else (
+        pressure_state if isinstance(pressure_state, dict) else {}
+    )
+    return bool(payload.get("active_contention"))
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _pressure_state_level(pressure_state: Any | None) -> str:
+    payload = pressure_state.to_dict() if hasattr(pressure_state, "to_dict") else (
+        pressure_state if isinstance(pressure_state, dict) else {}
+    )
+    return str(payload.get("pressure_level") or "none")
+
+
+def _health_budget_ms() -> float:
+    return max(0.0, _env_float("PITH_FULL_HEALTH_BUDGET_MS", 2500.0))
+
+
+def _health_elapsed_ms(start: float) -> float:
+    return round((time.perf_counter() - start) * 1000.0, 2)
+
+
+def _health_budget_exhausted(start: float, budget_ms: float) -> bool:
+    return budget_ms > 0 and _health_elapsed_ms(start) >= budget_ms
+
+
+def _health_section_budget_ms(section: str) -> float:
+    env_name = f"PITH_HEALTH_SECTION_{section.upper()}_BUDGET_MS"
+    return max(0.0, _env_float(env_name, _env_float("PITH_HEALTH_SECTION_BUDGET_MS", 25.0)))
+
+
+def _health_remaining_ms(start: float, budget_ms: float) -> float | None:
+    if budget_ms <= 0:
+        return None
+    return max(0.0, budget_ms - _health_elapsed_ms(start))
+
+
+def _with_health_section_metadata(
+    payload: dict,
+    *,
+    section: str,
+    section_start: float,
+    section_budget_ms: float,
+    deferred: bool = False,
+    reason: str | None = None,
+) -> dict:
+    enriched = dict(payload)
+    enriched.setdefault("section", section)
+    enriched.setdefault("section_elapsed_ms", _health_elapsed_ms(section_start))
+    enriched.setdefault("section_budget_ms", section_budget_ms)
+    enriched.setdefault("deferred", deferred)
+    if reason is not None:
+        enriched.setdefault("reason", reason)
+    return enriched
+
+
+def _run_health_section(
+    section: str,
+    health_start: float,
+    global_budget_ms: float,
+    builder,
+) -> dict:
+    section_budget_ms = _health_section_budget_ms(section)
+    section_start = time.perf_counter()
+    remaining_ms = _health_remaining_ms(health_start, global_budget_ms)
+    if remaining_ms is not None and section_budget_ms > 0 and remaining_ms < section_budget_ms:
+        return _with_health_section_metadata(
+            _build_unavailable_health_metric("health_section_budget_exhausted"),
+            section=section,
+            section_start=section_start,
+            section_budget_ms=section_budget_ms,
+            deferred=True,
+            reason="health_section_budget_exhausted",
+        )
+    try:
+        payload = builder()
+    except Exception as exc:
+        payload = {
+            "status": "unknown",
+            "alert": True,
+            "reason": f"{section}_health_failed",
+            "error": _safe_error(exc),
+        }
+    return _with_health_section_metadata(
+        payload,
+        section=section,
+        section_start=section_start,
+        section_budget_ms=section_budget_ms,
+    )
+
+
+def _deferred_health_metric(reason: str, *, pressure_state: Any | None = None) -> dict:
+    return {
+        "status": "degraded",
+        "alert": True,
+        "deferred": True,
+        "reason": reason,
+        "pressure_level": _pressure_state_level(pressure_state),
+    }
+
+
 @app.get("/health")
-def health_check(request: Request):
-    with request_db_scope("health"):
+def health_check(request: Request, detail: str | None = None):
+    health_start = time.perf_counter()
+    health_detail = _resolve_health_detail(request, detail)
+    health_budget_ms = _health_budget_ms()
+    # /health is observational; do not wrap the whole response in a DB-boundary
+    # request scope. Full-health diagnostics can stall or outlive clients, and a
+    # broad scope then makes health itself appear as foreground DB contention.
+    with nullcontext():
         try:
             from app.core.profile import get_active_profile, resolve_data_dir
 
@@ -1892,18 +2836,80 @@ def health_check(request: Request):
             ready["benchmark_mode"] = os.environ.get("PITH_BENCHMARK_MODE", "").lower() in ("true", "1")
             ready["benchmark_readonly"] = os.environ.get("PITH_BENCHMARK_READONLY", "").lower() in ("true", "1")
             ready["auth_status"] = _build_auth_status(request)
+            ready["workstreams"] = _workstreams_capability_contract()
+            try:
+                from app.ops.reflection_runner import reflection_runner
+
+                ready["active_reflection"] = reflection_runner.get_active_run()
+            except Exception:
+                ready["active_reflection"] = None
+            try:
+                from app.ops.pressure_state import build_pressure_state
+
+                pressure_state = build_pressure_state(active_reflection=ready["active_reflection"], use_cache=True)
+                ready["pressure_state"] = pressure_state.to_dict()
+            except Exception as pressure_err:
+                pressure_state = None
+                ready["pressure_state"] = {
+                    "active_contention": False,
+                    "active_sources": [],
+                    "pressure_level": "unknown",
+                    "reason_codes": ["pressure_state_failed"],
+                    "error": _safe_error(pressure_err),
+                }
             required_context_cache = _build_required_context_cache_health()
-            defer_db_metrics = _should_defer_health_db_metrics(ready)
-            defer_reason = _health_metrics_defer_reason(ready) if defer_db_metrics else None
+            startup_defer = _should_defer_health_db_metrics(ready)
+            try:
+                from app.ops.pressure_policy import should_defer_health_diagnostics
+
+                pressure_defer = health_detail in {"auto", "full"} and should_defer_health_diagnostics(pressure_state)
+            except Exception:
+                pressure_defer = health_detail == "auto" and _pressure_state_active_contention(pressure_state)
+            budget_defer = health_detail == "full" and _health_budget_exhausted(health_start, health_budget_ms)
+            defer_db_metrics = health_detail == "summary" or startup_defer or pressure_defer or budget_defer
+            if health_detail == "summary":
+                defer_reason = "summary_health_no_db_metrics"
+            elif pressure_defer:
+                if health_detail == "full":
+                    defer_reason = "pressure_protected_health"
+                else:
+                    defer_reason = "active_contention" if _pressure_state_active_contention(pressure_state) else "pressure_protected_health"
+            elif budget_defer:
+                defer_reason = "health_detail_budget_exhausted"
+            else:
+                defer_reason = _health_metrics_defer_reason(ready) if startup_defer else None
+            ready["metrics_detail"] = health_detail
+            ready["health_budget_ms"] = health_budget_ms
+            ready["db_metrics_deferred"] = bool(defer_db_metrics)
+            if defer_reason:
+                ready["db_metrics_defer_reason"] = defer_reason
+            if health_detail == "full":
+                # EUNOMIA-126: warmer/watchdog liveness (in-process; no DB, not defer-gated)
+                ready["diagnostic_warmer"] = _diagnostic_warmer_snapshot()
             conversation_turn_latency = (
-                _build_unavailable_health_metric(defer_reason)
+                _deferred_health_metric(defer_reason, pressure_state=pressure_state)
+                if defer_db_metrics and defer_reason in {"pressure_protected_health", "health_detail_budget_exhausted"}
+                else _build_unavailable_health_metric(defer_reason)
                 if defer_db_metrics and defer_reason is not None
-                else _build_conversation_turn_latency_health()
+                else _run_health_section(
+                    "conversation_turn_latency",
+                    health_start,
+                    health_budget_ms,
+                    lambda: _build_conversation_turn_latency_health(pressure_state=pressure_state),
+                )
             )
+            if health_detail == "full" and _health_budget_exhausted(health_start, health_budget_ms):
+                defer_db_metrics = True
+                defer_reason = "health_detail_budget_exhausted"
             lifecycle_jobs = (
-                _build_unavailable_health_metric(defer_reason)
+                _build_deferred_lifecycle_jobs_health(defer_reason, pressure_state=pressure_state)
                 if defer_db_metrics and defer_reason is not None
-                else _build_lifecycle_jobs_health()
+                else _run_health_section(
+                    "lifecycle_jobs",
+                    health_start,
+                    health_budget_ms,
+                    _build_lifecycle_jobs_health,
+                )
             )
             ready["components"] = {
                 "storage": "ok",
@@ -1917,16 +2923,40 @@ def health_check(request: Request):
                 "required_context_cache": required_context_cache.get("status", "unknown"),
                 "conversation_turn_latency": conversation_turn_latency.get("status", "unknown"),
                 "lifecycle_jobs": lifecycle_jobs.get("status", "unknown"),
+                "autolearn_maintenance": "unknown",
             }
             if defer_db_metrics:
-                contradiction_signals = _build_unavailable_health_metric(defer_reason)
+                contradiction_signals = (
+                    _deferred_health_metric(defer_reason, pressure_state=pressure_state)
+                    if defer_reason in {"pressure_protected_health", "health_detail_budget_exhausted"}
+                    else _build_unavailable_health_metric(defer_reason)
+                )
                 indexed_concepts = None
-                session_learn_queue = _build_deferred_session_learn_queue_health(defer_reason)
+                if defer_reason in {"pressure_protected_health", "health_detail_budget_exhausted"}:
+                    deferred_session_learn_queue = _build_deferred_session_learn_queue_health(defer_reason)
+                    session_learn_queue = {
+                        **deferred_session_learn_queue,
+                        "status": (
+                            deferred_session_learn_queue.get("status")
+                            if deferred_session_learn_queue.get("status") in {"warning", "critical"}
+                            else "degraded"
+                        ),
+                        "alert": True,
+                        "deferred": True,
+                        "pressure_level": _pressure_state_level(pressure_state),
+                    }
+                else:
+                    session_learn_queue = _build_deferred_session_learn_queue_health(defer_reason)
             else:
                 if _read_only_aggregates_enabled():
                     try:
                         with read_snapshot_db("health") as conn:
-                            contradiction_signals = _get_contradiction_signal_backlog(conn=conn)
+                            contradiction_signals = _run_health_section(
+                                "contradiction_signals",
+                                health_start,
+                                health_budget_ms,
+                                lambda: _get_contradiction_signal_backlog(conn=conn),
+                            )
                     except Exception as snap_err:
                         if not _read_only_aggregates_fallback_allowed():
                             raise
@@ -1934,11 +2964,26 @@ def health_check(request: Request):
                             "read-only snapshot failed for /health, falling back to legacy path: %s",
                             snap_err,
                         )
-                        contradiction_signals = _get_contradiction_signal_backlog()
+                        contradiction_signals = _run_health_section(
+                            "contradiction_signals",
+                            health_start,
+                            health_budget_ms,
+                            _get_contradiction_signal_backlog,
+                        )
                 else:
-                    contradiction_signals = _get_contradiction_signal_backlog()
+                    contradiction_signals = _run_health_section(
+                        "contradiction_signals",
+                        health_start,
+                        health_budget_ms,
+                        _get_contradiction_signal_backlog,
+                    )
                 indexed_concepts = retrieval_engine.index.document_count
-                session_learn_queue = _build_session_learn_queue_health()
+                session_learn_queue = _run_health_section(
+                    "session_learn_queue",
+                    health_start,
+                    health_budget_ms,
+                    _build_session_learn_queue_health,
+                )
             ready["metrics"] = {
                 "indexed_concepts": indexed_concepts,
                 "pricing": _get_pricing_health(),
@@ -1948,8 +2993,20 @@ def health_check(request: Request):
             }
             ready["metrics"]["session_learn_queue"] = session_learn_queue
             ready["metrics"]["lifecycle_jobs"] = lifecycle_jobs
+            autolearn_maintenance = _build_autolearn_maintenance_health(defer_reason if defer_db_metrics else None)
+            ready["metrics"]["autolearn_maintenance"] = autolearn_maintenance
+            ready["components"]["autolearn_maintenance"] = autolearn_maintenance.get("status", "unknown")
+            workstreams_metrics = _build_workstreams_metrics_health(defer_reason if defer_db_metrics else None)
+            ready["metrics"]["workstreams"] = workstreams_metrics
             ready["components"]["session_learn_queue"] = session_learn_queue.get("status", "unknown")
+            ready["components"]["workstreams"] = workstreams_metrics.get("status", "unknown")
+            _apply_memory_durability_health(
+                ready,
+                lifecycle_jobs=lifecycle_jobs,
+                session_learn_queue=session_learn_queue,
+            )
             ready["feature_flags"] = _get_feature_flags()
+            ready["health_elapsed_ms"] = _health_elapsed_ms(health_start)
             return ready
 
         except Exception as e:
@@ -2045,9 +3102,30 @@ def _fast_stats_max_stale_ms() -> int:
     return int(max(0.0, _FAST_STATS_MAX_STALE_S) * 1000)
 
 
+def _observability_snapshot_locked(observability: dict) -> dict:
+    """Project an observability dict into the public shape.
+
+    Replaces the internal ``last_success_monotonic`` key with a derived
+    ``last_success_age_ms`` (None when no success has been recorded). The 0.0
+    monotonic value is valid, so the guard is ``is not None`` (EUNOMIA-125).
+    """
+    snapshot = dict(observability)
+    last_success = snapshot.pop("last_success_monotonic", None)
+    if last_success is not None:
+        snapshot["last_success_age_ms"] = round((time.monotonic() - last_success) * 1000)
+    else:
+        snapshot["last_success_age_ms"] = None
+    return snapshot
+
+
 def _fast_stats_observability_snapshot() -> dict:
     with _FAST_STATS_REFRESH_LOCK:
-        return dict(_FAST_STATS_OBSERVABILITY)
+        return _observability_snapshot_locked(_FAST_STATS_OBSERVABILITY)
+
+
+def _fast_health_observability_snapshot() -> dict:
+    with _FAST_HEALTH_REFRESH_LOCK:
+        return _observability_snapshot_locked(_FAST_HEALTH_OBSERVABILITY)
 
 
 def _annotate_fast_stats_freshness(
@@ -2057,6 +3135,7 @@ def _annotate_fast_stats_freshness(
     freshness_reason: str,
     *,
     cache_age_ms: int | None = None,
+    observability: dict | None = None,
 ) -> dict:
     annotated = dict(payload)
     if cache_age_ms is not None:
@@ -2067,7 +3146,9 @@ def _annotate_fast_stats_freshness(
             "freshness_status": freshness_status,
             "freshness_reason": freshness_reason,
             "max_stale_ms": _fast_stats_max_stale_ms(),
-            "refresh_observability": _fast_stats_observability_snapshot(),
+            "refresh_observability": (
+                observability if observability is not None else _fast_stats_observability_snapshot()
+            ),
         }
     )
     return annotated
@@ -2089,6 +3170,7 @@ def _record_fast_stats_refresh_observation(success: bool, duration_ms: float, er
                 int(_FAST_STATS_OBSERVABILITY["refresh_success_count"] or 0) + 1
             )
             _FAST_STATS_OBSERVABILITY["last_refresh_error"] = None
+            _FAST_STATS_OBSERVABILITY["last_success_monotonic"] = time.monotonic()
             _FAST_STATS_REFRESH_ERROR = None
         else:
             _FAST_STATS_OBSERVABILITY["refresh_failure_count"] = (
@@ -2096,6 +3178,10 @@ def _record_fast_stats_refresh_observation(success: bool, duration_ms: float, er
             )
             _FAST_STATS_OBSERVABILITY["last_refresh_error"] = error or "unknown_refresh_error"
             _FAST_STATS_REFRESH_ERROR = error or "unknown_refresh_error"
+            if error == "slot_acquire_timeout":
+                _FAST_STATS_OBSERVABILITY["slot_acquire_timeout_count"] = (
+                    int(_FAST_STATS_OBSERVABILITY["slot_acquire_timeout_count"] or 0) + 1
+                )
         _FAST_STATS_OBSERVABILITY["last_refresh_duration_ms"] = round(duration_ms, 2)
 
 
@@ -2106,15 +3192,82 @@ def _record_fast_stats_stale_served() -> None:
         )
 
 
+def _record_fast_health_refresh_observation(success: bool, duration_ms: float, error: str | None = None) -> None:
+    """Mirror of _record_fast_stats_refresh_observation for the health worker (EUNOMIA-125)."""
+    global _FAST_HEALTH_REFRESH_ERROR
+    with _FAST_HEALTH_REFRESH_LOCK:
+        if success:
+            _FAST_HEALTH_OBSERVABILITY["refresh_success_count"] = (
+                int(_FAST_HEALTH_OBSERVABILITY["refresh_success_count"] or 0) + 1
+            )
+            _FAST_HEALTH_OBSERVABILITY["last_refresh_error"] = None
+            _FAST_HEALTH_OBSERVABILITY["last_success_monotonic"] = time.monotonic()
+            _FAST_HEALTH_REFRESH_ERROR = None
+        else:
+            _FAST_HEALTH_OBSERVABILITY["refresh_failure_count"] = (
+                int(_FAST_HEALTH_OBSERVABILITY["refresh_failure_count"] or 0) + 1
+            )
+            _FAST_HEALTH_OBSERVABILITY["last_refresh_error"] = error or "unknown_refresh_error"
+            _FAST_HEALTH_REFRESH_ERROR = error or "unknown_refresh_error"
+            if error == "slot_acquire_timeout":
+                _FAST_HEALTH_OBSERVABILITY["slot_acquire_timeout_count"] = (
+                    int(_FAST_HEALTH_OBSERVABILITY["slot_acquire_timeout_count"] or 0) + 1
+                )
+        _FAST_HEALTH_OBSERVABILITY["last_refresh_duration_ms"] = round(duration_ms, 2)
+
+
+def _record_fast_health_stale_served() -> None:
+    with _FAST_HEALTH_REFRESH_LOCK:
+        _FAST_HEALTH_OBSERVABILITY["stale_served_count"] = (
+            int(_FAST_HEALTH_OBSERVABILITY["stale_served_count"] or 0) + 1
+        )
+
+
+def _knowledge_areas_observability_snapshot() -> dict:
+    with _KNOWLEDGE_AREAS_REFRESH_LOCK:
+        return _observability_snapshot_locked(_FAST_KNOWLEDGE_AREAS_OBSERVABILITY)
+
+
+def _record_knowledge_areas_refresh_observation(success: bool, duration_ms: float, error: str | None = None) -> None:
+    """Mirror of _record_fast_health_refresh_observation for the KA worker (TOOLING-100)."""
+    global _KNOWLEDGE_AREAS_REFRESH_ERROR
+    with _KNOWLEDGE_AREAS_REFRESH_LOCK:
+        if success:
+            _FAST_KNOWLEDGE_AREAS_OBSERVABILITY["refresh_success_count"] = (
+                int(_FAST_KNOWLEDGE_AREAS_OBSERVABILITY["refresh_success_count"] or 0) + 1
+            )
+            _FAST_KNOWLEDGE_AREAS_OBSERVABILITY["last_refresh_error"] = None
+            _FAST_KNOWLEDGE_AREAS_OBSERVABILITY["last_success_monotonic"] = time.monotonic()
+            _KNOWLEDGE_AREAS_REFRESH_ERROR = None
+        else:
+            _FAST_KNOWLEDGE_AREAS_OBSERVABILITY["refresh_failure_count"] = (
+                int(_FAST_KNOWLEDGE_AREAS_OBSERVABILITY["refresh_failure_count"] or 0) + 1
+            )
+            _FAST_KNOWLEDGE_AREAS_OBSERVABILITY["last_refresh_error"] = error or "unknown_refresh_error"
+            _KNOWLEDGE_AREAS_REFRESH_ERROR = error or "unknown_refresh_error"
+            if error == "slot_acquire_timeout":
+                _FAST_KNOWLEDGE_AREAS_OBSERVABILITY["slot_acquire_timeout_count"] = (
+                    int(_FAST_KNOWLEDGE_AREAS_OBSERVABILITY["slot_acquire_timeout_count"] or 0) + 1
+                )
+        _FAST_KNOWLEDGE_AREAS_OBSERVABILITY["last_refresh_duration_ms"] = round(duration_ms, 2)
+
+
+def _record_knowledge_areas_stale_served() -> None:
+    with _KNOWLEDGE_AREAS_REFRESH_LOCK:
+        _FAST_KNOWLEDGE_AREAS_OBSERVABILITY["stale_served_count"] = (
+            int(_FAST_KNOWLEDGE_AREAS_OBSERVABILITY["stale_served_count"] or 0) + 1
+        )
+
+
 def _refresh_fast_stats_cache() -> dict:
     """Refresh fast stats cache from a worker so callers can stay bounded."""
     global _FAST_STATS_CACHE, _FAST_STATS_REFRESH_ERROR
     started = time.perf_counter()
-    acquired = _DIAGNOSTIC_ENDPOINT_SEMAPHORE.acquire(timeout=_DIAGNOSTIC_ENDPOINT_SLOT_TIMEOUT_S)
+    acquired = _DIAGNOSTIC_ENDPOINT_SEMAPHORE.acquire(timeout=_DIAGNOSTIC_REFRESH_SLOT_TIMEOUT_S)
     if not acquired:
         duration_ms = (time.perf_counter() - started) * 1000
-        _record_fast_stats_refresh_observation(False, duration_ms, "diagnostic_slot_unavailable")
-        raise TimeoutError("diagnostic_slot_unavailable")
+        _record_fast_stats_refresh_observation(False, duration_ms, "slot_acquire_timeout")
+        raise TimeoutError("slot_acquire_timeout")
     try:
         payload = _build_pith_stats_fast_payload()
         duration_ms = (time.perf_counter() - started) * 1000
@@ -2190,7 +3343,15 @@ def _build_stale_diagnostic_payload(cache_entry: tuple[float, dict], section: st
     errors[section] = error
     cache_age_ms = int((time.monotonic() - cached_at) * 1000)
     state, status, reason = _classify_stale_fast_stats(cache_age_ms, error if error != "refresh_in_progress" else None)
-    _record_fast_stats_stale_served()
+    if section == "fast_health":
+        _record_fast_health_stale_served()
+        observability = _fast_health_observability_snapshot()
+    elif section == "knowledge_areas":
+        _record_knowledge_areas_stale_served()
+        observability = _knowledge_areas_observability_snapshot()
+    else:
+        _record_fast_stats_stale_served()
+        observability = None  # default snapshot = fast_stats observability
     payload.update(
         {
             "cache_age_ms": cache_age_ms,
@@ -2199,7 +3360,9 @@ def _build_stale_diagnostic_payload(cache_entry: tuple[float, dict], section: st
             "section_errors": errors,
         }
     )
-    return _annotate_fast_stats_freshness(payload, state, status, reason, cache_age_ms=cache_age_ms)
+    return _annotate_fast_stats_freshness(
+        payload, state, status, reason, cache_age_ms=cache_age_ms, observability=observability
+    )
 
 
 def _build_empty_fast_stats_payload(error: str) -> dict:
@@ -2241,28 +3404,21 @@ def _build_empty_fast_health_payload(error: str) -> dict:
     }
 
 
-def _build_pith_health_fast_cached() -> dict:
-    """Build/coalesce default health so diagnostic readers remain bounded."""
-    global _FAST_HEALTH_CACHE
-    now = time.monotonic()
-    with _FAST_HEALTH_CACHE_LOCK:
-        if _FAST_HEALTH_CACHE is not None:
-            cached_at, cached_payload = _FAST_HEALTH_CACHE
-            cache_age_ms = int((now - cached_at) * 1000)
-            if cache_age_ms <= int(_FAST_HEALTH_CACHE_TTL_S * 1000):
-                payload = dict(cached_payload)
-                payload["cache_age_ms"] = cache_age_ms
-                return payload
-            stale_cache = (cached_at, dict(cached_payload))
-        else:
-            stale_cache = None
+def _refresh_fast_health_cache() -> dict:
+    """Refresh fast health cache from a worker so callers can stay bounded.
 
-    acquired = _DIAGNOSTIC_ENDPOINT_SEMAPHORE.acquire(timeout=_DIAGNOSTIC_ENDPOINT_SLOT_TIMEOUT_S)
+    EUNOMIA-125: mirror of _refresh_fast_stats_cache. Waits up to the long
+    background timeout for the single diagnostic slot (build is ~4s) instead of
+    bailing at 50ms, and records a named slot_acquire_timeout on miss so the
+    failure is no longer silent.
+    """
+    global _FAST_HEALTH_CACHE, _FAST_HEALTH_REFRESH_ERROR
+    started = time.perf_counter()
+    acquired = _DIAGNOSTIC_ENDPOINT_SEMAPHORE.acquire(timeout=_DIAGNOSTIC_REFRESH_SLOT_TIMEOUT_S)
     if not acquired:
-        if stale_cache is not None:
-            return _build_stale_diagnostic_payload(stale_cache, "fast_health", "diagnostic_slot_unavailable")
-        return _build_empty_fast_health_payload("diagnostic_slot_unavailable")
-
+        duration_ms = (time.perf_counter() - started) * 1000
+        _record_fast_health_refresh_observation(False, duration_ms, "slot_acquire_timeout")
+        raise TimeoutError("slot_acquire_timeout")
     try:
         from app.storage import get_pith_health_fast
 
@@ -2277,16 +3433,81 @@ def _build_pith_health_fast_cached() -> dict:
                 "section_errors": {},
             }
         )
+        duration_ms = (time.perf_counter() - started) * 1000
+        _record_fast_health_refresh_observation(True, duration_ms)
+        health = _annotate_fast_stats_freshness(
+            health, "fresh", "ok", "cache_fresh", cache_age_ms=0,
+            observability=_fast_health_observability_snapshot(),
+        )
         with _FAST_HEALTH_CACHE_LOCK:
             _FAST_HEALTH_CACHE = (time.monotonic(), dict(health))
         return health
     except Exception as err:
-        logger.error("Fast pith health failed: %s", err, exc_info=True)
-        if stale_cache is not None:
-            return _build_stale_diagnostic_payload(stale_cache, "fast_health", _safe_error(err))
-        return _build_empty_fast_health_payload(_safe_error(err))
+        duration_ms = (time.perf_counter() - started) * 1000
+        _record_fast_health_refresh_observation(False, duration_ms, _safe_error(err))
+        raise
     finally:
         _DIAGNOSTIC_ENDPOINT_SEMAPHORE.release()
+
+
+def _record_fast_health_refresh_result(future: concurrent.futures.Future) -> None:
+    global _FAST_HEALTH_REFRESH_ERROR
+    try:
+        exc = future.exception()
+    except concurrent.futures.CancelledError:
+        exc = None
+    if exc is not None:
+        with _FAST_HEALTH_REFRESH_LOCK:
+            _FAST_HEALTH_REFRESH_ERROR = _safe_error(exc)
+
+
+def _ensure_fast_health_refresh_started() -> concurrent.futures.Future:
+    global _FAST_HEALTH_REFRESH_FUTURE
+    add_callback = False
+    with _FAST_HEALTH_REFRESH_LOCK:
+        if _FAST_HEALTH_REFRESH_FUTURE is None or _FAST_HEALTH_REFRESH_FUTURE.done():
+            _FAST_HEALTH_REFRESH_FUTURE = _DIAGNOSTIC_REFRESH_EXECUTOR.submit(_refresh_fast_health_cache)
+            add_callback = True
+        future = _FAST_HEALTH_REFRESH_FUTURE
+    if add_callback:
+        future.add_done_callback(_record_fast_health_refresh_result)
+    return future
+
+
+def _build_pith_health_fast_cached() -> dict:
+    """Build/coalesce default health so diagnostic readers remain bounded.
+
+    EUNOMIA-125: mirrors _build_pith_stats_fast_cached — serve warm-but-stale
+    immediately and schedule a background refresh instead of refreshing inline
+    only (which left the cache silently stale for hours on zero-traffic readers).
+    """
+    now = time.monotonic()
+    with _FAST_HEALTH_CACHE_LOCK:
+        if _FAST_HEALTH_CACHE is not None:
+            cached_at, cached_payload = _FAST_HEALTH_CACHE
+            cache_age_ms = int((now - cached_at) * 1000)
+            if cache_age_ms <= int(_FAST_HEALTH_CACHE_TTL_S * 1000):
+                payload = dict(cached_payload)
+                payload["cache_age_ms"] = cache_age_ms
+                return payload
+            stale_cache = (cached_at, dict(cached_payload))
+        else:
+            stale_cache = None
+
+    refresh_future = _ensure_fast_health_refresh_started()
+    if stale_cache is not None:
+        with _FAST_HEALTH_REFRESH_LOCK:
+            refresh_error = _FAST_HEALTH_REFRESH_ERROR
+        return _build_stale_diagnostic_payload(
+            stale_cache, "fast_health", refresh_error or "refresh_in_progress"
+        )
+
+    try:
+        return refresh_future.result(timeout=max(0.001, _FAST_HEALTH_COLD_BUDGET_S))
+    except concurrent.futures.TimeoutError:
+        return _build_empty_fast_health_payload("budget_exceeded")
+    except Exception as err:
+        return _build_empty_fast_health_payload(_safe_error(err))
 
 
 def _build_empty_knowledge_areas_payload(error: str) -> dict:
@@ -2302,32 +3523,20 @@ def _build_empty_knowledge_areas_payload(error: str) -> dict:
     }
 
 
-def _build_knowledge_areas_cached() -> dict:
-    """Return knowledge-area summaries without materializing every concept."""
+def _refresh_knowledge_areas_cache() -> dict:
+    """Refresh the knowledge-area cache from a worker so callers stay bounded.
+
+    TOOLING-100: mirror of _refresh_fast_health_cache. Waits up to the long
+    background timeout for the single diagnostic slot instead of bailing at 50ms,
+    and records a named slot_acquire_timeout on miss (ends the silent-stale property).
+    """
     global _KNOWLEDGE_AREAS_CACHE
-    now = time.monotonic()
-    with _KNOWLEDGE_AREAS_CACHE_LOCK:
-        if _KNOWLEDGE_AREAS_CACHE is not None:
-            cached_at, cached_payload = _KNOWLEDGE_AREAS_CACHE
-            cache_age_ms = int((now - cached_at) * 1000)
-            if cache_age_ms <= int(_KNOWLEDGE_AREAS_CACHE_TTL_S * 1000):
-                payload = dict(cached_payload)
-                payload["cache_age_ms"] = cache_age_ms
-                return payload
-            stale_cache = (cached_at, dict(cached_payload))
-        else:
-            stale_cache = None
-
-    acquired = _DIAGNOSTIC_ENDPOINT_SEMAPHORE.acquire(timeout=_DIAGNOSTIC_ENDPOINT_SLOT_TIMEOUT_S)
+    started = time.perf_counter()
+    acquired = _DIAGNOSTIC_ENDPOINT_SEMAPHORE.acquire(timeout=_DIAGNOSTIC_REFRESH_SLOT_TIMEOUT_S)
     if not acquired:
-        if stale_cache is not None:
-            return _build_stale_diagnostic_payload(
-                stale_cache,
-                "knowledge_areas",
-                "diagnostic_slot_unavailable",
-            )
-        return _build_empty_knowledge_areas_payload("diagnostic_slot_unavailable")
-
+        duration_ms = (time.perf_counter() - started) * 1000
+        _record_knowledge_areas_refresh_observation(False, duration_ms, "slot_acquire_timeout")
+        raise TimeoutError("slot_acquire_timeout")
     try:
         from app.storage import list_knowledge_area_summaries
 
@@ -2342,20 +3551,85 @@ def _build_knowledge_areas_cached() -> dict:
             "stale": False,
             "section_errors": {},
         }
+        duration_ms = (time.perf_counter() - started) * 1000
+        _record_knowledge_areas_refresh_observation(True, duration_ms)
         with _KNOWLEDGE_AREAS_CACHE_LOCK:
             _KNOWLEDGE_AREAS_CACHE = (time.monotonic(), dict(payload))
         return payload
     except Exception as err:
+        duration_ms = (time.perf_counter() - started) * 1000
         logger.error("Fast knowledge area listing failed: %s", err, exc_info=True)
-        if stale_cache is not None:
-            return _build_stale_diagnostic_payload(stale_cache, "knowledge_areas", _safe_error(err))
-        return _build_empty_knowledge_areas_payload(_safe_error(err))
+        _record_knowledge_areas_refresh_observation(False, duration_ms, _safe_error(err))
+        raise
     finally:
         _DIAGNOSTIC_ENDPOINT_SEMAPHORE.release()
 
 
+def _record_knowledge_areas_refresh_result(future: concurrent.futures.Future) -> None:
+    global _KNOWLEDGE_AREAS_REFRESH_ERROR
+    try:
+        exc = future.exception()
+    except concurrent.futures.CancelledError:
+        exc = None
+    if exc is not None:
+        with _KNOWLEDGE_AREAS_REFRESH_LOCK:
+            _KNOWLEDGE_AREAS_REFRESH_ERROR = _safe_error(exc)
+
+
+def _ensure_knowledge_areas_refresh_started() -> concurrent.futures.Future:
+    global _KNOWLEDGE_AREAS_REFRESH_FUTURE
+    add_callback = False
+    with _KNOWLEDGE_AREAS_REFRESH_LOCK:
+        if _KNOWLEDGE_AREAS_REFRESH_FUTURE is None or _KNOWLEDGE_AREAS_REFRESH_FUTURE.done():
+            _KNOWLEDGE_AREAS_REFRESH_FUTURE = _DIAGNOSTIC_REFRESH_EXECUTOR.submit(_refresh_knowledge_areas_cache)
+            add_callback = True
+        future = _KNOWLEDGE_AREAS_REFRESH_FUTURE
+    if add_callback:
+        future.add_done_callback(_record_knowledge_areas_refresh_result)
+    return future
+
+
+def _build_knowledge_areas_cached() -> dict:
+    """Return knowledge-area summaries without materializing every concept.
+
+    TOOLING-100: mirrors _build_pith_health_fast_cached — serve warm-but-stale
+    immediately and schedule a background refresh instead of acquiring the single
+    diagnostic slot inline (which left the cache silently stale under contention
+    and emitted the deprecated slot-unavailable error string).
+    """
+    now = time.monotonic()
+    with _KNOWLEDGE_AREAS_CACHE_LOCK:
+        if _KNOWLEDGE_AREAS_CACHE is not None:
+            cached_at, cached_payload = _KNOWLEDGE_AREAS_CACHE
+            cache_age_ms = int((now - cached_at) * 1000)
+            if cache_age_ms <= int(_KNOWLEDGE_AREAS_CACHE_TTL_S * 1000):
+                payload = dict(cached_payload)
+                payload["cache_age_ms"] = cache_age_ms
+                return payload
+            stale_cache = (cached_at, dict(cached_payload))
+        else:
+            stale_cache = None
+
+    refresh_future = _ensure_knowledge_areas_refresh_started()
+    if stale_cache is not None:
+        with _KNOWLEDGE_AREAS_REFRESH_LOCK:
+            refresh_error = _KNOWLEDGE_AREAS_REFRESH_ERROR
+        return _build_stale_diagnostic_payload(
+            stale_cache, "knowledge_areas", refresh_error or "refresh_in_progress"
+        )
+
+    try:
+        return refresh_future.result(timeout=max(0.001, _KNOWLEDGE_AREAS_COLD_BUDGET_S))
+    except concurrent.futures.TimeoutError:
+        return _build_empty_knowledge_areas_payload("budget_exceeded")
+    except Exception as err:
+        return _build_empty_knowledge_areas_payload(_safe_error(err))
+
+
 def _reset_fast_stats_cache_for_tests() -> None:
     global _FAST_HEALTH_CACHE, _FAST_STATS_CACHE, _FAST_STATS_REFRESH_ERROR, _FAST_STATS_REFRESH_FUTURE, _KNOWLEDGE_AREAS_CACHE
+    global _FAST_HEALTH_REFRESH_FUTURE, _FAST_HEALTH_REFRESH_ERROR
+    global _KNOWLEDGE_AREAS_REFRESH_FUTURE, _KNOWLEDGE_AREAS_REFRESH_ERROR
     with _FAST_STATS_CACHE_LOCK:
         _FAST_STATS_CACHE = None
     with _FAST_STATS_REFRESH_LOCK:
@@ -2368,14 +3642,48 @@ def _reset_fast_stats_cache_for_tests() -> None:
                 "refresh_success_count": 0,
                 "refresh_failure_count": 0,
                 "stale_served_count": 0,
+                "slot_acquire_timeout_count": 0,
                 "last_refresh_duration_ms": None,
                 "last_refresh_error": None,
+                "last_success_monotonic": None,
             }
         )
     with _FAST_HEALTH_CACHE_LOCK:
         _FAST_HEALTH_CACHE = None
+    with _FAST_HEALTH_REFRESH_LOCK:
+        if _FAST_HEALTH_REFRESH_FUTURE is not None and not _FAST_HEALTH_REFRESH_FUTURE.done():
+            _FAST_HEALTH_REFRESH_FUTURE.cancel()
+        _FAST_HEALTH_REFRESH_FUTURE = None
+        _FAST_HEALTH_REFRESH_ERROR = None
+        _FAST_HEALTH_OBSERVABILITY.update(
+            {
+                "refresh_success_count": 0,
+                "refresh_failure_count": 0,
+                "stale_served_count": 0,
+                "slot_acquire_timeout_count": 0,
+                "last_refresh_duration_ms": None,
+                "last_refresh_error": None,
+                "last_success_monotonic": None,
+            }
+        )
     with _KNOWLEDGE_AREAS_CACHE_LOCK:
         _KNOWLEDGE_AREAS_CACHE = None
+    with _KNOWLEDGE_AREAS_REFRESH_LOCK:
+        if _KNOWLEDGE_AREAS_REFRESH_FUTURE is not None and not _KNOWLEDGE_AREAS_REFRESH_FUTURE.done():
+            _KNOWLEDGE_AREAS_REFRESH_FUTURE.cancel()
+        _KNOWLEDGE_AREAS_REFRESH_FUTURE = None
+        _KNOWLEDGE_AREAS_REFRESH_ERROR = None
+        _FAST_KNOWLEDGE_AREAS_OBSERVABILITY.update(
+            {
+                "refresh_success_count": 0,
+                "refresh_failure_count": 0,
+                "stale_served_count": 0,
+                "slot_acquire_timeout_count": 0,
+                "last_refresh_duration_ms": None,
+                "last_refresh_error": None,
+                "last_success_monotonic": None,
+            }
+        )
 
 
 @app.get("/learning_metrics")
@@ -2547,14 +3855,110 @@ def learning_metrics():
     }
 
 
+def _parse_search_filter_time(value: str | None, *, end_of_day: bool = False, strict: bool = True):
+    if not value:
+        return None
+    from datetime import UTC, datetime
+    from datetime import time as _time
+
+    text = str(value).strip()
+    try:
+        if len(text) == 10 and text[4] == "-" and text[7] == "-":
+            parsed_date = datetime.fromisoformat(text).date()
+            parsed = datetime.combine(parsed_date, _time.max if end_of_day else _time.min)
+        else:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        if not strict:
+            return None
+        raise HTTPException(status_code=400, detail=f"Invalid temporal filter value: {value}") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed
+
+
+def _concept_temporal_value(concept, field_name: str) -> str | None:
+    value = getattr(concept, field_name, None) if concept is not None else None
+    if value in (None, ""):
+        return None
+    return str(value)
+
+
+def _result_payload_with_temporal(result: SearchResult, concept=None) -> dict:
+    payload = result.model_dump() if hasattr(result, "model_dump") else dict(result)
+    for field_name in ("created_at", "valid_from", "original_date", "content_updated_at"):
+        if payload.get(field_name) in (None, ""):
+            payload[field_name] = _concept_temporal_value(concept, field_name)
+    return payload
+
+
+def _apply_search_temporal_filters(results: list[SearchResult], query: SearchQuery) -> tuple[list[SearchResult], list[dict], dict]:
+    has_filter = bool(query.since or query.until)
+    metadata = {
+        "applied": has_filter,
+        "time_field": query.time_field,
+        "since": query.since,
+        "until": query.until,
+        "filter_scope": "none",
+        "candidate_count": len(results),
+        "filtered_count": len(results),
+        "requested_max_results": query.max_results,
+        "invalid_temporal_count": 0,
+    }
+    if not has_filter:
+        payloads = [_result_payload_with_temporal(result, load_concept(result.concept_id, track_access=False)) for result in results]
+        return results, payloads, metadata
+
+    since_dt = _parse_search_filter_time(query.since)
+    until_dt = _parse_search_filter_time(query.until, end_of_day=True)
+    filtered: list[SearchResult] = []
+    payloads: list[dict] = []
+    invalid_temporal_count = 0
+    for result in results:
+        concept = load_concept(result.concept_id, track_access=False)
+        temporal_value = _concept_temporal_value(concept, query.time_field)
+        if not temporal_value:
+            continue
+        value_dt = _parse_search_filter_time(temporal_value, strict=False)
+        if value_dt is None:
+            invalid_temporal_count += 1
+            continue
+        if since_dt and value_dt < since_dt:
+            continue
+        if until_dt and value_dt > until_dt:
+            continue
+        filtered.append(result)
+        payloads.append(_result_payload_with_temporal(result, concept))
+
+    metadata.update(
+        {
+            "filter_scope": "post_retrieval_overfetch",
+            "filtered_count": len(filtered),
+            "invalid_temporal_count": invalid_temporal_count,
+            "filter_warning": (
+                "Temporal filtering is applied to an overfetched retrieval candidate set, "
+                "not an exhaustive database date scan."
+            ),
+        }
+    )
+    return filtered[: query.max_results], payloads[: query.max_results], metadata
+
+
 @app.post("/pith_search")
 def pith_search(query: SearchQuery):
     """Search for concepts using RAG retrieval."""
     try:
-        results = retrieval_engine.search(query)
+        requested_max_results = query.max_results
+        search_query = query
+        if query.since or query.until:
+            candidate_limit = max(int(requested_max_results or 5) * 20, 50)
+            search_query = query.model_copy(update={"max_results": candidate_limit})
+        results = retrieval_engine.search(search_query)
 
         # MATURITY-001: Filter quarantined/discarded from external API results
         results = [r for r in results if (r.maturity or "ESTABLISHED") not in _BLOCKED_MATURITIES]
+        query_for_filters = query.model_copy(update={"max_results": requested_max_results})
+        results, result_payloads, filter_metadata = _apply_search_temporal_filters(results, query_for_filters)
         # C2: Enrich with ambient_context from top result's associations
         ambient = []
         if results:
@@ -2563,9 +3967,12 @@ def pith_search(query: SearchQuery):
             ambient = select_ambient_concepts(top_id, query=query.query, exclude_ids=result_ids)
 
         return {
-            "results": [r.model_dump() if hasattr(r, "model_dump") else r for r in results],
+            "results": result_payloads,
             "ambient_context": {"related": ambient} if ambient else {},
+            "filters": filter_metadata,
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=_safe_error(e))
 
@@ -3426,9 +4833,1051 @@ def pith_integrity(repair: bool = False):
 
         if repair and not integrity["is_healthy"]:
             repair_result = retrieval_engine.repair_index_drift(integrity=integrity)
+            post_repair_integrity = repair_result.get("post_repair_integrity")
+            if post_repair_integrity:
+                result = {**post_repair_integrity}
             result["repair"] = repair_result
 
         return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=_safe_error(e))
+
+
+@app.get("/pith_concept_integrity_probe")
+def pith_concept_integrity_probe():
+    """Contention-immune read-only Surface-1 concept-integrity probe (EUNOMIA-127).
+
+    Returns freshly-computed concept-integrity sub-checks even while the diagnostic
+    slot (_DIAGNOSTIC_ENDPOINT_SEMAPHORE) is starved. Non-raising: any failure path
+    returns degraded:true with a reason. Auth posture matches /pith_integrity
+    (no verify_api_key dependency).
+    """
+    return JSONResponse(_run_concept_integrity_probe())
+
+
+def _association_integrity_snapshot(conn) -> dict[str, Any]:
+    hard_orphans = conn.execute(
+        """SELECT COUNT(*) FROM associations a
+           WHERE NOT EXISTS (SELECT 1 FROM concepts c WHERE c.id = a.source)
+              OR NOT EXISTS (SELECT 1 FROM concepts c WHERE c.id = a.target)"""
+    ).fetchone()[0]
+    missing_source = conn.execute(
+        """SELECT COUNT(*) FROM associations a
+           WHERE NOT EXISTS (SELECT 1 FROM concepts c WHERE c.id = a.source)"""
+    ).fetchone()[0]
+    missing_target = conn.execute(
+        """SELECT COUNT(*) FROM associations a
+           WHERE NOT EXISTS (SELECT 1 FROM concepts c WHERE c.id = a.target)"""
+    ).fetchone()[0]
+    inactive_existing = conn.execute(
+        """SELECT COUNT(*) FROM associations a
+           JOIN concepts s ON s.id = a.source
+           JOIN concepts t ON t.id = a.target
+           WHERE COALESCE(s.status, 'active') != 'active'
+              OR COALESCE(t.status, 'active') != 'active'
+              OR COALESCE(s.is_current, 1) != 1
+              OR COALESCE(t.is_current, 1) != 1"""
+    ).fetchone()[0]
+    return {
+        "hard_orphans": hard_orphans,
+        "missing_source": missing_source,
+        "missing_target": missing_target,
+        "inactive_existing_edges": inactive_existing,
+        "total_associations": conn.execute("SELECT COUNT(*) FROM associations").fetchone()[0],
+        "is_healthy": hard_orphans == 0,
+    }
+
+
+@app.get("/pith_association_integrity")
+def pith_association_integrity(repair: bool = False, dry_run: bool = True):
+    """Inspect and optionally repair hard dangling association rows."""
+    try:
+        with _db() as conn:
+            pre = _association_integrity_snapshot(conn)
+
+        result = {**pre, "repair": {"dry_run": dry_run, "attempted": False, "deleted": 0}}
+        if repair:
+            if dry_run:
+                result["repair"] = {
+                    "dry_run": True,
+                    "attempted": False,
+                    "would_delete": pre["hard_orphans"],
+                    "preserved_inactive_existing_edges": pre["inactive_existing_edges"],
+                }
+            else:
+                with _db_immediate() as conn:
+                    before = _association_integrity_snapshot(conn)
+                    cursor = conn.execute(
+                        """DELETE FROM associations
+                           WHERE NOT EXISTS (SELECT 1 FROM concepts c WHERE c.id = associations.source)
+                              OR NOT EXISTS (SELECT 1 FROM concepts c WHERE c.id = associations.target)"""
+                    )
+                    deleted = cursor.rowcount if cursor.rowcount is not None else 0
+                    after = _association_integrity_snapshot(conn)
+                if deleted:
+                    _invalidate_associations_cache()
+                result = {
+                    **after,
+                    "repair": {
+                        "dry_run": False,
+                        "attempted": True,
+                        "deleted": deleted,
+                        "pre_repair": before,
+                        "post_repair": after,
+                        "preserved_inactive_existing_edges": after["inactive_existing_edges"],
+                    },
+                }
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=_safe_error(e))
+
+
+def _json_knowledge_area_expr() -> str:
+    return "COALESCE(json_extract(data, '$.knowledge_area'), json_extract(data, '$.metadata.knowledge_area'))"
+
+
+def _ka_admission_state_expr() -> str:
+    return "COALESCE(json_extract(data, '$.metadata.ka_admission_state'), '')"
+
+
+def _unreviewed_general_predicate() -> str:
+    return """knowledge_area = 'general'
+             AND COALESCE(json_extract(data, '$.metadata.ka_admission_state'), '') NOT IN (
+                 'intentional_general',
+                 'deterministic_ambiguous'
+             )
+             AND COALESCE(json_extract(data, '$.metadata.knowledge_area_review'), '') != 'deterministic_ambiguous'"""
+
+
+_AMBIGUOUS_SECOND_PASS_RULES: dict[str, tuple[str, ...]] = {
+    "operations": (
+        r"\bdeploy(?:ed|ment)?\b",
+        r"\bruntime\b",
+        r"\bhealth\b",
+        r"\bstaging\b",
+        r"\blaunchd\b",
+        r"\bheartbeat\b",
+        r"\bmaintenance\b",
+        r"\brollback\b",
+        r"\bcloudflare\b",
+        r"\br2\b",
+    ),
+    "implementation": (
+        r"\bimplemented\b",
+        r"\bpatch(?:ed)?\b",
+        r"\bcommit\b",
+        r"\bPR\s*#?\d+\b",
+        r"\bbranch\b",
+        r"\brebas(?:e|ed|ing)\b",
+        r"\bmerg(?:e|ed|ing)\b",
+        r"\bcode\b",
+        r"\bendpoint\b",
+    ),
+    "testing": (
+        r"\btests?\b",
+        r"\btesting\b",
+        r"\bverification\b",
+        r"\bverified\b",
+        r"\bsmoke\b",
+        r"\bcanary\b",
+    ),
+    "debugging": (
+        r"\bRCA\b",
+        r"\broot cause\b",
+        r"\bdiagnostic\b",
+        r"\bfailure\b",
+        r"\bregression\b",
+        r"\btrace\b",
+    ),
+    "specification": (
+        r"\bspec\b",
+        r"\bspecification\b",
+        r"\bcontract\b",
+        r"\bprotocol\b",
+    ),
+    "review_methodology": (
+        r"\bgauntlet\b",
+        r"\breview\b",
+        r"\baudit\b",
+        r"\bchecklist\b",
+    ),
+    "pith_benchmarks": (
+        r"\bLoCoMo\b",
+        r"\bLME\b",
+        r"\bBEAM\b",
+        r"\bMH262\b",
+        r"\bbenchmark\b",
+        r"\bscore-bearing\b",
+    ),
+    "documentation": (
+        r"\bdocs?\b",
+        r"\bpacket\b",
+        r"\breport\b",
+        r"\bREADME\b",
+    ),
+}
+_AMBIGUOUS_SECOND_PASS_MIN_SCORE = 2
+_AMBIGUOUS_SECOND_PASS_MAX_SCAN = 20_000
+
+
+def _second_pass_ambiguous_ka(summary: str) -> dict[str, Any]:
+    """Classify an already-reviewed ambiguous general concept via strict phrase rules."""
+    if not summary:
+        return {"status": "unresolved", "area": None, "scores": {}, "rule": None, "confidence": None}
+
+    scores: dict[str, int] = {}
+    matched: dict[str, list[str]] = {}
+    for area, patterns in _AMBIGUOUS_SECOND_PASS_RULES.items():
+        hits = [pattern for pattern in patterns if re.search(pattern, summary, flags=re.IGNORECASE)]
+        if hits:
+            scores[area] = len(hits)
+            matched[area] = hits
+
+    eligible = {area: score for area, score in scores.items() if score >= _AMBIGUOUS_SECOND_PASS_MIN_SCORE}
+    if len(eligible) == 1:
+        area, score = next(iter(eligible.items()))
+        return {
+            "status": "classified",
+            "area": area,
+            "scores": scores,
+            "rule": ",".join(matched[area]),
+            "confidence": min(0.99, 0.88 + (0.02 * min(score, 4))),
+        }
+    if len(eligible) > 1:
+        return {"status": "conflict", "area": None, "scores": scores, "rule": None, "confidence": None}
+    return {"status": "unresolved", "area": None, "scores": scores, "rule": None, "confidence": None}
+
+
+def _ambiguous_review_predicate() -> str:
+    return """knowledge_area = 'general'
+             AND (
+                 COALESCE(json_extract(data, '$.metadata.ka_admission_state'), '') = 'deterministic_ambiguous'
+                 OR COALESCE(json_extract(data, '$.metadata.knowledge_area_review'), '') = 'deterministic_ambiguous'
+             )"""
+
+
+def _ambiguous_second_pass_candidates(
+    conn, *, batch_limit: int, scan_limit: int | None = None
+) -> tuple[list[tuple[str, str, float, str]], list[str], list[str], int]:
+    scan_limit = max(batch_limit, min(scan_limit or batch_limit, _AMBIGUOUS_SECOND_PASS_MAX_SCAN))
+    rows = conn.execute(
+        """SELECT id, summary
+           FROM concepts
+           WHERE is_current = 1
+             AND """ + _ambiguous_review_predicate() + """
+           ORDER BY created_at DESC
+           LIMIT ?""",
+        (scan_limit,),
+    ).fetchall()
+
+    classified: list[tuple[str, str, float, str]] = []
+    conflicts: list[str] = []
+    unresolved: list[str] = []
+    for row in rows:
+        decision = _second_pass_ambiguous_ka(row["summary"] or "")
+        if decision["status"] == "classified":
+            classified.append((row["id"], decision["area"], decision["confidence"], decision["rule"]))
+        elif decision["status"] == "conflict":
+            conflicts.append(row["id"])
+        else:
+            unresolved.append(row["id"])
+    return classified[:batch_limit], conflicts, unresolved, len(classified)
+
+
+def _safe_general_ka_candidates(conn, *, batch_limit: int) -> tuple[list[tuple[str, str, str]], list[str]]:
+    from app.cognitive.taxonomy import classify_knowledge_area
+
+    rows = conn.execute(
+        """SELECT id, summary
+           FROM concepts
+           WHERE is_current = 1
+             AND """ + _unreviewed_general_predicate() + """
+           ORDER BY created_at DESC
+           LIMIT ?""",
+        (batch_limit,),
+    ).fetchall()
+    planned_updates: list[tuple[str, str, str]] = []
+    ambiguous_ids: list[str] = []
+    for row in rows:
+        classified, source, score = classify_knowledge_area(row["summary"] or "", "general", strict=True)
+        if classified and classified not in ("general", "unclassified") and (
+            source == "inferred" or (source == "embedding" and score is not None and score >= 0.80)
+        ):
+            planned_updates.append((row["id"], classified, source))
+        else:
+            ambiguous_ids.append(row["id"])
+    return planned_updates, ambiguous_ids
+
+
+def _safe_unclassified_ka_candidates(conn, *, batch_limit: int) -> list[tuple[str, str, str]]:
+    from app.cognitive.taxonomy import classify_knowledge_area
+
+    rows = conn.execute(
+        """SELECT id, summary
+           FROM concepts
+           WHERE is_current = 1
+             AND knowledge_area = 'unclassified'
+             AND COALESCE(json_extract(data, '$.metadata.ka_admission_state'), '') IN (
+                 'queued_unclassified',
+                 'fallback_failure'
+             )
+           ORDER BY
+             CASE COALESCE(json_extract(data, '$.metadata.ka_admission_state'), '')
+                 WHEN 'queued_unclassified' THEN 0 ELSE 1
+             END,
+             created_at DESC
+           LIMIT ?""",
+        (batch_limit,),
+    ).fetchall()
+    planned_updates: list[tuple[str, str, str]] = []
+    for row in rows:
+        classified, source, score = classify_knowledge_area(row["summary"] or "", "general", strict=True)
+        if classified and classified not in ("general", "unclassified") and (
+            source == "inferred" or (source == "embedding" and score is not None and score >= 0.80)
+        ):
+            planned_updates.append((row["id"], classified, source))
+    return planned_updates
+
+
+class KAReviewApplyRequest(PydanticBaseModel):
+    review_summary_path: str = Field(..., min_length=1)
+    review_ledger_path: str = Field(..., min_length=1)
+    final_proof_csv_path: str = Field(..., min_length=1)
+    expected_review_commit: str = Field(..., min_length=7, max_length=40)
+    dry_run: StrictBool = True
+    apply: StrictBool = False
+    accepted_ids_only: StrictBool = True
+
+
+_KA_REVIEW_ALLOWED_PREFIXES = (
+    "docs/reports/ka_007_manual_review/",
+    "docs/reports/ka_007_full_plan_final_proof/",
+)
+
+
+def _ka_review_error(status_code: int, code: str, message: str, **extra: Any) -> HTTPException:
+    detail: dict[str, Any] = {"error": code, "message": message}
+    detail.update(extra)
+    return HTTPException(status_code=status_code, detail=detail)
+
+
+def _resolve_ka_review_internal_root(*, require_git: bool = True) -> Path:
+    raw_root = os.environ.get("PITH_REVIEW_ARTIFACT_ROOT", "").strip()
+    if not raw_root:
+        raise _ka_review_error(
+            409,
+            "review_artifact_root_missing",
+            "Review artifact root must be configured for KA review apply.",
+        )
+    root = Path(raw_root).expanduser().resolve()
+    if not root.exists() or not root.is_dir():
+        raise _ka_review_error(409, "review_artifact_root_invalid", "Configured review artifact root is not a directory.")
+    if require_git and not (root / ".git").exists():
+        raise _ka_review_error(409, "review_artifact_root_not_git", "Configured review artifact root is not a git worktree.")
+    return root
+
+
+def _resolve_ka_review_artifact(root: Path, raw_path: str) -> tuple[Path, str]:
+    candidate = Path(raw_path).expanduser()
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    try:
+        resolved = candidate.resolve()
+        rel = resolved.relative_to(root)
+    except ValueError as exc:
+        raise _ka_review_error(
+            400,
+            "artifact_path_outside_root",
+            "Review artifact path must stay inside the configured review artifact root.",
+        ) from exc
+    rel_posix = rel.as_posix()
+    if not any(rel_posix.startswith(prefix) for prefix in _KA_REVIEW_ALLOWED_PREFIXES):
+        raise _ka_review_error(
+            400,
+            "artifact_path_not_allowed",
+            "Review artifact path is not in an allowed KA review report directory.",
+            path=rel_posix,
+        )
+    if not resolved.exists() or not resolved.is_file():
+        raise _ka_review_error(400, "artifact_missing", "Review artifact path does not exist.", path=rel_posix)
+    return resolved, rel_posix
+
+
+def _git_output(repo_root: Path, args: list[str]) -> str:
+    if should_suppress_optional_subprocess("ka_review_git_output"):
+        raise _ka_review_error(
+            503,
+            "subprocess_suppressed_fork_safety",
+            "Git artifact verification is suppressed because the API process is fork-sensitive.",
+        )
+    env = os.environ.copy()
+    for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"):
+        env.pop(key, None)
+    try:
+        return subprocess.check_output(
+            ["git", "-C", str(repo_root), *args],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            env=env,
+        ).strip()
+    except subprocess.CalledProcessError as exc:
+        raise _ka_review_error(409, "git_artifact_verification_failed", "Git artifact verification failed.") from exc
+
+
+def _verify_ka_review_artifact_blob(repo_root: Path, commit: str, path: Path, rel_path: str) -> str:
+    if not re.fullmatch(r"[0-9a-fA-F]{7,40}", commit or ""):
+        raise _ka_review_error(400, "invalid_review_commit", "expected_review_commit must be a 7-40 char hex commit.")
+    commit_obj = _git_output(repo_root, ["rev-parse", "--verify", f"{commit}^{{commit}}"])
+    tree_line = _git_output(repo_root, ["ls-tree", "-r", commit_obj, "--", rel_path])
+    if not tree_line:
+        raise _ka_review_error(409, "artifact_not_in_commit", "Review artifact is not present in expected commit.", path=rel_path)
+    parts = tree_line.split()
+    if len(parts) < 4 or parts[1] != "blob":
+        raise _ka_review_error(409, "artifact_not_blob", "Review artifact in expected commit is not a blob.", path=rel_path)
+    expected_blob = parts[2]
+    working_blob = _git_output(repo_root, ["hash-object", str(path)])
+    if working_blob != expected_blob:
+        raise _ka_review_error(
+            409,
+            "artifact_working_tree_drift",
+            "Working review artifact differs from expected commit blob.",
+            path=rel_path,
+            expected_blob=expected_blob,
+            working_blob=working_blob,
+        )
+    return expected_blob
+
+
+def _load_ka_review_json(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise _ka_review_error(400, "invalid_review_summary", "Review summary JSON is malformed.") from exc
+    if not isinstance(data, dict):
+        raise _ka_review_error(400, "invalid_review_summary", "Review summary must be a JSON object.")
+    return data
+
+
+def _load_ka_review_csv(path: Path) -> list[dict[str, str]]:
+    try:
+        with path.open(newline="", encoding="utf-8") as f:
+            return list(csv.DictReader(f))
+    except OSError as exc:
+        raise _ka_review_error(400, "invalid_review_csv", "Review CSV artifact could not be read.") from exc
+
+
+def _status_set(rows: list[dict[str, str]], status: str) -> set[str]:
+    return {row.get("concept_id", "").strip() for row in rows if row.get("manual_review_status", "").strip() == status}
+
+
+def _verify_ka_review_artifacts(request: KAReviewApplyRequest) -> dict[str, Any]:
+    root = _resolve_ka_review_internal_root()
+    artifact_specs = {
+        "summary": request.review_summary_path,
+        "ledger": request.review_ledger_path,
+        "proof": request.final_proof_csv_path,
+    }
+    resolved: dict[str, tuple[Path, str]] = {
+        name: _resolve_ka_review_artifact(root, raw_path) for name, raw_path in artifact_specs.items()
+    }
+    blobs = {
+        name: _verify_ka_review_artifact_blob(root, request.expected_review_commit, path, rel_path)
+        for name, (path, rel_path) in resolved.items()
+    }
+
+    summary = _load_ka_review_json(resolved["summary"][0])
+    ledger_rows = _load_ka_review_csv(resolved["ledger"][0])
+    proof_rows = _load_ka_review_csv(resolved["proof"][0])
+
+    if summary.get("apply_design_allowed") != "accepted_ids_only":
+        raise _ka_review_error(409, "review_not_accepted_id_only", "Review summary does not allow accepted-ID-only apply.")
+
+    summary_accepted = {str(cid).strip() for cid in (summary.get("accepted_ids") or []) if str(cid).strip()}
+    summary_rejected = {str(cid).strip() for cid in (summary.get("rejected_ids") or []) if str(cid).strip()}
+    summary_needs_human = {str(cid).strip() for cid in (summary.get("needs_human_ids") or []) if str(cid).strip()}
+    ledger_accepted = _status_set(ledger_rows, "accept")
+    ledger_rejected = _status_set(ledger_rows, "reject")
+    ledger_needs_human = _status_set(ledger_rows, "needs_human")
+
+    if summary_accepted != ledger_accepted:
+        raise _ka_review_error(409, "accepted_id_disagreement", "Review summary and ledger disagree on accepted IDs.")
+    if summary_rejected != ledger_rejected:
+        raise _ka_review_error(409, "rejected_id_disagreement", "Review summary and ledger disagree on rejected IDs.")
+    if summary_needs_human != ledger_needs_human:
+        raise _ka_review_error(409, "needs_human_id_disagreement", "Review summary and ledger disagree on needs-human IDs.")
+    if (summary_accepted & summary_rejected) or (summary_accepted & summary_needs_human):
+        raise _ka_review_error(409, "blocked_id_overlap", "Accepted IDs overlap rejected or needs-human IDs.")
+    if not summary_accepted:
+        raise _ka_review_error(409, "accepted_ids_empty", "Review summary has no accepted IDs to apply.")
+
+    proof_targets: dict[str, str] = {}
+    for row in proof_rows:
+        concept_id = (row.get("concept_id") or "").strip()
+        if concept_id in summary_accepted:
+            if (row.get("decision") or "").strip() != "recommend_reclassify":
+                raise _ka_review_error(
+                    409,
+                    "accepted_id_not_recommended",
+                    "Accepted ID is not a final proof reclassification recommendation.",
+                    concept_id=concept_id,
+                )
+            target = (row.get("recommended_knowledge_area") or "").strip()
+            if not target:
+                raise _ka_review_error(409, "accepted_id_missing_target", "Accepted ID has no target KA.", concept_id=concept_id)
+            proof_targets[concept_id] = target
+
+    missing = sorted(summary_accepted - set(proof_targets))
+    if missing:
+        raise _ka_review_error(409, "accepted_ids_missing_from_proof", "Accepted IDs are missing from final proof.", missing=missing)
+
+    return {
+        "root": root,
+        "paths": {name: rel_path for name, (_, rel_path) in resolved.items()},
+        "blobs": blobs,
+        "accepted_ids": sorted(summary_accepted),
+        "rejected_ids": sorted(summary_rejected),
+        "needs_human_ids": sorted(summary_needs_human),
+        "targets": proof_targets,
+    }
+
+
+def _create_ka_review_apply_snapshot() -> dict[str, Any]:
+    import sqlite3 as _sqlite3
+
+    from app.core.profile import resolve_data_dir, resolve_db_path
+
+    data_dir = resolve_data_dir()
+    source_path = resolve_db_path(data_dir)
+    backup_dir = data_dir / "backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = _utc_now_iso().replace(":", "").replace("-", "").replace(".", "_").replace("+", "Z")
+    backup_path = backup_dir / f"pith_ka_review_apply_{timestamp}.db"
+    tmp_path = backup_path.with_suffix(".db.tmp")
+    if not source_path.exists():
+        raise _ka_review_error(409, "db_snapshot_source_missing", "Source DB does not exist.")
+
+    try:
+        src = _sqlite3.connect(f"file:{source_path}?mode=ro", uri=True)
+        try:
+            dst = _sqlite3.connect(str(tmp_path))
+            try:
+                src.backup(dst, pages=-1)
+            finally:
+                dst.close()
+        finally:
+            src.close()
+        tmp_path.replace(backup_path)
+        verify_conn = _sqlite3.connect(f"file:{backup_path}?mode=ro", uri=True)
+        try:
+            quick_check = verify_conn.execute("PRAGMA quick_check").fetchone()[0]
+            concept_count = verify_conn.execute("SELECT COUNT(*) FROM concepts WHERE is_current = 1").fetchone()[0]
+        finally:
+            verify_conn.close()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+        raise _ka_review_error(409, "db_snapshot_failed", "Could not create WAL-safe DB snapshot.") from exc
+    if quick_check != "ok":
+        raise _ka_review_error(
+            409,
+            "db_snapshot_quick_check_failed",
+            "DB snapshot quick_check did not return ok.",
+            quick_check=quick_check,
+            path=str(backup_path),
+        )
+    return {"path": str(backup_path), "quick_check": quick_check, "concept_count": concept_count}
+
+
+def _json_data_ka(data: dict[str, Any]) -> str | None:
+    value = data.get("knowledge_area")
+    return str(value) if value is not None else None
+
+
+def _json_meta_ka(data: dict[str, Any]) -> str | None:
+    meta = data.get("metadata")
+    if not isinstance(meta, dict):
+        return None
+    value = meta.get("knowledge_area")
+    return str(value) if value is not None else None
+
+
+def _prepare_ka_review_row(
+    row,
+    target_ka: str,
+    *,
+    now: str,
+    review_commit: str,
+    review_artifact: str,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    from app.core.taxonomy_utils import normalize_knowledge_area
+
+    concept_id = row["id"]
+    current_ka = row["knowledge_area"]
+    base = {"concept_id": concept_id, "target_ka": target_ka, "current_ka": current_ka}
+    if int(row["is_current"] or 0) != 1:
+        return None, {**base, "result": "skipped", "reason": "not_current"}
+    if current_ka != "general":
+        return None, {**base, "result": "skipped", "reason": "current_ka_changed"}
+    try:
+        data = json.loads(row["data"]) if row["data"] else {}
+    except json.JSONDecodeError:
+        return None, {**base, "result": "skipped", "reason": "invalid_json"}
+    if not isinstance(data, dict):
+        return None, {**base, "result": "skipped", "reason": "invalid_json"}
+
+    data_ka = _json_data_ka(data)
+    meta_ka = _json_meta_ka(data)
+    if data_ka not in (None, "general") or meta_ka not in (None, "general"):
+        return None, {
+            **base,
+            "result": "skipped",
+            "reason": "json_ka_changed",
+            "json_ka": data_ka,
+            "metadata_ka": meta_ka,
+        }
+
+    normalized_target, source = normalize_knowledge_area(target_ka, strict=True)
+    if not normalized_target or normalized_target == "general":
+        return None, {
+            **base,
+            "result": "skipped",
+            "reason": "invalid_target_ka",
+            "normalized_target_ka": normalized_target,
+            "normalization_source": source,
+        }
+
+    meta = data.get("metadata")
+    if not isinstance(meta, dict):
+        meta = {}
+        data["metadata"] = meta
+    data["knowledge_area"] = normalized_target
+    meta["knowledge_area"] = normalized_target
+    meta["knowledge_area_source"] = "manual_review_accepted_id"
+    meta["ka_admission_state"] = "classified"
+    meta["ka_admission_source"] = "manual_review_accepted_id"
+    meta["ka_admission_at"] = now
+    meta["ka_reclassified_from"] = "general"
+    meta["ka_reclassified_at"] = now
+    meta["ka_review_commit"] = review_commit
+    meta["ka_review_artifact"] = review_artifact
+    return data, {**base, "target_ka": normalized_target, "result": "ready", "normalization_source": source}
+
+
+def _ka_integrity_snapshot(conn, *, batch_limit: int, review_ambiguous: bool = False) -> dict[str, Any]:
+    from app.cognitive.ka_admission import KA_QUEUED_UNCLASSIFIED_STALE_HOURS
+
+    json_ka = _json_knowledge_area_expr()
+    state_expr = _ka_admission_state_expr()
+    mismatch_count = conn.execute(
+        f"""SELECT COUNT(*) FROM concepts
+            WHERE is_current = 1
+              AND COALESCE(knowledge_area, '') != COALESCE({json_ka}, '')"""
+    ).fetchone()[0]
+    total_current = conn.execute("SELECT COUNT(*) FROM concepts WHERE is_current = 1").fetchone()[0]
+    general_current = conn.execute(
+        "SELECT COUNT(*) FROM concepts WHERE is_current = 1 AND knowledge_area = 'general'"
+    ).fetchone()[0]
+    unreviewed_general = conn.execute(
+        f"""SELECT COUNT(*) FROM concepts
+           WHERE is_current = 1
+             AND {_unreviewed_general_predicate()}"""
+    ).fetchone()[0]
+    intentional_general = conn.execute(
+        f"""SELECT COUNT(*) FROM concepts
+           WHERE is_current = 1 AND knowledge_area = 'general'
+             AND {state_expr} = 'intentional_general'"""
+    ).fetchone()[0]
+    deterministic_ambiguous = conn.execute(
+        f"""SELECT COUNT(*) FROM concepts
+           WHERE is_current = 1 AND knowledge_area = 'general'
+             AND ({state_expr} = 'deterministic_ambiguous'
+                  OR COALESCE(json_extract(data, '$.metadata.knowledge_area_review'), '') = 'deterministic_ambiguous')"""
+    ).fetchone()[0]
+    queued_unclassified = conn.execute(
+        f"""SELECT COUNT(*) FROM concepts
+           WHERE is_current = 1 AND knowledge_area = 'unclassified'
+             AND {state_expr} = 'queued_unclassified'"""
+    ).fetchone()[0]
+    queued_unclassified_stale = conn.execute(
+        f"""SELECT COUNT(*) FROM concepts
+           WHERE is_current = 1 AND knowledge_area = 'unclassified'
+             AND {state_expr} = 'queued_unclassified'
+             AND datetime(COALESCE(json_extract(data, '$.metadata.ka_admission_at'), created_at)) < datetime('now', ?)""",
+        (f"-{KA_QUEUED_UNCLASSIFIED_STALE_HOURS} hours",),
+    ).fetchone()[0]
+    fallback_failure = conn.execute(
+        f"""SELECT COUNT(*) FROM concepts
+           WHERE is_current = 1 AND knowledge_area = 'unclassified'
+             AND {state_expr} = 'fallback_failure'"""
+    ).fetchone()[0]
+    invalid_ka_admission_state = conn.execute(
+        f"""SELECT COUNT(*) FROM concepts
+           WHERE is_current = 1
+             AND {state_expr} != ''
+             AND {state_expr} NOT IN (
+                 'classified',
+                 'intentional_general',
+                 'deterministic_ambiguous',
+                 'queued_unclassified',
+                 'fallback_failure'
+             )"""
+    ).fetchone()[0]
+    planned_updates, ambiguous_ids = _safe_general_ka_candidates(conn, batch_limit=batch_limit)
+    unclassified_updates = _safe_unclassified_ka_candidates(conn, batch_limit=batch_limit)
+    snapshot = {
+        "sql_json_mismatches": mismatch_count,
+        "general_current": general_current,
+        "unreviewed_general": unreviewed_general,
+        "intentional_general": intentional_general,
+        "deterministic_ambiguous": deterministic_ambiguous,
+        "queued_unclassified": queued_unclassified,
+        "queued_unclassified_stale": queued_unclassified_stale,
+        "fallback_failure": fallback_failure,
+        "invalid_ka_admission_state": invalid_ka_admission_state,
+        "total_current": total_current,
+        "general_pct": round(general_current / total_current, 4) if total_current else 0.0,
+        "batch_limit": batch_limit,
+        "batch_reclassifiable": len(planned_updates),
+        "batch_unclassified_reclassifiable": len(unclassified_updates),
+        "batch_ambiguous": len(ambiguous_ids),
+        "is_healthy": (
+            mismatch_count == 0
+            and unreviewed_general == 0
+            and fallback_failure == 0
+            and queued_unclassified_stale == 0
+            and invalid_ka_admission_state == 0
+        ),
+    }
+    if review_ambiguous:
+        ambiguous_review, ambiguous_conflicts, ambiguous_unresolved, ambiguous_reclassifiable_total = (
+            _ambiguous_second_pass_candidates(
+                conn, batch_limit=batch_limit, scan_limit=_AMBIGUOUS_SECOND_PASS_MAX_SCAN
+            )
+        )
+        snapshot.update(
+            {
+                "ambiguous_review_reclassifiable": len(ambiguous_review),
+                "ambiguous_review_reclassifiable_total": ambiguous_reclassifiable_total,
+                "ambiguous_review_conflicts": len(ambiguous_conflicts),
+                "ambiguous_review_unresolved": len(ambiguous_unresolved),
+                "ambiguous_review_scan_limit": _AMBIGUOUS_SECOND_PASS_MAX_SCAN,
+            }
+        )
+    return snapshot
+
+
+@app.get("/pith_ka_integrity")
+def pith_ka_integrity(
+    repair: bool = False,
+    dry_run: bool = True,
+    batch_limit: int = 250,
+    review_ambiguous: bool = False,
+):
+    """Inspect and optionally repair deterministic knowledge-area drift."""
+    batch_limit = max(1, min(batch_limit, 1000))
+    try:
+        with _db() as conn:
+            pre = _ka_integrity_snapshot(conn, batch_limit=batch_limit, review_ambiguous=review_ambiguous)
+        result = {**pre, "repair": {"dry_run": dry_run, "attempted": False, "updated": 0, "ambiguous": pre["batch_ambiguous"]}}
+        if not repair:
+            return result
+
+        with _db() as conn:
+            planned_updates, ambiguous_ids = _safe_general_ka_candidates(conn, batch_limit=batch_limit)
+            unclassified_updates = _safe_unclassified_ka_candidates(conn, batch_limit=batch_limit)
+            ambiguous_review, ambiguous_conflicts, ambiguous_unresolved = (
+                _ambiguous_second_pass_candidates(
+                    conn, batch_limit=batch_limit, scan_limit=_AMBIGUOUS_SECOND_PASS_MAX_SCAN
+                )[:3]
+                if review_ambiguous
+                else ([], [], [])
+            )
+            mismatch_rows = conn.execute(
+                f"""SELECT id, knowledge_area
+                    FROM concepts
+                    WHERE is_current = 1
+                      AND COALESCE(knowledge_area, '') != COALESCE({_json_knowledge_area_expr()}, '')"""
+            ).fetchall()
+
+        if dry_run:
+            result["repair"] = {
+                "dry_run": True,
+                "attempted": False,
+                "would_update": len(planned_updates),
+                "would_update_unclassified": len(unclassified_updates),
+                "would_fix_mismatches": len(mismatch_rows),
+                "ambiguous": len(ambiguous_ids),
+                "would_mark_ambiguous": len(ambiguous_ids),
+                "ambiguous_ids": ambiguous_ids[:50],
+                "would_update_ambiguous_review": len(ambiguous_review),
+                "ambiguous_review_conflicts": len(ambiguous_conflicts),
+                "ambiguous_review_unresolved": len(ambiguous_unresolved),
+                "ambiguous_review_ids": [row[0] for row in ambiguous_review[:50]],
+                "review_ambiguous": review_ambiguous,
+            }
+            return result
+
+        updated = 0
+        unclassified_updated = 0
+        mismatch_fixed = 0
+        ambiguous_marked = 0
+        ambiguous_review_updated = 0
+        with _db_immediate() as conn:
+            now = _utc_now_iso()
+            for row in mismatch_rows:
+                conn.execute(
+                    """UPDATE concepts
+                       SET data = json_set(
+                           COALESCE(data, '{}'),
+                           '$.knowledge_area', ?,
+                           '$.metadata.knowledge_area', ?
+                       ),
+                       updated_at = ?
+                       WHERE id = ?""",
+                    (row["knowledge_area"], row["knowledge_area"], now, row["id"]),
+                )
+                mismatch_fixed += 1
+            for concept_id, area, source in planned_updates:
+                conn.execute(
+                    """UPDATE concepts
+                       SET knowledge_area = ?,
+                           data = json_set(
+                               COALESCE(data, '{}'),
+                               '$.knowledge_area', ?,
+                               '$.metadata.knowledge_area', ?,
+                               '$.metadata.knowledge_area_source', ?,
+                               '$.metadata.ka_admission_state', 'classified',
+                               '$.metadata.ka_admission_source', ?,
+                               '$.metadata.ka_admission_at', ?
+                           ),
+                           updated_at = ?
+                       WHERE id = ? AND is_current = 1 AND knowledge_area = 'general'""",
+                    (area, area, area, source, source, now, now, concept_id),
+                )
+                updated += conn.execute("SELECT changes()").fetchone()[0]
+            for concept_id, area, source in unclassified_updates:
+                conn.execute(
+                    """UPDATE concepts
+                       SET knowledge_area = ?,
+                           data = json_set(
+                               COALESCE(data, '{}'),
+                               '$.knowledge_area', ?,
+                               '$.metadata.knowledge_area', ?,
+                               '$.metadata.knowledge_area_source', ?,
+                               '$.metadata.ka_admission_state', 'classified',
+                               '$.metadata.ka_admission_source', ?,
+                               '$.metadata.ka_admission_at', ?
+                           ),
+                           updated_at = ?
+                       WHERE id = ? AND is_current = 1 AND knowledge_area = 'unclassified'""",
+                    (area, area, area, source, source, now, now, concept_id),
+                )
+                unclassified_updated += conn.execute("SELECT changes()").fetchone()[0]
+            for concept_id, area, confidence, rule in ambiguous_review:
+                conn.execute(
+                    """UPDATE concepts
+                       SET knowledge_area = ?,
+                           data = json_set(
+                               COALESCE(data, '{}'),
+                               '$.knowledge_area', ?,
+                               '$.metadata.knowledge_area', ?,
+                               '$.metadata.knowledge_area_source', 'deterministic_second_pass',
+                               '$.metadata.ka_admission_state', 'classified',
+                               '$.metadata.ka_admission_source', 'deterministic_second_pass',
+                               '$.metadata.ka_confidence', ?,
+                               '$.metadata.ka_reclassified_from', 'general',
+                               '$.metadata.ka_reclassified_at', ?,
+                               '$.metadata.ka_second_pass_rule', ?,
+                               '$.metadata.ka_second_pass_at', ?
+                           ),
+                           updated_at = ?
+                       WHERE id = ? AND is_current = 1 AND knowledge_area = 'general'""",
+                    (area, area, area, confidence, now, rule, now, now, concept_id),
+                )
+                ambiguous_review_updated += conn.execute("SELECT changes()").fetchone()[0]
+            for concept_id in ambiguous_ids:
+                conn.execute(
+                    """UPDATE concepts
+                       SET data = json_set(
+                           COALESCE(data, '{}'),
+                           '$.metadata.ka_admission_state', 'deterministic_ambiguous',
+                           '$.metadata.ka_admission_source', 'repair',
+                           '$.metadata.ka_admission_at', ?,
+                           '$.metadata.ka_reviewed_at', ?,
+                           '$.metadata.knowledge_area_review', 'deterministic_ambiguous',
+                           '$.metadata.knowledge_area_reviewed_at', ?
+                       ),
+                       updated_at = ?
+                       WHERE id = ? AND is_current = 1 AND knowledge_area = 'general'""",
+                    (now, now, now, now, concept_id),
+                )
+                ambiguous_marked += conn.execute("SELECT changes()").fetchone()[0]
+            post = _ka_integrity_snapshot(conn, batch_limit=batch_limit, review_ambiguous=review_ambiguous)
+        result = {
+            **post,
+            "repair": {
+                "dry_run": False,
+                "attempted": True,
+                "updated": updated,
+                "unclassified_updated": unclassified_updated,
+                "mismatches_fixed": mismatch_fixed,
+                "ambiguous_marked": ambiguous_marked,
+                "ambiguous_review_updated": ambiguous_review_updated,
+                "ambiguous_review_conflicts": len(ambiguous_conflicts),
+                "ambiguous_review_unresolved": len(ambiguous_unresolved),
+                "ambiguous": len(ambiguous_ids),
+                "ambiguous_ids": ambiguous_ids[:50],
+                "review_ambiguous": review_ambiguous,
+                "pre_repair": pre,
+                "post_repair": post,
+            },
+        }
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=_safe_error(e))
+
+
+@app.post("/pith_ka_review_apply", dependencies=[Depends(verify_api_key)])
+def pith_ka_review_apply(request: KAReviewApplyRequest):
+    """Apply manually accepted KA review recommendations with artifact and health gates."""
+    try:
+        if not request.accepted_ids_only:
+            raise _ka_review_error(400, "accepted_ids_only_required", "accepted_ids_only must be true.")
+        if request.apply and request.dry_run:
+            raise _ka_review_error(400, "ambiguous_apply_flags", "apply=true requires dry_run=false.")
+        if not request.dry_run and not request.apply:
+            raise _ka_review_error(400, "apply_flag_required", "dry_run=false requires apply=true.")
+
+        artifacts = _verify_ka_review_artifacts(request)
+        accepted_ids = artifacts["accepted_ids"]
+        targets = artifacts["targets"]
+        pre: dict[str, Any]
+        with _db() as conn:
+            pre = _ka_integrity_snapshot(conn, batch_limit=1000, review_ambiguous=False)
+            placeholders = ",".join("?" for _ in accepted_ids)
+            rows = conn.execute(
+                f"SELECT id, knowledge_area, is_current, status, data FROM concepts WHERE id IN ({placeholders})",
+                tuple(accepted_ids),
+            ).fetchall()
+        if request.apply and not pre.get("is_healthy"):
+            raise _ka_review_error(
+                409,
+                "ka_integrity_unhealthy",
+                "KA integrity must be healthy before accepted-ID apply.",
+                pre_integrity=pre,
+            )
+
+        row_by_id = {row["id"]: row for row in rows}
+        now = _utc_now_iso()
+        review_artifact = artifacts["paths"]["ledger"]
+        dry_rows: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        for concept_id in accepted_ids:
+            row = row_by_id.get(concept_id)
+            if row is None:
+                result = {
+                    "concept_id": concept_id,
+                    "target_ka": targets[concept_id],
+                    "result": "skipped",
+                    "reason": "missing_concept",
+                }
+                skipped.append(result)
+                dry_rows.append(result)
+                continue
+            data, result = _prepare_ka_review_row(
+                row,
+                targets[concept_id],
+                now=now,
+                review_commit=request.expected_review_commit,
+                review_artifact=review_artifact,
+            )
+            if data is None:
+                skipped.append(result)
+                dry_rows.append(result)
+            else:
+                dry_rows.append({**result, "result": "would_update" if request.dry_run else "ready"})
+
+        artifact_verification = {
+            "summary_blob": artifacts["blobs"]["summary"],
+            "ledger_blob": artifacts["blobs"]["ledger"],
+            "proof_blob": artifacts["blobs"]["proof"],
+            "accepted_count": len(artifacts["accepted_ids"]),
+            "rejected_count": len(artifacts["rejected_ids"]),
+            "needs_human_count": len(artifacts["needs_human_ids"]),
+        }
+        base_response: dict[str, Any] = {
+            "success": True,
+            "dry_run": request.dry_run,
+            "attempted": False,
+            "artifact_commit": request.expected_review_commit,
+            "artifact_verification": artifact_verification,
+            "pre_integrity": pre,
+            "snapshot": None,
+            "planned": sum(1 for row in dry_rows if row["result"] in {"would_update", "ready"}),
+            "updated": 0,
+            "skipped": skipped,
+            "rows": dry_rows,
+            "post_integrity": None,
+        }
+        if request.dry_run:
+            return base_response
+
+        snapshot = _create_ka_review_apply_snapshot()
+        apply_rows: list[dict[str, Any]] = []
+        apply_skipped: list[dict[str, Any]] = []
+        updated = 0
+        with _db_immediate() as conn:
+            now = _utc_now_iso()
+            for concept_id in accepted_ids:
+                row = conn.execute(
+                    "SELECT id, knowledge_area, is_current, status, data FROM concepts WHERE id = ?",
+                    (concept_id,),
+                ).fetchone()
+                if row is None:
+                    result = {
+                        "concept_id": concept_id,
+                        "target_ka": targets[concept_id],
+                        "result": "skipped",
+                        "reason": "missing_concept",
+                    }
+                    apply_skipped.append(result)
+                    apply_rows.append(result)
+                    continue
+                data, result = _prepare_ka_review_row(
+                    row,
+                    targets[concept_id],
+                    now=now,
+                    review_commit=request.expected_review_commit,
+                    review_artifact=review_artifact,
+                )
+                if data is None:
+                    apply_skipped.append(result)
+                    apply_rows.append(result)
+                    continue
+                rowcount = update_concept_data(conn, concept_id, data)
+                if rowcount == 1:
+                    updated += 1
+                    apply_rows.append({**result, "result": "updated"})
+                else:
+                    failed = {**result, "result": "skipped", "reason": "update_failed"}
+                    apply_skipped.append(failed)
+                    apply_rows.append(failed)
+            post = _ka_integrity_snapshot(conn, batch_limit=1000, review_ambiguous=False)
+        return {
+            **base_response,
+            "dry_run": False,
+            "attempted": True,
+            "snapshot": snapshot,
+            "planned": sum(1 for row in apply_rows if row["result"] == "updated"),
+            "updated": updated,
+            "skipped": apply_skipped,
+            "rows": apply_rows,
+            "post_integrity": post,
+        }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=_safe_error(e))
 
@@ -3440,8 +5889,89 @@ def remove_question(concept_id: str):
     return {"status": "removed", "concept_id": concept_id}
 
 
+def _reflection_summary_text(summary: Any, mode: str) -> str:
+    # OPS-046: Build human-readable reflection_summary (always present).
+    parts = []
+    if summary.concepts_consolidated:
+        parts.append(f"{summary.concepts_consolidated} consolidated")
+    if summary.concepts_decayed:
+        parts.append(f"{summary.concepts_decayed} decayed")
+    if summary.concepts_archived:
+        parts.append(f"{summary.concepts_archived} forgotten")
+    if getattr(summary, "concepts_gc_archived", 0):  # REFLECT-025
+        parts.append(f"{summary.concepts_gc_archived} gc-archived")
+    if getattr(summary, "forgetting_candidates", 0):  # REFLECT-025: early-warning gauge
+        parts.append(f"{summary.forgetting_candidates} forget-candidates")
+    if summary.concepts_recalibrated:
+        parts.append(f"{summary.concepts_recalibrated} recalibrated")
+    if summary.concepts_promoted:
+        parts.append(f"{summary.concepts_promoted} promoted")
+    if summary.concepts_time_matured:
+        parts.append(f"{summary.concepts_time_matured} matured")
+    if summary.associations_updated:
+        parts.append(f"{summary.associations_updated} associations updated")
+    if summary.questions_generated:
+        parts.append(f"{summary.questions_generated} questions generated")
+
+    if summary.aborted:
+        abort_location = getattr(summary, "abort_stage", None) or summary.last_completed_step or "startup"
+        return f"{mode.capitalize()} reflection aborted: {summary.abort_reason or 'unknown'} after {abort_location}"
+    return f"{mode.capitalize()} reflection: " + (", ".join(parts) if parts else "no changes")
+
+
+def _reflection_api_response(result: Any, *, verbose: bool) -> dict[str, Any]:
+    summary = result.summary
+    if summary is None:
+        response = result.response_fields
+        response["reflection_summary"] = f"{result.mode.capitalize()} reflection: no changes"
+        return response
+
+    response = {
+        "reflection_summary": _reflection_summary_text(summary, result.mode),
+        "mode": result.mode,
+        "run_id": result.run_id,
+        "run_status": result.status,
+        "source": result.source,
+        "duration_ms": result.duration_ms,
+        "concepts_consolidated": summary.concepts_consolidated,
+        "concepts_decayed": summary.concepts_decayed,
+        "concepts_archived": summary.concepts_archived,
+        "forgetting_candidates": getattr(summary, "forgetting_candidates", 0),  # REFLECT-025: early-warning gauge
+        "concepts_gc_archived": getattr(summary, "concepts_gc_archived", 0),  # REFLECT-025: GC archival (was dropped)
+        "concepts_recalibrated": summary.concepts_recalibrated,
+        "concepts_promoted": summary.concepts_promoted,
+        "concepts_time_matured": summary.concepts_time_matured,
+        "associations_updated": summary.associations_updated,
+        "questions_generated": summary.questions_generated,
+        "gc_queue_remaining": summary.gc_queue_remaining,
+        "timestamp": summary.timestamp,
+        "aborted": summary.aborted,
+        "abort_reason": summary.abort_reason,
+        "last_completed_step": summary.last_completed_step,
+        "abort_stage": getattr(summary, "abort_stage", None),
+        "budget_status": getattr(summary, "budget_status", "completed"),
+    }
+
+    # Verbose fields: internal scoring details omitted by default (OPS-048 alignment).
+    if verbose:
+        response["phase_timings"] = summary.phase_timings
+        response["deferred_phases"] = getattr(summary, "deferred_phases", [])
+        response["phase_budget_decisions"] = getattr(summary, "phase_budget_decisions", {})
+        response["merge_progress"] = getattr(summary, "merge_progress", {})
+        response["evidence_cv"] = {
+            "composite": summary.evidence_cv_composite,
+            "reliability": summary.evidence_cv_reliability,
+            "directness": summary.evidence_cv_directness,
+            "consistency": summary.evidence_cv_consistency,
+            "corroboration": summary.evidence_cv_corroboration,
+            "recency": summary.evidence_cv_recency,
+        }
+
+    return response
+
+
 @app.post("/pith_reflect", dependencies=[Depends(verify_api_key)])
-def pith_reflect(mode: str = "incremental", verbose: bool = False):
+def pith_reflect(mode: str = "incremental", verbose: bool = False, response: Response = None):
     """Run reflection/consolidation cycle.
 
     Args:
@@ -3452,69 +5982,60 @@ def pith_reflect(mode: str = "incremental", verbose: bool = False):
     The reflection_summary field is always present regardless of verbose setting.
     """
     try:
-        summary = reflection_engine.reflect(mode)
+        from app.ops.reflection_runner import (
+            ReflectionRunRequest,
+            run_reflection,
+            submit_reflection_background,
+        )
 
-        # OPS-046: Build human-readable reflection_summary (always present)
-        parts = []
-        if summary.concepts_consolidated:
-            parts.append(f"{summary.concepts_consolidated} consolidated")
-        if summary.concepts_decayed:
-            parts.append(f"{summary.concepts_decayed} decayed")
-        if summary.concepts_archived:
-            parts.append(f"{summary.concepts_archived} archived")
-        if summary.concepts_recalibrated:
-            parts.append(f"{summary.concepts_recalibrated} recalibrated")
-        if summary.concepts_promoted:
-            parts.append(f"{summary.concepts_promoted} promoted")
-        if summary.concepts_time_matured:
-            parts.append(f"{summary.concepts_time_matured} matured")
-        if summary.associations_updated:
-            parts.append(f"{summary.associations_updated} associations updated")
-        if summary.questions_generated:
-            parts.append(f"{summary.questions_generated} questions generated")
-
-        if summary.aborted:
-            abort_location = getattr(summary, "abort_stage", None) or summary.last_completed_step or "startup"
-            reflection_summary = (
-                f"{mode.capitalize()} reflection aborted: "
-                f"{summary.abort_reason or 'unknown'} after {abort_location}"
+        engine_override = None if isinstance(reflection_engine, _LazyImportProxy) else reflection_engine
+        require_ready = mode == "full" and engine_override is None
+        request = ReflectionRunRequest(
+            mode=mode,
+            source="api",
+            verbose=verbose,
+            require_ready=require_ready,
+            ready_state=_build_ready_state() if require_ready else None,
+            reflection_engine_override=engine_override,
+        )
+        result = (
+            submit_reflection_background(request)
+            if mode == "full" and engine_override is None
+            else run_reflection(request)
+        )
+        if result.status in {"accepted", "deferred", "queued"}:
+            if response is not None:
+                response.status_code = 202
+            accepted_response = result.response_fields
+            if result.status == "accepted":
+                accepted_response["reflection_summary"] = "Full reflection accepted for durable background execution"
+            elif result.status == "queued":
+                accepted_response["reflection_summary"] = "Full reflection queued for durable background execution"
+            else:
+                accepted_response["reflection_summary"] = "Full reflection deferred by admission policy"
+            return accepted_response
+        if result.status == "rejected":
+            headers = None
+            retry_after = result.admission.retry_after_seconds if result.admission else None
+            if retry_after is not None:
+                headers = {"Retry-After": str(retry_after)}
+            raise HTTPException(
+                status_code=result.admission.http_status if result.admission else 503,
+                detail=result.response_fields,
+                headers=headers,
             )
-        else:
-            reflection_summary = f"{mode.capitalize()} reflection: " + (", ".join(parts) if parts else "no changes")
-
-        # Core fields always returned
-        response = {
-            "reflection_summary": reflection_summary,
-            "mode": mode,
-            "concepts_consolidated": summary.concepts_consolidated,
-            "concepts_decayed": summary.concepts_decayed,
-            "concepts_archived": summary.concepts_archived,
-            "concepts_recalibrated": summary.concepts_recalibrated,
-            "concepts_promoted": summary.concepts_promoted,
-            "concepts_time_matured": summary.concepts_time_matured,
-            "associations_updated": summary.associations_updated,
-            "questions_generated": summary.questions_generated,
-            "gc_queue_remaining": summary.gc_queue_remaining,
-            "timestamp": summary.timestamp,
-            "aborted": summary.aborted,
-            "abort_reason": summary.abort_reason,
-            "last_completed_step": summary.last_completed_step,
-            "abort_stage": getattr(summary, "abort_stage", None),
-        }
-
-        # Verbose fields: internal scoring details omitted by default (OPS-048 alignment)
+        if result.status == "failed":
+            raise HTTPException(status_code=500, detail=result.response_fields)
         if verbose:
-            response["phase_timings"] = summary.phase_timings
-            response["evidence_cv"] = {
-                "composite": summary.evidence_cv_composite,
-                "reliability": summary.evidence_cv_reliability,
-                "directness": summary.evidence_cv_directness,
-                "consistency": summary.evidence_cv_consistency,
-                "corroboration": summary.evidence_cv_corroboration,
-                "recency": summary.evidence_cv_recency,
-            }
-
+            response = _reflection_api_response(result, verbose=True)
+            # MONITOR-063: helper gates "phase_timings" behind verbose output.
+        else:
+            response = _reflection_api_response(result, verbose=False)
+        if "reflection_summary" not in response:
+            response["reflection_summary"] = f"{mode.capitalize()} reflection: no changes"
         return response
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=_safe_error(e))
 
@@ -3525,6 +6046,12 @@ def pith_health(detail: str = "fast"):
     if detail not in {"fast", "full"}:
         raise HTTPException(status_code=400, detail="detail must be 'fast' or 'full'")
     ready = _build_ready_state()
+    try:
+        from app.ops.reflection_runner import reflection_runner
+
+        active_reflection = reflection_runner.get_active_run()
+    except Exception:
+        active_reflection = None
     if _should_defer_health_db_metrics(ready):
         reason = _health_metrics_defer_reason(ready)
         return {
@@ -3544,6 +6071,7 @@ def pith_health(detail: str = "fast"):
                 "write_state": ready.get("write_state"),
                 "retrieval_state": ready.get("retrieval_state"),
             },
+            "active_reflection": active_reflection,
         }
     if detail == "fast":
         return _build_pith_health_fast_cached()
@@ -3641,6 +6169,7 @@ def pith_health(detail: str = "fast"):
             health["startup_warnings"] = warnings
             health["startup_degraded"] = any(w["severity"] == "critical" for w in warnings)
 
+        health["active_reflection"] = active_reflection
         health.setdefault("mode", "full")
         health.setdefault("generated_at", _utc_now_iso())
         health.setdefault("cache_age_ms", 0)
@@ -3754,9 +6283,10 @@ def backup_health():
 
 @app.post("/pith/benchmark", dependencies=[Depends(verify_api_key)])
 async def benchmark_endpoint(mode: str = "full"):
-    """AF-05: Run CogGov-Bench behavioral governance benchmark.
+    """AF-05: Run the internal CogGov governance diagnostic.
 
-    The benchmark logic lives in app/coggov_bench.py (992+ lines).
+    This is local health evidence only, not public benchmark evidence.
+    The diagnostic logic lives in app/coggov_bench.py (992+ lines).
     Amendment 7: 5-minute timeout to prevent server hangs.
     """
     import asyncio as _asyncio
@@ -3854,6 +6384,26 @@ async def maintenance_endpoint(request: Request, body: dict = {}):
 
     phases = body.get("phases")
     dry_run = body.get("dry_run", False)
+
+    op = body.get("op")
+    if op == "tfidf_repair":
+        # In-process fresh-rebuild + atomic swap (RETRIEVAL-123). Runs in the
+        # server process so the in-process writer-quiesce gate covers the hot
+        # path. to_thread keeps the event loop responsive during the ~65s build.
+        from app.ops.pressure_state import clear_maintenance_lease, write_maintenance_lease
+
+        async with maintenance_lock:
+            lease = write_maintenance_lease(
+                source="tfidf_repair", phase="repair", expected_timeout_seconds=180
+            )
+            try:
+                report = await asyncio.to_thread(
+                    retrieval_engine.rebuild_and_swap_repair, dry_run=dry_run
+                )
+            finally:
+                clear_maintenance_lease(run_id=lease.run_id)
+        return report
+
     async with maintenance_lock:
         report = await run_maintenance(phases=phases, dry_run=dry_run)
     return report.to_dict()
@@ -3866,7 +6416,27 @@ def maintenance_status():
     from app.storage import get_db_connection
 
     conn = get_db_connection()
-    return task_runner.get_status(conn)
+    status = task_runner.get_status(conn)
+
+    # RETRIEVAL-123: expose in-process writer-quiesce observability.
+    try:
+        status["quiesce"] = {
+            "quiesce_active": retrieval_engine._quiesce.is_set(),
+            "inflight_writers": retrieval_engine._inflight_writers,
+            "quiesce_skipped": dict(retrieval_engine._quiesce_skipped),
+        }
+    except Exception:
+        pass
+
+    # MONITOR-163: expose TF-IDF refresh-drain status for the out-of-process monitor.
+    try:
+        from app.retrieval.refresh_drain import get_drain_status
+
+        status["tfidf_refresh_drain"] = get_drain_status()
+    except Exception:
+        pass
+
+    return status
 
 
 # --- OPS-080: Consumer Status Endpoint ---
@@ -4621,12 +7191,19 @@ def session_start(body: dict = None):
     context_hint = ""
     agent_id = "default"
     platform_hint = "unknown"  # SESSION-012 v0.3
+    surface_id = "unknown"
     if body and isinstance(body, dict):
         context_hint = body.get("context_hint", "")
         agent_id = body.get("agent_id", "default")
         platform_hint = body.get("platform_hint", "unknown")
+        surface_id = body.get("surface_id", "unknown")
 
-    result = session_manager.start_session(context_hint=context_hint, agent_id=agent_id, platform_hint=platform_hint)
+    result = session_manager.start_session(
+        context_hint=context_hint,
+        agent_id=agent_id,
+        platform_hint=platform_hint,
+        surface_id=surface_id,
+    )
     # start_session now returns dict (with optional active_checkpoint attached)
     if hasattr(result, "model_dump"):
         return result.model_dump()
@@ -4714,14 +7291,19 @@ def conversation_turn_endpoint(
     the most relevant existing knowledge. Read-only. Target: <50ms."""
     if getattr(app.state, "startup_task", None) is not None:
         _require_retrieval_ready("conversation_turn")
+    is_hook_additional_context = (
+        getattr(request, "context_delivery_mode", "") == "hook_additional_context"
+    )
     # PERF-FORT-1: Semaphore prevents threadpool starvation under concurrent load
-    acquired = _HEAVY_ENDPOINT_SEMAPHORE.acquire(timeout=HEAVY_ENDPOINT_TIMEOUT_S)
-    if not acquired:
-        raise HTTPException(
-            status_code=503,
-            detail="Server under heavy load — try again in a few seconds",
-            headers={"Retry-After": "3"},
-        )
+    acquired = False
+    if not is_hook_additional_context:
+        acquired = _HEAVY_ENDPOINT_SEMAPHORE.acquire(timeout=HEAVY_ENDPOINT_TIMEOUT_S)
+        if not acquired:
+            raise HTTPException(
+                status_code=503,
+                detail="Server under heavy load — try again in a few seconds",
+                headers={"Retry-After": "3"},
+            )
     binding = None
     try:
         request.transport_mode = x_pith_transport
@@ -4755,6 +7337,8 @@ def conversation_turn_endpoint(
                     "error": "invalid_session_id",
                     "message": str(e),
                     "session_id": getattr(e, "session_id", None),
+                    "reason": getattr(e, "reason", "invalid_session_id"),
+                    "session_status": getattr(e, "session_status", None),
                 },
             ) from e
         logger.error(f"conversation_turn error: {e}")
@@ -4765,7 +7349,8 @@ def conversation_turn_endpoint(
                 binding["session_token"],
                 binding["active_token"],
             )
-        _HEAVY_ENDPOINT_SEMAPHORE.release()
+        if acquired:
+            _HEAVY_ENDPOINT_SEMAPHORE.release()
 
 
 def _get_session_learn_executor() -> concurrent.futures.ThreadPoolExecutor:
@@ -4854,6 +7439,17 @@ def _session_learn_processing_payload(request_id: str, *, processing_time_ms: fl
         retry_after_seconds=_SESSION_LEARN_PROCESSING_RETRY_AFTER_SECONDS,
     )
     return response.model_dump()
+
+
+def _should_commit_structured_session_learn_fast_path(request: SessionLearnRequest) -> bool:
+    """Structured client concepts are authoritative enough to persist immediately."""
+    return bool(getattr(request, "extracted_concepts", None))
+
+
+def _prepare_structured_session_learn_fast_path(request: SessionLearnRequest) -> None:
+    request.replay_fast_path = True
+    if not request.trigger_path or request.trigger_path == "unknown":
+        request.trigger_path = "session_learn_structured_fast_path"
 
 
 def _enqueue_session_learn_lifecycle_job(request: SessionLearnRequest, request_id: str) -> dict:
@@ -4966,18 +7562,44 @@ def _build_unavailable_health_metric(reason: str) -> dict:
 
 
 def _build_deferred_session_learn_queue_health(reason: str) -> dict:
-    return {
-        **_build_unavailable_health_metric(reason),
-        "stale_threshold_seconds": int(_cfg.WRITE_STALE_MINUTES * 60),
-        "processing_count": None,
-        "stale_processing_count": None,
-        "recoverable_stale_count": None,
-        "unrecoverable_stale_count": None,
-        "oldest_processing_age_seconds": None,
-        "oldest_stale_age_seconds": None,
-        "oldest_stale_request_id": None,
-        "max_attempts_exhausted_count": None,
-    }
+    try:
+        payload = _build_session_learn_queue_health()
+        payload.update({"deferred": True, "reason": reason})
+        return payload
+    except Exception:
+        return {
+            **_build_unavailable_health_metric(reason),
+            "stale_threshold_seconds": int(_cfg.WRITE_STALE_MINUTES * 60),
+            "processing_count": None,
+            "stale_processing_count": None,
+            "recoverable_stale_count": None,
+            "unrecoverable_stale_count": None,
+            "oldest_processing_age_seconds": None,
+            "oldest_stale_age_seconds": None,
+            "oldest_stale_request_id": None,
+            "max_attempts_exhausted_count": None,
+        }
+
+
+def _build_deferred_lifecycle_jobs_health(reason: str, *, pressure_state: Any | None = None) -> dict:
+    try:
+        payload = _build_lifecycle_jobs_health()
+        payload.update(
+            {
+                "deferred": True,
+                "reason": reason,
+                "pressure_level": _pressure_state_level(pressure_state),
+            }
+        )
+        return payload
+    except Exception:
+        return {
+            **_deferred_health_metric(reason, pressure_state=pressure_state),
+            "queued_count": None,
+            "oldest_queued_age_seconds": None,
+            "stale_running_count": None,
+            "last_committed_age_seconds": None,
+        }
 
 
 def _build_lifecycle_jobs_health() -> dict:
@@ -4997,10 +7619,16 @@ def _build_lifecycle_jobs_health() -> dict:
             source="session_learn",
             stale_before_iso=stale_cutoff,
         )
+        reflection_summary = summarize_lifecycle_jobs_by_source(
+            profile=get_active_profile(),
+            source="reflection_full",
+            stale_before_iso=stale_cutoff,
+        )
         queued_count = int(summary["queued_count"]) + int(summary["retry_count"])
         stale_running_count = int(summary["stale_running_count"])
         oldest_queued_age = _iso_age_seconds(summary.get("oldest_queued_updated_at"))
         oldest_running_age = _iso_age_seconds(summary.get("oldest_running_updated_at"))
+        last_committed_age = _iso_age_seconds(summary.get("last_committed_updated_at"))
         if queued_count > 50 or (oldest_queued_age or 0) > 600 or stale_running_count > 0:
             status = "critical"
         elif queued_count > 10 or (oldest_queued_age or 0) > 120:
@@ -5020,6 +7648,12 @@ def _build_lifecycle_jobs_health() -> dict:
             "stale_running_count": stale_running_count,
             "oldest_queued_age_seconds": oldest_queued_age,
             "oldest_running_age_seconds": oldest_running_age,
+            "last_committed_age_seconds": last_committed_age,
+            "supervisor_enabled": bool(_cfg.LIFECYCLE_SUPERVISOR_ENABLED),
+            "supervisor_state": getattr(app.state, "lifecycle_supervisor_state", "unknown"),
+            "supervisor_interval_seconds": float(_cfg.LIFECYCLE_SUPERVISOR_INTERVAL_SECONDS),
+            "supervisor_batch_size": int(_cfg.LIFECYCLE_SUPERVISOR_BATCH_SIZE),
+            "supervisor_starvation_seconds": float(_cfg.LIFECYCLE_SUPERVISOR_STARVATION_SECONDS),
             "warning_queued_count": 10,
             "critical_queued_count": 50,
             "warning_oldest_queued_age_seconds": 120,
@@ -5040,6 +7674,28 @@ def _build_lifecycle_jobs_health() -> dict:
                     "oldest_running_age_seconds": _iso_age_seconds(
                         session_learn_summary.get("oldest_running_updated_at")
                     ),
+                    "last_committed_age_seconds": _iso_age_seconds(
+                        session_learn_summary.get("last_committed_updated_at")
+                    ),
+                },
+                "reflection_full": {
+                    "enabled": bool(_cfg.REFLECTION_DURABLE_JOBS_ENABLED),
+                    "queued_count": int(reflection_summary["queued_count"]),
+                    "running_count": int(reflection_summary["running_count"]),
+                    "retry_count": int(reflection_summary["retry_count"]),
+                    "failed_count": int(reflection_summary["failed_count"]),
+                    "committed_count": int(reflection_summary["committed_count"]),
+                    "skipped_count": int(reflection_summary["skipped_count"]),
+                    "stale_running_count": int(reflection_summary["stale_running_count"]),
+                    "oldest_queued_age_seconds": _iso_age_seconds(
+                        reflection_summary.get("oldest_queued_updated_at")
+                    ),
+                    "oldest_running_age_seconds": _iso_age_seconds(
+                        reflection_summary.get("oldest_running_updated_at")
+                    ),
+                    "last_committed_age_seconds": _iso_age_seconds(
+                        reflection_summary.get("last_committed_updated_at")
+                    ),
                 }
             },
         }
@@ -5048,6 +7704,63 @@ def _build_lifecycle_jobs_health() -> dict:
             "status": "unknown",
             "alert": True,
             "reason": "lifecycle_jobs_health_failed",
+            "error": _safe_error(exc),
+        }
+
+
+def _build_autolearn_maintenance_health(defer_reason: str | None = None) -> dict[str, Any]:
+    """Summarize autonomous autolearn enrichment liveness."""
+    try:
+        from app.session.autolearn_maintenance import get_autolearn_maintenance_supervisor_status
+
+        supervisor = get_autolearn_maintenance_supervisor_status()
+        supervisor_state = getattr(app.state, "autolearn_maintenance_supervisor_state", "unknown")
+        enabled = bool(
+            _cfg.get_autolearn_maintenance_enabled()
+            and _cfg.get_autolearn_maintenance_supervisor_enabled()
+            and os.environ.get("PITH_BENCHMARK_READONLY", "").lower() not in ("1", "true")
+        )
+        last_status = str(supervisor.get("last_status") or "unknown")
+        if last_status == "error" or (enabled and not bool(supervisor.get("thread_alive"))):
+            status = "degraded"
+            alert = True
+        elif last_status == "skipped_required_context_cache":
+            status = "warning"
+            alert = False
+        else:
+            status = "ok"
+            alert = False
+        payload: dict[str, Any] = {
+            "status": status,
+            "alert": alert,
+            "enabled": enabled,
+            "supervisor_state": supervisor_state,
+            "thread_alive": bool(supervisor.get("thread_alive")),
+            "stop_requested": bool(supervisor.get("stop_requested")),
+            "last_status": last_status,
+            "last_started_at": supervisor.get("last_started_at"),
+            "last_completed_at": supervisor.get("last_completed_at"),
+            "last_processed": int(supervisor.get("last_processed") or 0),
+            "last_error": supervisor.get("last_error"),
+            "last_reason": supervisor.get("last_reason"),
+            "interval_seconds": _cfg.get_autolearn_maintenance_supervisor_interval_seconds(),
+            "batch_size": _cfg.get_autolearn_maintenance_supervisor_batch_size(),
+            "max_wall_seconds": _cfg.get_autolearn_maintenance_supervisor_max_wall_seconds(),
+        }
+        payload.update(
+            {
+                "deferred": True,
+                "defer_reason": defer_reason or "queue_metrics_monitor_owned",
+                "ready_total": None,
+                "oldest_ready_age_seconds": None,
+            }
+        )
+        return payload
+    except Exception as exc:
+        return {
+            "status": "unknown",
+            "alert": True,
+            "reason": "autolearn_maintenance_health_failed",
             "error": _safe_error(exc),
         }
 
@@ -5091,28 +7804,101 @@ def _build_required_context_cache_health() -> dict[str, Any]:
         }
 
 
-def _build_conversation_turn_latency_health() -> dict[str, Any]:
+def _build_conversation_turn_latency_health(pressure_state: Any | None = None) -> dict[str, Any]:
     """Summarize recent conversation_turn latency from metrics."""
     try:
         from app.ops.metrics import metrics
 
-        aggregate = metrics.query_aggregate("conversation_turn_latency_ms")
+        if os.environ.get("PITH_CONVERSATION_LATENCY_HEALTH_V2", "1").lower() in ("0", "false", "off"):
+            aggregate = metrics.query_aggregate("conversation_turn_latency_ms")
+        else:
+            aggregate = metrics.query_aggregate_with_recency("conversation_turn_latency_ms")
         p95_ms = float(aggregate.get("p95", 0.0) or 0.0)
         max_ms = float(aggregate.get("max", 0.0) or 0.0)
+        count = int(aggregate.get("count", 0) or 0)
         if max_ms > 15000.0:
-            status = "critical"
+            raw_status = "critical"
         elif p95_ms > 3500.0:
+            raw_status = "degraded"
+        else:
+            raw_status = "ok"
+
+        if os.environ.get("PITH_CONVERSATION_LATENCY_HEALTH_V2", "1").lower() in ("0", "false", "off"):
+            status = raw_status
+            return {
+                "status": status,
+                "alert": status in {"critical", "degraded"},
+                "p95_ms": p95_ms,
+                "max_ms": max_ms,
+                "count": count,
+                "threshold_p95_ms": 3500.0,
+                "threshold_critical_max_ms": 15000.0,
+            }
+
+        pressure_payload = pressure_state.to_dict() if hasattr(pressure_state, "to_dict") else (
+            pressure_state if isinstance(pressure_state, dict) else {}
+        )
+        active_contention = bool(pressure_payload.get("active_contention"))
+        reason_codes = list(pressure_payload.get("reason_codes") or [])
+        if active_contention:
+            reason_codes.append("active_contention")
+        if pressure_payload.get("in_process_reflection"):
+            reason_codes.append("in_process_reflection_active")
+        if pressure_payload.get("external_maintenance"):
+            reason_codes.append("external_maintenance_active")
+        if pressure_payload.get("stale_external_maintenance"):
+            reason_codes.append("external_maintenance_stale")
+        if count < 20:
+            reason_codes.append("low_sample_confidence")
+        if p95_ms > 3500.0:
+            reason_codes.append("p95_above_degraded_threshold")
+        if max_ms > 15000.0:
+            reason_codes.append("max_above_critical_threshold")
+
+        max_age_seconds = aggregate.get("max_age_seconds")
+        fresh_window_seconds = _env_float("PITH_CONVERSATION_LATENCY_HEALTH_FRESH_WINDOW_SECONDS", 600.0)
+        recent_outlier_status = "none"
+        if max_ms > 15000.0:
+            if max_age_seconds is None or float(max_age_seconds) <= fresh_window_seconds:
+                recent_outlier_status = "critical"
+                reason_codes.append("fresh_critical_outlier")
+            else:
+                recent_outlier_status = "aged_critical_outlier"
+                reason_codes.append("aged_critical_outlier")
+
+        steady_state_status = "degraded" if p95_ms > 3500.0 else "ok"
+        if recent_outlier_status == "critical" or raw_status == "critical" and active_contention:
+            status = "critical"
+        elif steady_state_status == "degraded":
             status = "degraded"
         else:
             status = "ok"
+        aged_outlier_diagnostic_only = recent_outlier_status == "aged_critical_outlier" and status == "ok"
+        recovery_state = "recovered" if aged_outlier_diagnostic_only else (
+            "active" if status in {"critical", "degraded"} else "ok"
+        )
+
+        deduped_reasons = list(dict.fromkeys(str(code) for code in reason_codes))
         return {
             "status": status,
             "alert": status in {"critical", "degraded"},
             "p95_ms": p95_ms,
             "max_ms": max_ms,
-            "count": int(aggregate.get("count", 0) or 0),
+            "count": count,
             "threshold_p95_ms": 3500.0,
             "threshold_critical_max_ms": 15000.0,
+            "raw_status": raw_status,
+            "steady_state_status": steady_state_status,
+            "recent_outlier_status": recent_outlier_status,
+            "fresh_window_seconds": fresh_window_seconds,
+            "aged_outlier_diagnostic_only": aged_outlier_diagnostic_only,
+            "recovery_state": recovery_state,
+            "active_contention": active_contention,
+            "sample_confidence": "low" if count < 20 else "normal",
+            "max_age_seconds": max_age_seconds,
+            "reason_codes": deduped_reasons,
+            "pressure_state": pressure_payload,
+            "window_seconds": int(aggregate.get("window_seconds", 3600) or 3600),
         }
     except Exception as exc:
         return {
@@ -5156,7 +7942,11 @@ def _record_write_replay_metric(metric: str, endpoint: str, labels: dict | None 
 
 
 def _run_session_learn_replay_payload(payload: dict) -> object:
-    request = SessionLearnRequest(**payload)
+    replay_payload = dict(payload)
+    if replay_payload.get("extracted_concepts") or replay_payload.get("extracted_concepts_json"):
+        replay_payload["replay_fast_path"] = True
+        replay_payload["trigger_path"] = replay_payload.get("trigger_path") or "session_learn_replay"
+    request = SessionLearnRequest(**replay_payload)
     return _with_db_retry(lambda: session_manager.session_learn(request))
 
 
@@ -5170,6 +7960,29 @@ def _load_committed_session_learn_replay(request_id: str) -> dict | None:
     payload.setdefault("request_id", request_id)
     payload.setdefault("persistence_state", "committed")
     return payload
+
+
+def _lifecycle_job_blocks_session_learn_replay(lifecycle_job: dict | None, now_dt) -> tuple[bool, str]:
+    if not lifecycle_job:
+        return False, "absent"
+    status = lifecycle_job.get("status")
+    if status not in {"queued", "running", "retry"}:
+        return False, str(status or "inactive")
+    if status != "running":
+        return True, str(status)
+
+    try:
+        lease_expires_at = lifecycle_job.get("lease_expires_at")
+        if lease_expires_at and _ensure_aware(datetime.fromisoformat(str(lease_expires_at))) <= now_dt:
+            return False, "expired_running_lease"
+        updated_at = lifecycle_job.get("updated_at")
+        if not lease_expires_at and updated_at:
+            updated = _ensure_aware(datetime.fromisoformat(str(updated_at)))
+            if (now_dt - updated).total_seconds() >= _cfg.LIFECYCLE_JOB_LEASE_SECONDS:
+                return False, "stale_running_without_lease"
+    except Exception:
+        return True, "running_unparseable_lease"
+    return True, "running_active_lease"
 
 
 def _run_session_learn_lifecycle_job(job: dict) -> dict:
@@ -5310,10 +8123,26 @@ def _run_write_replay_reclaimer(endpoint: str, reason: str, batch_size: int | No
                 source="session_learn",
                 idempotency_key=request_id,
             )
-            if lifecycle_job and lifecycle_job.get("status") in {"queued", "running", "retry"}:
+            blocks_replay, block_reason = _lifecycle_job_blocks_session_learn_replay(lifecycle_job, now_dt)
+            if blocks_replay:
                 _record_session_learn_contract_metric("session_learn_reclaimer_skipped_active_lifecycle")
+                _record_write_replay_metric(
+                    "write_request_reclaimer_skipped_active_lifecycle",
+                    endpoint,
+                    {
+                        "lifecycle_status": str(lifecycle_job.get("status") if lifecycle_job else "absent"),
+                        "reason": block_reason,
+                    },
+                )
                 result["skipped_active_lifecycle"] += 1
                 continue
+            if lifecycle_job and lifecycle_job.get("status") == "running":
+                _record_session_learn_contract_metric("session_learn_reclaimer_unpinned_expired_lifecycle")
+                _record_write_replay_metric(
+                    "write_request_reclaimer_unpinned_expired_lifecycle",
+                    endpoint,
+                    {"reason": block_reason},
+                )
         try:
             request_payload = dict(row["request"])
             request_payload.setdefault("request_id", request_id)
@@ -5447,21 +8276,9 @@ def session_learn_endpoint(request: SessionLearnRequest):
         _record_session_learn_initial_response_latency(start, "replay")
         return replay_state.replay
 
-    if _SESSION_LEARN_LIFECYCLE_JOBS_ENABLED:
-        try:
-            _enqueue_session_learn_lifecycle_job(request, request_id)
-        except Exception as e:
-            abandon_write_request("session_learn", request_id, error_class=type(e).__name__)
-            _record_session_learn_initial_response_latency(start, "error")
-            logger.error("session_learn lifecycle enqueue error: %s", e, exc_info=True)
-            raise HTTPException(status_code=500, detail=_safe_error(e))
-        _record_session_learn_contract_metric("session_learn_lifecycle_deferred")
-        _record_session_learn_lifecycle_latency("session_learn_lifecycle_ack_latency_ms", start)
-        _record_session_learn_initial_response_latency(start, "lifecycle_processing")
-        return _session_learn_processing_payload(
-            request_id,
-            processing_time_ms=(time.perf_counter() - start) * 1000,
-        )
+    structured_fast_path = _should_commit_structured_session_learn_fast_path(request)
+    if structured_fast_path:
+        _prepare_structured_session_learn_fast_path(request)
 
     def _do_session_learn():
         binding = None
@@ -5476,6 +8293,22 @@ def session_learn_endpoint(request: SessionLearnRequest):
                     binding["session_token"],
                     binding["active_token"],
                 )
+
+    if _SESSION_LEARN_LIFECYCLE_JOBS_ENABLED and not structured_fast_path:
+        try:
+            _enqueue_session_learn_lifecycle_job(request, request_id)
+        except Exception as e:
+            abandon_write_request("session_learn", request_id, error_class=type(e).__name__)
+            _record_session_learn_initial_response_latency(start, "error")
+            logger.error("session_learn lifecycle enqueue error: %s", e, exc_info=True)
+            raise HTTPException(status_code=500, detail=_safe_error(e))
+        _record_session_learn_contract_metric("session_learn_lifecycle_deferred")
+        _record_session_learn_lifecycle_latency("session_learn_lifecycle_ack_latency_ms", start)
+        _record_session_learn_initial_response_latency(start, "lifecycle_processing")
+        return _session_learn_processing_payload(
+            request_id,
+            processing_time_ms=(time.perf_counter() - start) * 1000,
+        )
 
     future = _get_session_learn_executor().submit(_do_session_learn)
     try:
@@ -5502,6 +8335,18 @@ def session_learn_endpoint(request: SessionLearnRequest):
 def sessions_list_endpoint(status: str = None, limit: int = 20, since: str = None):
     """Query session history. Optional filters: status, limit, since (ISO datetime)."""
     return list_sessions(status=status, limit=limit, since=since)
+
+
+@app.post("/write_request_status", dependencies=[Depends(verify_api_key)])
+def write_request_status_endpoint(body: dict):
+    """Redacted idempotent write-request status for lifecycle conformance."""
+    try:
+        return get_write_request_status(
+            str(body.get("endpoint") or ""),
+            body.get("request_id"),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def _record_checkpoint_save_telemetry(body: dict) -> None:
@@ -5644,6 +8489,8 @@ _WORKSTREAM_ACTIVATION_CREATE_METADATA_FIELDS = (
     "goal_ids",
     "knowledge_areas",
     "agent_id",
+    "lane_id",
+    "external_refs",
     "current_objective",
     "current_summary",
     "next_action",
@@ -5658,6 +8505,171 @@ def _workstream_activation_metadata_from_body(body: dict) -> object:
     if metadata is not None:
         return metadata
     return {key: body[key] for key in _WORKSTREAM_ACTIVATION_CREATE_METADATA_FIELDS if key in body}
+
+
+_WORKSTREAM_LIFECYCLE_TOP_LEVEL_METADATA_FIELDS = (
+    "title",
+    "description",
+    "urgency",
+    "goal_ids",
+    "knowledge_areas",
+    "agent_id",
+    "lane_id",
+    "external_refs",
+    "current_objective",
+    "current_summary",
+    "next_action",
+    "blockers",
+    "quality_state",
+    "created_by",
+    "parent_workstream_id",
+    "parent_title",
+    "relationship",
+)
+
+
+def _workstream_lifecycle_metadata_from_body(body: dict) -> object:
+    top_level = {
+        key: body[key]
+        for key in _WORKSTREAM_LIFECYCLE_TOP_LEVEL_METADATA_FIELDS
+        if key in body
+    }
+    metadata = body.get("metadata")
+    if metadata is None:
+        return top_level or None
+    if not isinstance(metadata, dict):
+        return metadata
+    return {**top_level, **metadata}
+
+
+_WORKSTREAM_RAW_ADMIN_ACTIONS = {
+    "create_workstream",
+    "promote_workstream",
+    "update_workstream",
+    "bind_workstream",
+    "clear_workstream_binding",
+    "workstream_promote_discovery_candidate",
+    "workstream_demote_discovery_candidate",
+}
+_WORKSTREAM_HYGIENE_WRITE_ACTIONS = {
+    "workstream_hygiene_apply",
+    "workstream_hygiene_rollback",
+}
+_WORKSTREAM_RAW_LIFECYCLE_VERBS = {
+    "create_workstream": "start",
+    "bind_workstream": "adopt",
+    "update_workstream": "progress",
+}
+
+
+def _workstreams_capability_contract() -> dict:
+    from app.core.config import get_feature_flag
+
+    return {
+        "consumer_write_mode": "lifecycle",
+        "lifecycle_writes_enabled": bool(get_feature_flag("WORKSTREAMS_LIFECYCLE_WRITE_ENABLED", False)),
+        "activation_writes_enabled": bool(get_feature_flag("WORKSTREAMS_ACTIVATION_WRITE_ENABLED", False)),
+        "hygiene_writes_enabled": bool(get_feature_flag("WORKSTREAMS_HYGIENE_WRITE_ENABLED", True)),
+        "admin_raw_writes_enabled": bool(get_feature_flag("WORKSTREAMS_WRITE_ENABLED", False)),
+        "default_write_action": "workstream_lifecycle",
+        "default_lifecycle_verbs": ["start", "adopt", "progress", "complete", "reopen", "archive"],
+        "admin_raw_write_flag": "WORKSTREAMS_WRITE_ENABLED",
+    }
+
+
+def _raw_workstream_admin_write_disabled(action: str, body: dict) -> dict:
+    response = {
+        "status": "disabled",
+        "reason": "raw_workstream_admin_write_disabled",
+        "action": action,
+        "required_action": "use_workstream_lifecycle",
+        "recommended_action": "workstream_lifecycle",
+        "write_mode": "lifecycle_enabled_admin_raw_disabled",
+        "admin_raw_writes_enabled": False,
+    }
+    recommended_verb = _WORKSTREAM_RAW_LIFECYCLE_VERBS.get(action)
+    if action == "clear_workstream_binding":
+        metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
+        raw_status = str(body.get("status") or metadata.get("status") or "").strip().lower()
+        if raw_status in {"complete", "completed"}:
+            recommended_verb = "complete"
+        else:
+            response["needs_operator_decision"] = True
+            response["decision_reason"] = "clear_workstream_binding is ambiguous without completion intent"
+    if recommended_verb:
+        response["recommended_verb"] = recommended_verb
+    elif action not in {"clear_workstream_binding"}:
+        response["required_action"] = "admin_raw_write_or_lifecycle_design"
+        response["recommended_action"] = None
+        response["write_mode"] = "admin_raw_write_only"
+    return response
+
+
+def _record_raw_workstream_admin_rejection(action: str, response: dict) -> None:
+    try:
+        from app.features.threads import _record_workstream_metric
+
+        _record_workstream_metric(
+            "workstream_raw_admin_write_rejected",
+            {
+                "action": action,
+                "reason": response.get("reason", ""),
+                "required_action": response.get("required_action", ""),
+                "recommended_action": response.get("recommended_action", ""),
+                "recommended_verb": response.get("recommended_verb", ""),
+            },
+        )
+    except Exception:
+        pass
+
+
+def _build_workstreams_metrics_health(defer_reason: str | None = None) -> dict:
+    if defer_reason:
+        return _build_unavailable_health_metric(defer_reason)
+    try:
+        from datetime import timedelta
+
+        from app.core.datetime_utils import _utc_now
+        from app.ops.metrics import metrics
+
+        since = (_utc_now() - timedelta(hours=1)).isoformat()
+        metric_names = [
+            "workstream_lifecycle_request",
+            "workstream_lifecycle_transition",
+            "workstream_lifecycle_idempotency",
+            "workstream_raw_admin_write_rejected",
+        ]
+        totals: dict[str, int] = {}
+        recent: list[dict] = []
+        rejected_total = 0
+        accepted_total = 0
+        for metric_name in metric_names:
+            rows = metrics.query(metric_name, since=since, limit=100)
+            totals[metric_name] = len(rows)
+            for row in rows[:5]:
+                labels = row.get("labels") if isinstance(row.get("labels"), dict) else {}
+                if labels.get("status") == "rejected" or metric_name == "workstream_raw_admin_write_rejected":
+                    rejected_total += 1
+                if labels.get("status") == "accepted":
+                    accepted_total += 1
+                recent.append(
+                    {
+                        "timestamp": row.get("timestamp"),
+                        "metric": metric_name,
+                        "labels": labels,
+                    }
+                )
+        recent.sort(key=lambda item: str(item.get("timestamp") or ""), reverse=True)
+        return {
+            "status": "ok",
+            "window_seconds": 3600,
+            "totals": totals,
+            "accepted_lifecycle_requests": accepted_total,
+            "rejected_events": rejected_total,
+            "recent": recent[:10],
+        }
+    except Exception as exc:
+        return {"status": "degraded", "reason": _safe_error(exc), "alert": False}
 
 
 @app.post("/pith_threads", dependencies=[Depends(verify_api_key)])
@@ -5689,6 +8701,7 @@ def pith_threads_endpoint(body: dict):
         unlink_concept_from_thread,
         update_thread_status,
         update_workstream_metadata,
+        workstream_lifecycle,
     )
 
     action = body.get("action", "list")
@@ -5711,18 +8724,24 @@ def pith_threads_endpoint(body: dict):
             activation_write_enabled = get_feature_flag("WORKSTREAMS_ACTIVATION_WRITE_ENABLED", False)
             if not (broad_write_enabled or activation_write_enabled):
                 return {"status": "disabled", "reason": "WORKSTREAMS_ACTIVATION_WRITE_ENABLED is false"}
-    if action in (
-        "create_workstream",
-        "promote_workstream",
-        "update_workstream",
-        "bind_workstream",
-        "clear_workstream_binding",
-        "workstream_hygiene_apply",
-        "workstream_hygiene_rollback",
-        "workstream_promote_discovery_candidate",
-        "workstream_demote_discovery_candidate",
-    ) and not get_feature_flag("WORKSTREAMS_WRITE_ENABLED", False):
-        return {"status": "disabled", "reason": "WORKSTREAMS_WRITE_ENABLED is false"}
+    if action == "workstream_lifecycle":
+        broad_write_enabled = get_feature_flag("WORKSTREAMS_WRITE_ENABLED", False)
+        lifecycle_write_enabled = get_feature_flag("WORKSTREAMS_LIFECYCLE_WRITE_ENABLED", False)
+        if not (broad_write_enabled or lifecycle_write_enabled):
+            return {"status": "disabled", "reason": "WORKSTREAMS_LIFECYCLE_WRITE_ENABLED is false"}
+    if action in _WORKSTREAM_HYGIENE_WRITE_ACTIONS:
+        broad_write_enabled = get_feature_flag("WORKSTREAMS_WRITE_ENABLED", False)
+        hygiene_write_enabled = get_feature_flag("WORKSTREAMS_HYGIENE_WRITE_ENABLED", True)
+        if not (broad_write_enabled or hygiene_write_enabled):
+            return {
+                "status": "disabled",
+                "reason": "WORKSTREAMS_HYGIENE_WRITE_ENABLED is false",
+                "required_action": "rerun_hygiene_dry_run_and_operator_confirm",
+            }
+    if action in _WORKSTREAM_RAW_ADMIN_ACTIONS and not get_feature_flag("WORKSTREAMS_WRITE_ENABLED", False):
+        disabled = _raw_workstream_admin_write_disabled(action, body)
+        _record_raw_workstream_admin_rejection(action, disabled)
+        return disabled
 
     if action == "create":
         if not body.get("title"):
@@ -5855,6 +8874,7 @@ def pith_threads_endpoint(body: dict):
             fingerprints=body.get("fingerprints") or {},
             proposed_states=body.get("proposed_states") or {},
             operator_confirmed=body.get("operator_confirmed", False),
+            agent_id=body.get("agent_id", "default"),
         )
 
     elif action == "workstream_hygiene_rollback":
@@ -5984,6 +9004,20 @@ def pith_threads_endpoint(body: dict):
             )
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
+
+    elif action == "workstream_lifecycle":
+        return workstream_lifecycle(
+            verb=body.get("verb", ""),
+            origin_id=body.get("origin_id"),
+            session_id=body.get("session_id"),
+            current_task_id=body.get("current_task_id"),
+            thread_id=body.get("thread_id"),
+            metadata=_workstream_lifecycle_metadata_from_body(body),
+            operator_confirmed=body.get("operator_confirmed", False),
+            request_id=body.get("request_id"),
+            op_id=body.get("op_id"),
+            payload_hash=body.get("payload_hash"),
+        )
 
     elif action == "active_workstream":
         try:
@@ -7096,6 +10130,30 @@ async def metrics_session_activity(days: int = 7):
     except Exception as e:
         logger.error(f"session_activity error: {e}")
         return {"status": "error", "error": _safe_error(e)}
+
+
+@app.get("/diagnostics/surface_activity", dependencies=[Depends(verify_api_key)])
+async def diagnostics_surface_activity(
+    since: str | None = None,
+    until: str | None = None,
+    include_codex_local: bool = False,
+    requested_surfaces: str | None = None,
+    include_concept_samples: bool = False,
+    min_confidence: float | None = None,
+    max_samples_per_surface: int | None = None,
+):
+    """Source-labeled lifecycle and optional surface memory coverage diagnostic."""
+    from app.diagnostics.surface_activity import build_surface_activity_diagnostic
+
+    return build_surface_activity_diagnostic(
+        since=since,
+        until=until,
+        include_codex_local=include_codex_local,
+        requested_surfaces=requested_surfaces,
+        include_concept_samples=include_concept_samples,
+        min_confidence=min_confidence,
+        max_samples_per_surface=max_samples_per_surface,
+    )
 
 
 @app.get("/metrics/graduation_stats", dependencies=[Depends(verify_api_key)])

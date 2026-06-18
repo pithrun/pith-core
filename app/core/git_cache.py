@@ -12,6 +12,8 @@ import subprocess
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
+from app.core.fork_safety import should_suppress_optional_subprocess
+
 logger = logging.getLogger(__name__)
 
 # Default to pith-beta repo path
@@ -32,6 +34,11 @@ class GitCache:
     def populate(self, lookback_commits: int = 20) -> None:
         """Cache git state. Safe to call multiple times (idempotent)."""
         if self._populated:
+            return
+        if should_suppress_optional_subprocess("git_cache_populate"):
+            self.populated_at = datetime.now(UTC).isoformat()
+            self._populated = True
+            logger.info("GitCache population suppressed by fork-safety guard")
             return
         try:
             # Current commit hash

@@ -31,6 +31,26 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from app.core.datetime_utils import _utc_now_iso
 
 ORIGIN_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+SURFACE_ID_VALUES = {
+    "claude_code",
+    "codex_local_api",
+    "claude_desktop_mcp",
+    "cursor_mcp",
+    "cline_mcp",
+    "local_api_cli",
+    "vscode_copilot_mcp",
+    "windsurf_mcp",
+    "unknown",
+}
+CONTEXT_DELIVERY_MODE_VALUES = {
+    "hook_additional_context",
+    "local_api_first_call",
+    "mcp_tool_call",
+    "extension_injection",
+    "instruction_only",
+    "unknown",
+}
 
 
 # --- CKPT-003: Checkpoint Field TTL Classification ---
@@ -350,6 +370,7 @@ class Concept(BaseModel):
 
     # --- Activation & Access ---
     last_accessed: str | None = None
+    last_decayed_at: str | None = None  # REFLECT-024: idempotent-decay watermark (SQL column authoritative; see list_concepts_full)
     last_organic_access: str | None = None
     access_count: int = 0
     reinforcement_count: int = 0  # DATA-017: Cumulative retrieval reinforcements
@@ -374,6 +395,7 @@ class Concept(BaseModel):
     session_id: str | None = None  # AGENT-004: Direct session linkage for federation
     conflicting_preferences: list[str] = []  # [N2] Preference conflict tracking
     provenance_migrated: bool = True  # [FIX F1] False for pre-4b concepts
+    provenance: str = "human"  # A8: authorship trust-tier — 'human' | 'agent_loop'; distinct from edit_provenance/provenance_migrated
 
     # --- Knowledge Domain ---
     knowledge_area: str = "general"  # Domain/topic area (e.g., 'architecture', 'debugging')
@@ -510,6 +532,9 @@ class SearchQuery(BaseModel):
     goal: str | None = None
     max_results: int = 5
     min_confidence: float = 0.0
+    since: str | None = None
+    until: str | None = None
+    time_field: str = Field(default="created_at", pattern="^(created_at|valid_from|original_date|content_updated_at)$")
     # Federation Phase 0, Component 0.3: KA-aware query routing
     ka_boost: list[str] | None = None
     ka_boost_weight: float = Field(default=0.2, ge=0.0, le=0.5)  # DEBT-197: constrain [0,0.5]
@@ -547,7 +572,9 @@ class ReflectionSummary(BaseModel):
     concepts_consolidated: int
     concepts_decayed: int
     concepts_recalibrated: int = 0  # Overconfidence correction count
-    concepts_archived: int = 0  # Forgetting mechanism output
+    concepts_archived: int = 0  # Forgetting mechanism output (forgotten concepts)
+    forgetting_candidates: int = 0  # REFLECT-025: forgetting-eligible candidate count (early-warning gauge; observability only)
+    concepts_gc_archived: int = 0  # REFLECT-025: low-confidence GC archival count (previously dropped from the summary)
     associations_updated: int
     questions_generated: int
     timestamp: str
@@ -572,6 +599,10 @@ class ReflectionSummary(BaseModel):
     abort_reason: str | None = None
     last_completed_step: str | None = None
     abort_stage: str | None = None
+    budget_status: str = "completed"  # completed|deferred|aborted
+    deferred_phases: list[str] = []
+    phase_budget_decisions: dict[str, dict[str, Any]] = {}
+    merge_progress: dict[str, Any] = {}
 
 
 class PithStats(BaseModel):
@@ -1055,6 +1086,7 @@ class SessionInfo(BaseModel):
     agent_id: str = "default"  # AGENT-001: Multi-agent scoping
     model_id: str = "unknown"  # FEDERATION L1.5: model provenance
     platform_hint: str = "unknown"  # SESSION-012 v0.3: caller provenance
+    surface_id: str = "unknown"  # Consumer lifecycle surface identifier
     origin_id: str | None = None  # SESSION-015: stable client/thread closeout binding
     # Auto-reflection state (T2 bookmarks)
     reflection_bookmarks: list[dict] = []  # Accumulated T2 bookmarks
@@ -1121,11 +1153,18 @@ class ConversationTurnRequest(BaseModel):
     model_id: str = "unknown"
     platform_hint: str = "unknown"  # SESSION-012 v0.3: client platform (cowork, claude-code, etc.)
     transport_mode: str | None = None  # SESSION-012 binding safety: route header plumbing
+    surface_id: str = "unknown"
+    workspace_id: str | None = None
+    context_delivery_mode: str = "unknown"
+    surface_lifecycle_version: str = "1.0"
     workspace_context: WorkspaceContext | None = None
     # SESSION-014: stable client/thread binding for checkpoint authority.
     origin_id: str | None = None
     current_task_id: str | None = None
     context_authority_mode: str = "balanced"
+    # RUNG0 Component C (A8): authorship trust-tier. Set by the MCP bridge from the
+    # PITH_PROVENANCE env var (per-origin), NOT an LLM-supplied argument. Default 'human'.
+    provenance: str = "human"
 
     @field_validator("model_id", mode="before")
     @classmethod
@@ -1135,6 +1174,57 @@ class ConversationTurnRequest(BaseModel):
         if isinstance(v, str):
             return v.strip()[:200]
         return "unknown"
+
+    @field_validator("surface_id", mode="before")
+    @classmethod
+    def validate_surface_id(cls, v):
+        if v is None or (isinstance(v, str) and not v.strip()):
+            return "unknown"
+        if not isinstance(v, str):
+            raise ValueError("surface_id must be a string")
+        value = v.strip().lower()[:100]
+        if CONTROL_CHARS_RE.search(value):
+            raise ValueError("surface_id must not contain control characters")
+        return value if value in SURFACE_ID_VALUES else "unknown"
+
+    @field_validator("context_delivery_mode", mode="before")
+    @classmethod
+    def validate_context_delivery_mode(cls, v):
+        if v is None or (isinstance(v, str) and not v.strip()):
+            return "unknown"
+        if not isinstance(v, str):
+            raise ValueError("context_delivery_mode must be a string")
+        value = v.strip().lower()[:100]
+        if CONTROL_CHARS_RE.search(value):
+            raise ValueError("context_delivery_mode must not contain control characters")
+        return value if value in CONTEXT_DELIVERY_MODE_VALUES else "unknown"
+
+    @field_validator("workspace_id", mode="before")
+    @classmethod
+    def validate_workspace_id(cls, v):
+        if v is None:
+            return None
+        if not isinstance(v, str):
+            raise ValueError("workspace_id must be a string")
+        value = v.strip()
+        if not value:
+            return None
+        value = value[:200]
+        if CONTROL_CHARS_RE.search(value):
+            raise ValueError("workspace_id must not contain control characters")
+        return value
+
+    @field_validator("surface_lifecycle_version", mode="before")
+    @classmethod
+    def validate_surface_lifecycle_version(cls, v):
+        if v is None or (isinstance(v, str) and not v.strip()):
+            return "1.0"
+        if not isinstance(v, str):
+            raise ValueError("surface_lifecycle_version must be a string")
+        value = v.strip()[:40]
+        if CONTROL_CHARS_RE.search(value):
+            raise ValueError("surface_lifecycle_version must not contain control characters")
+        return value or "1.0"
 
     @field_validator("origin_id", mode="before")
     @classmethod
@@ -1171,6 +1261,18 @@ class ConversationTurnRequest(BaseModel):
         if mode not in {"strict", "balanced", "permissive"}:
             raise ValueError("context_authority_mode must be strict, balanced, or permissive")
         return mode
+
+    @field_validator("provenance", mode="before")
+    @classmethod
+    def validate_provenance(cls, v):
+        # RUNG0 Component C (A8): fail-safe — any unknown/garbage value collapses to
+        # 'human' so malformed input can never create a new uncapped trust tier.
+        # Mirrors validate_concept_type. Value originates from the bridge env, not the LLM.
+        from app.core.constants import PROVENANCE_VALUES
+
+        if isinstance(v, str) and v in PROVENANCE_VALUES:
+            return v
+        return "human"
 
 
 class ActivatedConcept(BaseModel):
@@ -1301,6 +1403,9 @@ class ConversationTurnResponse(BaseModel):
     governance_summary: dict | None = None  # GOV: Governance pipeline telemetry (phases, latency, events)
     source_set_trace: dict | None = None  # RETRIEVAL-112: trace-only source-set completeness telemetry
     canary_retrieval_trace: dict | None = None  # RETRIEVAL-113: MH262 canary diagnostic-only retrieval trace
+    retrieval_policy_trace: dict | None = None  # Agentic retrieval policy Slice 0 observe-only trace
+    latency_components_ms: dict | None = None  # Retrieval Policy: replay-safe latency decomposition
+    locomo_candidate_boundary_trace: dict | None = None  # LoCoMo benchmark-only candidate-boundary diagnostics
     terminal_conflict_trace: dict | None = None  # MAB: trace-only same-key terminal conflict telemetry
     correction_signals: dict | None = None  # CCL §3c: Compounding correction loop results
     constraint_set: dict | None = None  # GOV-W2.5: Constraint set for this turn
@@ -1347,6 +1452,8 @@ class ConversationTurnResponse(BaseModel):
     active_workstream: dict | None = None
     # Workstreams API parity: compact read-only activation state hint, no context block.
     workstream_activation: dict | None = None
+    # INGEST-060 remediation: visible debt when prior-turn learning was skipped.
+    turn_ingestion_warning: dict | None = None
     # SAL V0: Structured activation summary (None when SAL disabled or fallback)
     structured_summary: dict | None = None
     # SAL V1: Formatted context string for LLM consumption (None when below threshold)
@@ -1376,10 +1483,15 @@ class SessionLearnRequest(BaseModel):
     agent_id: str = "default"
     # FEDERATION L1.5: Model provenance (forwarded from ConversationTurnRequest)
     model_id: str = "unknown"
+    # RUNG0 Component C (A8): authorship trust-tier, forwarded from ConversationTurnRequest.
+    provenance: str = "human"
     # RETRIEVAL-021: Activation-learning bridge — concept IDs activated during retrieval
     activated_concept_ids: list[str] | None = None
     # SESSION-LEARN-MISMATCH-001: Diagnostic — identifies dispatch origin
     trigger_path: str = "unknown"  # "auto_learn" | "direct_mcp" | "unknown"
+    # Replay workers must preserve authoritative client concepts without running
+    # broad enrichment inline on recovery/drain paths.
+    replay_fast_path: bool = False
 
     @model_validator(mode="before")
     @classmethod
@@ -1494,6 +1606,9 @@ class SessionLearnResponse(BaseModel):
     supersession_details: list[dict] = []  # S3.5: details of superseded concepts [{old_id, new_id, reason}]
     persistence_state: str = "committed"
     processing_state: str = "committed"
+    accepted_learning_events: int = 0
+    learning_capture_state: str = "zero_learning"  # accepted|zero_learning|rejected|error
+    session_linkage_state: str = "unbound"  # linked|mismatch|unbound
     request_id: str | None = None
     retry_after_seconds: float | None = None
 
@@ -1591,6 +1706,8 @@ class WorkstreamMetadata(BaseModel):
     """User-curated product metadata for an explicit Workstream."""
 
     kind: str = "workstream"
+    lane_id: str | None = None
+    external_refs: list[dict[str, str]] = Field(default_factory=list)
     current_objective: str = ""
     current_summary: str = ""
     next_action: str = ""
@@ -1602,6 +1719,11 @@ class WorkstreamMetadata(BaseModel):
     parent_title: str | None = None
     relationship: str | None = None  # child|related
     discovery_state: WorkstreamDiscoveryState | None = None
+    activation_origin_id: str | None = None
+    activation_session_id: str | None = None
+    activation_current_task_id: str | None = None
+    activation_binding_source: str | None = None
+    activation_bound_at: str | None = None
 
 
 class NarrativeThread(BaseModel):

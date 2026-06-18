@@ -39,6 +39,20 @@ def _create_index_columns_available(conn: sqlite3.Connection, sql: str) -> bool:
     }
     return requested.issubset(available)
 
+
+def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (table_name,),
+    ).fetchone()
+    return row is not None
+
+
+def _table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
+    if not _table_exists(conn, table_name):
+        return set()
+    return {row[1] for row in conn.execute(f"PRAGMA table_info({table_name})")}
+
 # Migration registry — each entry is (migration_id, description, sql_statements)
 # sql_statements is a list of (sql, description) tuples
 GOVERNANCE_MIGRATIONS = [
@@ -602,6 +616,31 @@ GOVERNANCE_MIGRATIONS = [
         ],
     ),
     (
+        "SURFACE-ATTRIBUTION-001",
+        "Add session surface_id and raw turn payload completeness",
+        [
+            (
+                "ALTER TABLE sessions ADD COLUMN surface_id TEXT NOT NULL DEFAULT 'unknown'",
+                "sessions.surface_id column for consumer lifecycle surface attribution",
+            ),
+            (
+                "ALTER TABLE raw_turn_payloads ADD COLUMN payload_completeness TEXT NOT NULL DEFAULT 'unknown'",
+                "raw_turn_payloads.payload_completeness column for raw exchange completeness",
+            ),
+            (
+                """UPDATE raw_turn_payloads
+                   SET payload_completeness = CASE
+                       WHEN COALESCE(message_len, 0) > 0 AND COALESCE(response_len, 0) > 0 THEN 'full_exchange'
+                       WHEN COALESCE(message_len, 0) > 0 AND COALESCE(response_len, 0) = 0 THEN 'user_only'
+                       WHEN COALESCE(message_len, 0) = 0 AND COALESCE(response_len, 0) > 0 THEN 'assistant_only'
+                       ELSE 'empty'
+                   END
+                   WHERE payload_completeness = 'unknown'""",
+                "backfill raw_turn_payloads.payload_completeness from stored payload lengths",
+            ),
+        ],
+    ),
+    (
         "GOV-020",
         "DATA-040: Clean up zombie concepts (superseded_at set but superseded_by NULL)",
         [
@@ -806,6 +845,26 @@ GOVERNANCE_MIGRATIONS = [
             ),
         ],
     ),
+    (
+        "GOV-026",
+        "Add last_decayed_at watermark column for idempotent delta-based decay (REFLECT-024)",
+        [
+            (
+                "ALTER TABLE concepts ADD COLUMN last_decayed_at TEXT DEFAULT NULL",
+                "timestamp of last decay application (idempotence watermark)",
+            ),
+        ],
+    ),
+    (
+        "GOV-027",
+        "Add provenance column to concepts (machine/agent authorship trust-tier; A8)",
+        [
+            (
+                "ALTER TABLE concepts ADD COLUMN provenance TEXT NOT NULL DEFAULT 'human'",
+                "provenance column (machine/agent authorship trust-tier)",
+            ),
+        ],
+    ),
 ]
 
 
@@ -917,6 +976,19 @@ def run_governance_migrations(conn: sqlite3.Connection) -> dict:
         migration_errors = []
         for sql, stmt_desc in statements:
             try:
+                if (
+                    migration_id == "SURFACE-ATTRIBUTION-001"
+                    and "raw_turn_payloads" in sql.lower()
+                    and not conn.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='raw_turn_payloads'"
+                    ).fetchone()
+                ):
+                    logger.info(
+                        "GOV migration %s skipped unavailable optional raw payload table: %s",
+                        migration_id,
+                        stmt_desc,
+                    )
+                    continue
                 if not _create_index_columns_available(conn, sql):
                     logger.info("GOV migration %s skipped unavailable optional index: %s", migration_id, stmt_desc)
                     continue
@@ -993,6 +1065,38 @@ def run_governance_migrations(conn: sqlite3.Connection) -> dict:
     if "RETRIEVAL-070" in applied:
         _backfill_fts_verbatim(conn)
 
+    subject_key_backfill_id = "EUNOMIA-040-F3-DATA-BACKFILL"
+    if not _is_migration_applied(conn, subject_key_backfill_id):
+        try:
+            updated = migrate_eunomia_040_subject_key_data_backfill(conn)
+            _record_migration(
+                conn,
+                subject_key_backfill_id,
+                "Backfill indexed concept subject_key column from existing concept data JSON",
+            )
+            conn.commit()
+            applied.append(subject_key_backfill_id)
+            logger.info("EUNOMIA-040: subject_key data backfill updated %d concept(s)", updated)
+        except Exception as e:
+            errors.append(f"{subject_key_backfill_id}: {e}")
+            logger.warning("EUNOMIA-040: subject_key data backfill failed: %s", e)
+
+    subject_key_requeue_id = "EUNOMIA-040-F3-REQUEUE-SKIPS"
+    if not _is_migration_applied(conn, subject_key_requeue_id):
+        try:
+            requeued = requeue_subject_key_supersession_skips(conn)
+            _record_migration(
+                conn,
+                subject_key_requeue_id,
+                "Requeue historical subject-key supersession rows unblocked by subject_key backfill",
+            )
+            conn.commit()
+            applied.append(subject_key_requeue_id)
+            logger.info("EUNOMIA-040: requeued %d subject_key supersession skipped row(s)", requeued)
+        except Exception as e:
+            errors.append(f"{subject_key_requeue_id}: {e}")
+            logger.warning("EUNOMIA-040: subject_key skip requeue failed: %s", e)
+
     # DATA-064: Fix FTS index parity issues
     try:
         backfilled, concepts_cleaned, verbatim_cleaned = migrate_fts_parity_data064(conn)
@@ -1012,7 +1116,7 @@ def run_governance_migrations(conn: sqlite3.Connection) -> dict:
 
 def migrate_fts_parity_data064(conn):
     """DATA-064: Fix FTS index parity issues.
-    
+
     1. Backfill fts_concepts for active concepts missing entries
     2. Remove orphaned fts_concepts entries for non-active concepts
     3. Remove orphaned fts_verbatim entries for non-active concepts
@@ -1022,7 +1126,7 @@ def migrate_fts_parity_data064(conn):
         return 0, 0, 0
 
     from app.storage import _sync_fts5
-    
+
     # Phase 1: Backfill missing fts_concepts entries
     missing = conn.execute("""
         SELECT c.id, c.summary FROM concepts c
@@ -1033,7 +1137,7 @@ def migrate_fts_parity_data064(conn):
     for cid, summary in missing:
         _sync_fts5(conn, cid, summary)
     backfilled = len(missing)
-    
+
     # Phase 2: Remove orphaned fts_concepts (superseded/retired/deleted concepts)
     orphan_result = conn.execute("""
         DELETE FROM fts_concepts WHERE concept_id NOT IN (
@@ -1041,7 +1145,7 @@ def migrate_fts_parity_data064(conn):
         )
     """)
     concepts_cleaned = orphan_result.rowcount
-    
+
     # Phase 3: Remove orphaned fts_verbatim (superseded/retired/deleted concepts)
     verbatim_result = conn.execute("""
         DELETE FROM fts_verbatim WHERE concept_id NOT IN (
@@ -1049,7 +1153,7 @@ def migrate_fts_parity_data064(conn):
         )
     """)
     verbatim_cleaned = verbatim_result.rowcount
-    
+
     conn.commit()
     return backfilled, concepts_cleaned, verbatim_cleaned
 
@@ -1081,3 +1185,96 @@ def migrate_eunomia_040_backfill_subject_key(conn: sqlite3.Connection) -> int:
         "EUNOMIA-040: Backfilled subject_key for %d/%d active concepts", updated, len(rows)
     )
     return updated
+
+
+def migrate_eunomia_040_subject_key_data_backfill(conn: sqlite3.Connection) -> int:
+    """Backfill indexed subject_key column from existing concept data JSON.
+
+    EUNOMIA-040 originally added the indexed column, while many historical rows
+    already carried the same subject key in ``data.subject_key``. This migration
+    copies that authoritative cached value into the queryable column without
+    inventing new keys or changing concept timestamps.
+    """
+    if BENCHMARK_READONLY:
+        logger.info("EUNOMIA-040: subject_key data backfill skipped (PITH_BENCHMARK_READONLY)")
+        return 0
+    columns = _table_columns(conn, "concepts")
+    required = {"subject_key", "data"}
+    if not required.issubset(columns):
+        logger.info("EUNOMIA-040: subject_key data backfill skipped (missing concepts columns)")
+        return 0
+
+    filters = [
+        "subject_key IS NULL",
+        "data IS NOT NULL",
+        "json_valid(data)",
+        "NULLIF(TRIM(json_extract(data, '$.subject_key')), '') IS NOT NULL",
+    ]
+    if "status" in columns:
+        filters.append("status != 'deleted'")
+    if "is_current" in columns:
+        filters.append("is_current = 1")
+    if "superseded_by" in columns:
+        filters.append("superseded_by IS NULL")
+
+    cur = conn.execute(
+        f"""UPDATE concepts
+            SET subject_key = json_extract(data, '$.subject_key')
+            WHERE {' AND '.join(filters)}"""
+    )
+    conn.commit()
+    return int(cur.rowcount or 0)
+
+
+def requeue_subject_key_supersession_skips(conn: sqlite3.Connection) -> int:
+    """Requeue historical subject-key supersession rows unblocked by backfill."""
+    if BENCHMARK_READONLY:
+        logger.info("EUNOMIA-040: subject_key skip requeue skipped (PITH_BENCHMARK_READONLY)")
+        return 0
+    if not _table_exists(conn, "autolearn_maintenance_queue"):
+        return 0
+    concept_columns = _table_columns(conn, "concepts")
+    queue_columns = _table_columns(conn, "autolearn_maintenance_queue")
+    required_concepts = {"id", "subject_key"}
+    required_queue = {
+        "concept_id",
+        "task_type",
+        "status",
+        "attempts",
+        "next_attempt_at",
+        "updated_at",
+        "last_error",
+    }
+    if not required_concepts.issubset(concept_columns) or not required_queue.issubset(queue_columns):
+        return 0
+
+    processable_filters = [
+        "c.subject_key IS NOT NULL",
+        "NULLIF(TRIM(c.subject_key), '') IS NOT NULL",
+    ]
+    if "status" in concept_columns:
+        processable_filters.append("c.status != 'deleted'")
+    if "is_current" in concept_columns:
+        processable_filters.append("c.is_current = 1")
+    if "superseded_by" in concept_columns:
+        processable_filters.append("c.superseded_by IS NULL")
+
+    cur = conn.execute(
+        f"""UPDATE autolearn_maintenance_queue
+            SET status='queued',
+                attempts=0,
+                next_attempt_at=NULL,
+                updated_at=?,
+                last_error='requeued after subject_key backfill'
+            WHERE status='skipped'
+              AND task_type='subject_key_supersession'
+              AND last_error='missing subject_key'
+              AND EXISTS (
+                  SELECT 1 FROM concepts c
+                  WHERE c.id = autolearn_maintenance_queue.concept_id
+                    AND {' AND '.join(processable_filters)}
+              )""",
+        (_utc_now_iso(),),
+    )
+    conn.commit()
+    return int(cur.rowcount or 0)

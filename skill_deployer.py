@@ -808,7 +808,18 @@ def _verify_surface_parity(skills, surface_results, log_fn):
                 parity["drift"].append({"surface": surface, "skill": skill["id"], "reason": "hash_mismatch"})
 
     if _canonical_hub_enabled():
-        parity["auxiliaryAudit"] = _audit_auxiliary_skill_dirs(skills)
+        auxiliary_audit = _audit_auxiliary_skill_dirs(skills)
+        parity["auxiliaryAudit"] = auxiliary_audit
+        for root in auxiliary_audit:
+            if root.get("status") != "drift":
+                continue
+            for drift in root.get("drift", []):
+                parity["drift"].append({
+                    "surface": "auxiliary",
+                    "path": root.get("path"),
+                    "skill": drift.get("skill"),
+                    "reason": drift.get("reason"),
+                })
         parity["registryPollution"] = _audit_registry_pollution(skills)
 
     if parity["drift"]:
@@ -838,6 +849,73 @@ def _audit_auxiliary_skill_dirs(skills):
         drift.extend({"skill": skill_id, "reason": "missing_from_auxiliary"} for skill_id in missing)
         audit.append({"path": str(skills_dir), "status": "drift" if drift else "ok", "drift": drift})
     return audit
+
+
+def _deploy_to_auxiliary_skill_dirs(skills, log_fn):
+    """Repair managed auxiliary skill roots such as ~/.agents/skills."""
+    canonical_ids = {skill["id"] for skill in skills}
+    results = {"status": "ok", "roots": [], "warnings": []}
+    for skills_dir in AUXILIARY_SKILL_DIRS:
+        root_result = {
+            "path": str(skills_dir),
+            "status": "ok",
+            "skills": [],
+            "removedExtraSkills": [],
+            "warnings": [],
+        }
+        if not skills_dir.is_dir():
+            # TOOLING-099: the auxiliary root is a required drift-guard surface; a
+            # managed deploy target should self-heal a missing root rather than
+            # silently skip it (the gap that left ~/.agents/skills drifted). Only
+            # skip if creation genuinely fails (e.g. permissions).
+            try:
+                skills_dir.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                root_result["status"] = "skipped"
+                root_result["reason"] = f"auxiliary_root_uncreatable: {e}"
+                results["roots"].append(root_result)
+                continue
+            root_result["createdRoot"] = True
+        for existing in _discover_from_dir(skills_dir):
+            if existing["id"] in canonical_ids:
+                continue
+            existing_path = Path(existing["path"])
+            if (existing_path / MARKER_FILE).exists():
+                shutil.rmtree(existing_path)
+                root_result["removedExtraSkills"].append(existing["id"])
+            else:
+                root_result["warnings"].append(f"{existing['id']}: extra skill is unmanaged")
+        for skill in skills:
+            source_dir = Path(skill["path"])
+            target_dir = skills_dir / skill["id"]
+            try:
+                if target_dir.is_symlink():
+                    if target_dir.resolve() != source_dir.resolve():
+                        root_result["warnings"].append(f"{skill['id']}: symlink managed by another tool")
+                        continue
+                    target_dir.unlink()
+                elif target_dir.exists():
+                    if not (target_dir / MARKER_FILE).exists() and not _target_matches_source(target_dir, source_dir):
+                        root_result["warnings"].append(f"{skill['id']}: exists, not pith-managed")
+                        continue
+                    shutil.rmtree(target_dir)
+                shutil.copytree(source_dir, target_dir)
+                (target_dir / MARKER_FILE).write_text(json.dumps({
+                    "deployed_at": _now_iso(),
+                    "source": str(source_dir),
+                    "strategy": "auxiliary_materialize",
+                }))
+                root_result["skills"].append(skill["id"])
+            except OSError as e:
+                root_result["warnings"].append(f"{skill['id']}: {e}")
+        if root_result["warnings"]:
+            root_result["status"] = "warning"
+            results["warnings"].extend({"path": str(skills_dir), "warning": w} for w in root_result["warnings"])
+        log_fn("auxiliary", root_result["status"], f"{skills_dir}: {len(root_result['skills'])}/{len(skills)} skills")
+        results["roots"].append(root_result)
+    if results["warnings"]:
+        results["status"] = "warning"
+    return results
 
 
 def repair_generated_surfaces(skills, log_fn):
@@ -874,6 +952,7 @@ def repair_generated_surfaces(skills, log_fn):
             "claude-code": _deploy_to_claude_compat(skills, log_fn, strategy="symlink"),
             "codex": _deploy_to_codex(skills, log_fn),
         },
+        "auxiliary": _deploy_to_auxiliary_skill_dirs(skills, log_fn),
     }
     return results
 
@@ -1004,6 +1083,17 @@ def deploy_skills(*, status_only=False, migrate=False, dry_run=False, repair=Fal
     except Exception as e:
         log_fn("cowork", "error", f"Unhandled: {e}")
         results["surfaces"]["cowork"] = {"status": "error", "error": str(e)}
+
+    # TOOLING-099: materialize the auxiliary skill root(s) (~/.agents/skills) on
+    # every deploy, not just on repair=True. The drift guard requires this root in
+    # sync; previously it was only refreshed via repair_generated_surfaces, so new
+    # skills drifted out of it on normal deploys. Idempotent; when repair=True the
+    # repair path re-runs this harmlessly (its result is discarded at the merge).
+    try:
+        results["surfaces"]["auxiliary"] = _deploy_to_auxiliary_skill_dirs(skills, log_fn)
+    except Exception as e:
+        log_fn("auxiliary", "error", f"Unhandled: {e}")
+        results["surfaces"]["auxiliary"] = {"status": "error", "error": str(e)}
 
     if repair:
         results["repair"] = repair_generated_surfaces(skills, log_fn)

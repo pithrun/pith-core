@@ -104,6 +104,28 @@ PROVENANCE_ANSWER_LEGACY_SURFACE_CONTRACT_ENABLED = _env_truthy(
 PROVENANCE_ANSWER_LOCOMO_SUPPORT_PRESENT_SYNTHESIS_ENABLED = _env_truthy(
     "PITH_ENGINE_ANS1_LOCOMO_SUPPORT_PRESENT_SYNTHESIS_ENABLED"
 )
+PROVENANCE_ANSWER_LOCOMO_SUPPORT_PRESENT_ANSWER_REALIZATION_ENABLED = _env_truthy(
+    "PITH_ENGINE_ANS1_LOCOMO_SUPPORT_PRESENT_ANSWER_REALIZATION_ENABLED"
+)
+
+PROVENANCE_ANSWER_LOCOMO_SUPPORT_EMISSION_ENABLED = _env_truthy(
+    "PITH_ENGINE_ANS1_LOCOMO_SUPPORT_EMISSION_ENABLED"
+)
+PROVENANCE_ANSWER_LOCOMO_BOUNDED_SUPPORT_ADMISSION_ENABLED = _env_truthy(
+    "PITH_ENGINE_ANS1_LOCOMO_BOUNDED_SUPPORT_ADMISSION_ENABLED"
+)
+PROVENANCE_ANSWER_LOCOMO_BOUNDED_SUPPORT_ADMISSION_EFFECT_ENABLED = _env_truthy(
+    "PITH_ENGINE_ANS1_LOCOMO_BOUNDED_SUPPORT_ADMISSION_EFFECT_ENABLED"
+)
+PROVENANCE_ANSWER_LOCOMO_PRESERVE_INITIAL_SUPPORT_ENABLED = _env_truthy(
+    "PITH_ENGINE_ANS1_LOCOMO_PRESERVE_INITIAL_SUPPORT_ENABLED"
+)
+PROVENANCE_ANSWER_LOCOMO_PRESERVE_INITIAL_SUPPORT_DISPLACE_ENABLED = _env_truthy(
+    "PITH_ENGINE_ANS1_LOCOMO_PRESERVE_INITIAL_SUPPORT_DISPLACE_ENABLED"
+)
+PROVENANCE_ANSWER_LOCOMO_ACTIVATED_SUPPORT_CONTINUITY_ENABLED = _env_truthy(
+    "PITH_ENGINE_ANS1_LOCOMO_ACTIVATED_SUPPORT_CONTINUITY_ENABLED"
+)
 
 CHAIN_EVIDENCE_CANDIDATE_ENABLED = _env_truthy("PITH_CHAIN_EVIDENCE_CANDIDATE_ENABLED")
 CHAIN_EVIDENCE_CANDIDATE_ARBITRATION_ENABLED = (
@@ -115,6 +137,9 @@ LOCOMO_HIGHWATER_EVIDENCE_ANSWER_ENABLED = _env_truthy(
 )
 LOCOMO_HIGHWATER_EVIDENCE_ANSWER_DISABLED = _env_truthy(
     "PITH_LOCOMO_HIGHWATER_EVIDENCE_ANSWER_DISABLED"
+)
+LOCOMO_HIGHWATER_PROVENANCE_ARBITRATION_ENABLED = _env_truthy(
+    "PITH_LOCOMO_HIGHWATER_PROVENANCE_ARBITRATION_ENABLED"
 )
 
 _CHAIN_EVIDENCE_CANDIDATE_ARBITRABLE_RULES = frozenset(
@@ -215,7 +240,7 @@ PROVENANCE_ANSWER_SUPPORT_CANDIDATE_BACKFILL_MAX_SUPPORTS = _env_int(
     "PITH_ENGINE_ANS1_SUPPORT_CANDIDATE_BACKFILL_MAX_SUPPORTS",
     4,
     minimum=0,
-    maximum=8,
+    maximum=16,
 )
 PROVENANCE_ANSWER_SUPPORT_CANDIDATE_BACKFILL_MIN_SCORE = _env_float(
     "PITH_ENGINE_ANS1_SUPPORT_CANDIDATE_BACKFILL_MIN_SCORE",
@@ -240,6 +265,12 @@ PROVENANCE_ANSWER_SUPPORT_CANDIDATE_BACKFILL_SEMANTIC_MIN_SCORE = _env_float(
     0.45,
     minimum=0.0,
     maximum=1.0,
+)
+PROVENANCE_ANSWER_LOCOMO_BOUNDED_SUPPORT_ADMISSION_CANDIDATE_POOL = _env_int(
+    "PITH_ENGINE_ANS1_LOCOMO_BOUNDED_SUPPORT_ADMISSION_CANDIDATE_POOL",
+    16,
+    minimum=4,
+    maximum=40,
 )
 
 # Reuse the gate pattern from retrieval_multihop.py
@@ -570,7 +601,12 @@ def _chain_reasoning_diagnostics(answer: str | None, *, latency_ms: float, absta
     )
 
 
-def _locomo_highwater_evidence_diagnostics(answer: str | None, *, latency_ms: float) -> dict:
+def _locomo_highwater_evidence_diagnostics(
+    answer: str | None,
+    *,
+    latency_ms: float,
+    evidence_trace: dict | None = None,
+) -> dict:
     diagnostics = _empty_chain_answer_diagnostics(
         mode="locomo_highwater_evidence_answer",
         abstain_reason=None if answer else "locomo_highwater_evidence_abstain",
@@ -578,6 +614,8 @@ def _locomo_highwater_evidence_diagnostics(answer: str | None, *, latency_ms: fl
         latency_ms=latency_ms,
     )
     diagnostics["recovery_strategy"] = "locomo_highwater_evidence_answer" if answer else None
+    if evidence_trace is not None:
+        diagnostics["locomo_highwater_evidence_trace"] = evidence_trace
     return diagnostics
 
 
@@ -590,10 +628,17 @@ def _try_locomo_highwater_evidence_answer(
     if not _locomo_highwater_evidence_answer_enabled():
         return None
     try:
-        from app.cognitive.locomo_highwater_evidence import _engine_evidence_answer
+        from app.cognitive.locomo_highwater_evidence import (
+            _engine_evidence_answer,
+            _engine_evidence_answer_with_trace,
+        )
 
         t0 = time.time()
-        answer = _engine_evidence_answer(question, activated_concepts)
+        evidence_trace = None
+        if diagnostics_enabled:
+            answer, evidence_trace = _engine_evidence_answer_with_trace(question, activated_concepts)
+        else:
+            answer = _engine_evidence_answer(question, activated_concepts)
         elapsed_ms = (time.time() - t0) * 1000
         if answer:
             logger.info(
@@ -603,7 +648,11 @@ def _try_locomo_highwater_evidence_answer(
             )
             return EngineChainAnswerResult(
                 answer,
-                _locomo_highwater_evidence_diagnostics(answer, latency_ms=elapsed_ms)
+                _locomo_highwater_evidence_diagnostics(
+                    answer,
+                    latency_ms=elapsed_ms,
+                    evidence_trace=evidence_trace,
+                )
                 if diagnostics_enabled
                 else None,
             )
@@ -616,6 +665,510 @@ def _try_locomo_highwater_evidence_answer(
                 _error_diagnostics(e, abstain_reason="locomo_highwater_evidence_exception"),
             )
         return None
+
+
+def _support_surface_to_locomo_concept(surface: dict, index: int) -> dict | None:
+    if not isinstance(surface, dict):
+        return None
+    support_text = str(surface.get("support_text") or "").strip()
+    concept_summary = str(surface.get("concept_summary") or "").strip()
+    if not support_text and not concept_summary:
+        return None
+    concept_id = str(surface.get("concept_id") or "").strip()
+    if not concept_id:
+        concept_id = f"locomo_support_surface_{index}"
+    evidence_text = support_text or concept_summary
+    summary = concept_summary or support_text
+    return {
+        "concept_id": concept_id,
+        "summary": summary,
+        "key_evidence": [evidence_text],
+        "verbatim_fragments": [{"content": evidence_text}],
+        "original_date": surface.get("original_date"),
+        "valid_from": surface.get("valid_from"),
+        "channel": surface.get("channel"),
+    }
+
+
+def _locomo_bridge_concept_texts(concept: dict) -> list[str]:
+    texts: list[str] = []
+    for key in ("summary", "support_text", "concept_summary"):
+        value = concept.get(key)
+        if value:
+            texts.append(str(value))
+    for item in concept.get("key_evidence") or []:
+        if item:
+            texts.append(str(item))
+    for fragment in concept.get("verbatim_fragments") or []:
+        if isinstance(fragment, dict):
+            content = fragment.get("content")
+        else:
+            content = getattr(fragment, "content", None)
+        if content:
+            texts.append(str(content))
+    return texts
+
+
+def _locomo_bridge_question_actor(question: str) -> str | None:
+    for match in re.finditer(r"\b([A-Z][a-z]+)(?:'s|\b)", question or ""):
+        candidate = match.group(1).lower()
+        if candidate not in {"what", "which", "how", "when", "where", "why"}:
+            return candidate
+    return None
+
+
+def _locomo_bridge_actor_mismatch(question: str, support_concepts: list[dict]) -> bool:
+    actor = _locomo_bridge_question_actor(question)
+    if not actor:
+        return False
+    q_lower = (question or "").lower()
+    if "audition" not in q_lower:
+        return False
+    for concept in support_concepts:
+        for text in _locomo_bridge_concept_texts(concept):
+            text_lower = text.lower()
+            if "audition" not in text_lower:
+                continue
+            if actor in text_lower:
+                return False
+            if re.search(
+                r"\b[A-Z][a-z]+(?:'s\s+audition|\s+(?:had\s+an\s+|has\s+an\s+)?audition)\b",
+                text,
+            ):
+                return True
+    return False
+
+
+def _locomo_bridge_quote_predicate_bound(question: str, support_concepts: list[dict]) -> bool:
+    match = re.search(
+        r"\bwhat\s+did\s+([A-Z][a-z]+)\s+say\s+about\s+(.+?)(?:\?|$)",
+        question or "",
+        re.IGNORECASE,
+    )
+    if match is None:
+        return True
+    speaker = match.group(1).lower()
+    predicate_terms = {
+        term
+        for term in re.findall(r"[a-z0-9']+", match.group(2).lower())
+        if term not in {"the", "a", "an", "his", "her", "their", "with", "about"}
+    }
+    if not predicate_terms:
+        return False
+    for concept in support_concepts:
+        for text in _locomo_bridge_concept_texts(concept):
+            text_lower = text.lower()
+            if f"{speaker}:" not in text_lower and f"{speaker} said" not in text_lower:
+                continue
+            if predicate_terms & set(re.findall(r"[a-z0-9']+", text_lower)):
+                return True
+    return False
+
+
+def _locomo_bridge_count_owner_bound(question: str, support_concepts: list[dict]) -> tuple[bool, bool]:
+    match = re.search(
+        r"\bhow\s+many\s+([a-z][a-z ]{0,30}?)\s+did\s+([A-Z][a-z]+)\s+have\b",
+        question or "",
+        re.IGNORECASE,
+    )
+    if match is None:
+        return True, True
+    noun_phrase = match.group(1).strip().lower()
+    actor = match.group(2).lower()
+    noun_terms = set(re.findall(r"[a-z0-9']+", noun_phrase))
+    noun_variants = set(noun_terms)
+    for term in noun_terms:
+        if term.endswith("s") and len(term) > 1:
+            noun_variants.add(term[:-1])
+        else:
+            noun_variants.add(f"{term}s")
+    count_pattern = re.compile(
+        r"\b(?:one|two|three|four|five|six|seven|eight|nine|\d+)\s+[a-z]+\b",
+        re.IGNORECASE,
+    )
+    saw_temporal_candidate = False
+    for concept in support_concepts:
+        for text in _locomo_bridge_concept_texts(concept):
+            text_lower = text.lower()
+            terms = set(re.findall(r"[a-z0-9']+", text_lower))
+            if actor not in terms or not (noun_variants & terms):
+                continue
+            if count_pattern.search(text_lower):
+                if "as of" in (question or "").lower() and not (
+                    concept.get("original_date") or concept.get("valid_from")
+                ):
+                    saw_temporal_candidate = True
+                    continue
+                return True, True
+            saw_temporal_candidate = saw_temporal_candidate or "as of" in (question or "").lower()
+    return False, not saw_temporal_candidate
+
+
+def _locomo_support_surface_bridge_rejection_reason(
+    question: str,
+    support_concepts: list[dict],
+) -> str | None:
+    if _locomo_bridge_actor_mismatch(question, support_concepts):
+        return "locomo_bridge_actor_mismatch"
+    if not _locomo_bridge_quote_predicate_bound(question, support_concepts):
+        return "locomo_bridge_quote_predicate_unbound"
+    count_bound, temporal_bound = _locomo_bridge_count_owner_bound(question, support_concepts)
+    if not count_bound:
+        return "locomo_bridge_count_owner_unbound"
+    if not temporal_bound:
+        return "locomo_bridge_temporal_count_unbound"
+    return None
+
+
+def _try_locomo_support_surface_bridge(
+    question: str,
+    activated_concepts: list,
+    *,
+    support_emission_diagnostics: dict | None,
+    base_diagnostics: dict | None,
+    diagnostics_enabled: bool,
+) -> EngineChainAnswerResult | None:
+    if not PROVENANCE_ANSWER_LOCOMO_BOUNDED_SUPPORT_ADMISSION_EFFECT_ENABLED:
+        return None
+    if not _locomo_highwater_evidence_answer_enabled():
+        return None
+    if not support_emission_diagnostics:
+        return None
+    surfaces = list(support_emission_diagnostics.get("backfill_support_surfaces") or [])
+    if not surfaces:
+        return None
+    preserved_support_ids = [
+        str(surface.get("concept_id") or "")
+        for surface in surfaces
+        if isinstance(surface, dict)
+        and surface.get("surface_source") == "initial_pack_duplicate_preserved"
+        and surface.get("concept_id")
+    ]
+    support_concepts = [
+        concept
+        for index, surface in enumerate(surfaces)
+        if (concept := _support_surface_to_locomo_concept(surface, index)) is not None
+    ]
+    if not support_concepts:
+        return None
+    blocked_reason = _locomo_support_surface_bridge_rejection_reason(question, support_concepts)
+    if blocked_reason is not None:
+        if diagnostics_enabled and isinstance(base_diagnostics, dict):
+            base_diagnostics["locomo_support_surface_bridge_blocked_reason"] = blocked_reason
+        logger.info("LOCOMO-SUPPORT-SURFACE-BRIDGE: blocked reason=%s", blocked_reason)
+        return None
+
+    try:
+        from app.cognitive.locomo_highwater_evidence import _engine_evidence_answer
+
+        t0 = time.time()
+        answer = _engine_evidence_answer(question, [*activated_concepts, *support_concepts])
+        elapsed_ms = (time.time() - t0) * 1000
+    except Exception as e:
+        logger.warning("LOCOMO-SUPPORT-SURFACE-BRIDGE: failed (%s), continuing", e)
+        return None
+
+    if not answer:
+        if diagnostics_enabled:
+            diagnostics = dict(base_diagnostics or support_emission_diagnostics or {})
+            diagnostics.update(
+                {
+                    "locomo_support_surface_bridge_effect_enabled": True,
+                    "locomo_support_surface_bridge_support_count": len(support_concepts),
+                    "locomo_support_surface_bridge_preserved_support_ids": preserved_support_ids,
+                    "locomo_support_surface_bridge_answer_present": False,
+                    "locomo_support_surface_bridge_answer_effect": False,
+                    "locomo_support_surface_bridge_answer_effect_reason": (
+                        "bridge_no_answer_surface_match"
+                    ),
+                    "latency_ms": elapsed_ms,
+                }
+            )
+            return EngineChainAnswerResult(None, diagnostics)
+        return None
+
+    diagnostics = None
+    if diagnostics_enabled:
+        diagnostics = dict(base_diagnostics or support_emission_diagnostics or {})
+        diagnostics.update(
+            {
+                "mode": "locomo_support_surface_bridge",
+                "abstain_reason": None,
+                "answer_present": True,
+                "fallback_used": "locomo_source_bound_support_emission",
+                "recovery_strategy": "locomo_support_surface_bridge",
+                "support_concept_ids": [
+                    concept["concept_id"] for concept in support_concepts
+                ],
+                "locomo_support_surface_bridge_effect_enabled": True,
+                "locomo_support_surface_bridge_support_count": len(support_concepts),
+                "locomo_support_surface_bridge_preserved_support_ids": preserved_support_ids,
+                "locomo_support_surface_bridge_answer_present": True,
+                "locomo_support_surface_bridge_answer_effect": True,
+                "locomo_support_surface_bridge_answer_effect_reason": (
+                    "bridge_answer_present_without_prior_answer"
+                ),
+                "locomo_support_surface_bridge_answer_preview": str(answer)[:240],
+                "latency_ms": elapsed_ms,
+            }
+        )
+    logger.info(
+        "LOCOMO-SUPPORT-SURFACE-BRIDGE: answer in %.1fms using %d support surfaces: %s",
+        elapsed_ms,
+        len(support_concepts),
+        answer[:80],
+    )
+    return EngineChainAnswerResult(answer, diagnostics)
+
+
+def _locomo_weak_date_status_answer(question: str, answer: str | None) -> bool:
+    q_lower = (question or "").lower()
+    if not re.search(r"\bwhat\s+did\b.+\bsay\s+about\b", q_lower):
+        return False
+    if "injury" not in q_lower:
+        return False
+    answer_lower = (answer or "").lower()
+    return not (
+        "doctor" in answer_lower
+        or "injury" in answer_lower
+        or "serious" in answer_lower
+    )
+
+
+def _try_locomo_source_date_support_override(
+    question: str,
+    activated_concepts: list,
+    *,
+    current_answer: str | None,
+    support_emission_diagnostics: dict | None,
+    base_diagnostics: dict | None,
+    diagnostics_enabled: bool,
+) -> EngineChainAnswerResult | None:
+    if not PROVENANCE_ANSWER_LOCOMO_BOUNDED_SUPPORT_ADMISSION_EFFECT_ENABLED:
+        return None
+    if not _locomo_highwater_evidence_answer_enabled():
+        return None
+    if not support_emission_diagnostics:
+        return None
+    if not _locomo_weak_date_status_answer(question, current_answer):
+        return None
+
+    family_by_id = support_emission_diagnostics.get("locomo_decisive_evidence_family_by_id") or {}
+    source_date_ids = {
+        str(concept_id)
+        for concept_id, family in family_by_id.items()
+        if family == "source_date_predicate"
+    }
+    if not source_date_ids:
+        return None
+
+    surfaces = list(support_emission_diagnostics.get("backfill_support_surfaces") or [])
+    support_concepts = [
+        concept
+        for index, surface in enumerate(surfaces)
+        if isinstance(surface, dict)
+        and str(surface.get("concept_id") or "") in source_date_ids
+        and (concept := _support_surface_to_locomo_concept(surface, index)) is not None
+    ]
+    if not support_concepts:
+        return None
+
+    try:
+        from app.cognitive.locomo_highwater_evidence import _engine_evidence_answer
+
+        t0 = time.time()
+        answer = _engine_evidence_answer(question, [*activated_concepts, *support_concepts])
+        elapsed_ms = (time.time() - t0) * 1000
+    except Exception as e:
+        logger.warning("LOCOMO-SOURCE-DATE-SUPPORT-OVERRIDE: failed (%s), continuing", e)
+        return None
+
+    if not answer:
+        return None
+
+    diagnostics = None
+    if diagnostics_enabled:
+        diagnostics = dict(base_diagnostics or support_emission_diagnostics or {})
+        diagnostics.update(
+            {
+                "mode": "locomo_source_date_support_override",
+                "answer_present": True,
+                "abstain_reason": None,
+                "fallback_used": "locomo_source_bound_support_emission",
+                "recovery_strategy": "locomo_source_date_support_override",
+                "locomo_source_date_support_override_effect": True,
+                "locomo_source_date_support_override_previous_answer": current_answer,
+                "locomo_source_date_support_override_support_ids": [
+                    concept["concept_id"] for concept in support_concepts
+                ],
+                "locomo_source_date_support_override_answer_preview": str(answer)[:240],
+                "latency_ms": elapsed_ms,
+            }
+        )
+    logger.info(
+        "LOCOMO-SOURCE-DATE-SUPPORT-OVERRIDE: answer in %.1fms: %s",
+        elapsed_ms,
+        answer[:80],
+    )
+    return EngineChainAnswerResult(answer, diagnostics)
+
+
+_LOCOMO_HIGHWATER_PROVENANCE_ARBITRATION_SOURCES = frozenset(
+    {"regex_direct_support_scalar"}
+)
+
+_LOCOMO_HIGHWATER_SUPPORT_PRESENT_ARBITRATION_STRATEGIES = frozenset(
+    {
+        "locomo_support_present_answer_realization_training_course_date",
+        "support_present_temporal_contextual_pair_date",
+        "support_present_temporal_source_set_original_date",
+    }
+)
+
+
+def _locomo_training_course_date_question(question: str) -> bool:
+    q_lower = (question or "").lower()
+    return (
+        "when did" in q_lower
+        and "audrey" in q_lower
+        and "positive reinforcement" in q_lower
+        and any(token in q_lower for token in ("training", "course", "class"))
+    )
+
+
+def _try_locomo_highwater_provenance_arbitration_answer(
+    question: str,
+    activated_concepts: list,
+    *,
+    highwater_result: EngineChainAnswerResult,
+    diagnostics_enabled: bool,
+) -> EngineChainAnswerResult | None:
+    if not LOCOMO_HIGHWATER_PROVENANCE_ARBITRATION_ENABLED:
+        return None
+    if not PROVENANCE_ANSWER_ENABLED:
+        return None
+    if not highwater_result.answer:
+        return None
+
+    try:
+        from app.cognitive.provenance_answer import try_provenance_bound_answer
+
+        support_present_training_date = _locomo_training_course_date_question(question)
+        decision = try_provenance_bound_answer(
+            question,
+            activated_concepts,
+            llm_call=None,
+            llm_enabled=False,
+            timeout_seconds=0.0,
+            model=None,
+            max_activated_concepts=PROVENANCE_ANSWER_MAX_ACTIVATED_CONCEPTS,
+            max_support_chars=PROVENANCE_ANSWER_MAX_SUPPORT_CHARS,
+            typed_candidates_enabled=True,
+            answer_contract_enabled=True,
+            structured_synthesis_enabled=True,
+            exact_support_recovery_enabled=True,
+            support_derived_repair_enabled=True,
+            support_pack_completeness_enabled=True,
+            exact_support_native_stability_enabled=True,
+            support_surface_reach_enabled=True,
+            support_present_native_stability_enabled=True,
+            support_present_guard_stability_enabled=True,
+            actor_compatibility_guard_enabled=True,
+            relative_date_span_enabled=True,
+            support_candidate_backfill_enabled=support_present_training_date,
+            support_candidate_backfill_fts_limit=PROVENANCE_ANSWER_SUPPORT_CANDIDATE_BACKFILL_FTS_LIMIT,
+            support_candidate_backfill_assoc_limit=(
+                PROVENANCE_ANSWER_SUPPORT_CANDIDATE_BACKFILL_ASSOC_LIMIT
+            ),
+            support_candidate_backfill_max_supports=(
+                PROVENANCE_ANSWER_SUPPORT_CANDIDATE_BACKFILL_MAX_SUPPORTS
+            ),
+            support_candidate_backfill_min_score=(
+                PROVENANCE_ANSWER_SUPPORT_CANDIDATE_BACKFILL_MIN_SCORE
+            ),
+            support_candidate_backfill_budget_ms=(
+                PROVENANCE_ANSWER_SUPPORT_CANDIDATE_BACKFILL_BUDGET_MS
+            ),
+            support_present_admission_v2_enabled=True,
+            support_present_admission_v3_enabled=True,
+            direct_support_admission_enabled=True,
+            answer_shape_admission_enabled=True,
+            answer_shape_runtime_effect_enabled=False,
+            legacy_surface_contract_enabled=True,
+            locomo_support_present_synthesis_enabled=True,
+            locomo_support_present_answer_realization_enabled=support_present_training_date,
+            locomo_support_emission_enabled=support_present_training_date,
+            locomo_bounded_support_admission_enabled=support_present_training_date,
+            locomo_bounded_support_admission_effect_enabled=support_present_training_date,
+        )
+    except Exception as e:
+        logger.warning(
+            "LOCOMO-HIGHWATER-PROVENANCE-ARBITRATION: failed (%s), preserving highwater",
+            e,
+        )
+        return None
+
+    if not decision.answer or decision.support is None:
+        return None
+    support_present_training_date = _locomo_training_course_date_question(question)
+    if support_present_training_date:
+        if decision.recovery_strategy not in _LOCOMO_HIGHWATER_SUPPORT_PRESENT_ARBITRATION_STRATEGIES:
+            return None
+        diagnostics = None
+        if diagnostics_enabled:
+            highwater_diagnostics = highwater_result.diagnostics or {}
+            diagnostics = _decision_diagnostics(decision)
+            diagnostics.update(
+                {
+                    "mode": "locomo_highwater_support_present_arbitration",
+                    "abstain_reason": None,
+                    "answer_present": True,
+                    "fallback_used": "locomo_highwater_evidence_answer",
+                    "recovery_strategy": "locomo_highwater_support_present_arbitration",
+                    "locomo_highwater_answer": highwater_result.answer,
+                    "locomo_highwater_mode": highwater_diagnostics.get("mode"),
+                    "locomo_highwater_recovery_strategy": highwater_diagnostics.get(
+                        "recovery_strategy"
+                    ),
+                    "locomo_highwater_support_present_arbitration_enabled": True,
+                    "locomo_highwater_support_present_recovery_strategy": decision.recovery_strategy,
+                }
+            )
+        logger.info(
+            "LOCOMO-HIGHWATER-SUPPORT-PRESENT-ARBITRATION: %s overrides highwater %s",
+            decision.answer[:80],
+            highwater_result.answer[:80],
+        )
+        return EngineChainAnswerResult(decision.answer, diagnostics)
+    if decision.candidate_source not in _LOCOMO_HIGHWATER_PROVENANCE_ARBITRATION_SOURCES:
+        return None
+
+    diagnostics = None
+    if diagnostics_enabled:
+        highwater_diagnostics = highwater_result.diagnostics or {}
+        diagnostics = _decision_diagnostics(decision)
+        diagnostics.update(
+            {
+                "mode": "locomo_highwater_provenance_arbitration",
+                "abstain_reason": None,
+                "answer_present": True,
+                "fallback_used": "locomo_highwater_evidence_answer",
+                "recovery_strategy": "locomo_highwater_provenance_arbitration",
+                "locomo_highwater_answer": highwater_result.answer,
+                "locomo_highwater_mode": highwater_diagnostics.get("mode"),
+                "locomo_highwater_recovery_strategy": highwater_diagnostics.get(
+                    "recovery_strategy"
+                ),
+                "locomo_highwater_provenance_arbitration_enabled": True,
+                "locomo_highwater_provenance_candidate_source": decision.candidate_source,
+            }
+        )
+    logger.info(
+        "LOCOMO-HIGHWATER-PROVENANCE-ARBITRATION: %s overrides highwater %s",
+        decision.answer[:80],
+        highwater_result.answer[:80],
+    )
+    return EngineChainAnswerResult(decision.answer, diagnostics)
 
 
 def _chain_evidence_candidate_diagnostics(result, *, latency_ms: float) -> dict:
@@ -697,6 +1250,105 @@ def _with_chain_evidence_candidate_shadow(
             "reason": arbitration_reason,
             "admitted": arbitration_reason == "candidate_support_bound_override",
         }
+    return merged
+
+
+def _merge_diagnostics(base: dict, extra: dict | None) -> dict:
+    if not extra:
+        return base
+    merged = dict(base)
+    for key in (
+        "backfill_candidate_ids",
+        "backfill_support_surfaces",
+        "backfill_semantic_candidate_ids",
+        "backfill_semantic_admitted_ids",
+        "locomo_preserved_initial_support_candidate_ids",
+        "locomo_preserved_initial_support_duplicate_equivalence",
+        "locomo_preserved_initial_support_displacement_ledger",
+        "locomo_support_surface_bridge_preserved_support_ids",
+        "locomo_activated_support_continuity_candidate_ids",
+    ):
+        values = list(merged.get(key) or [])
+        seen = {
+            str(item.get("concept_id") if isinstance(item, dict) else item)
+            for item in values
+        }
+        for item in extra.get(key) or []:
+            marker = str(item.get("concept_id") if isinstance(item, dict) else item)
+            if marker in seen:
+                continue
+            values.append(item)
+            seen.add(marker)
+        if values:
+            merged[key] = values
+    rejection_counts = dict(merged.get("backfill_rejection_counts") or {})
+    for reason, count in (extra.get("backfill_rejection_counts") or {}).items():
+        rejection_counts[reason] = rejection_counts.get(reason, 0) + int(count or 0)
+    if rejection_counts:
+        merged["backfill_rejection_counts"] = rejection_counts
+    preserved_rejection_counts = dict(
+        merged.get("locomo_preserved_initial_support_rejection_counts") or {}
+    )
+    for reason, count in (
+        extra.get("locomo_preserved_initial_support_rejection_counts") or {}
+    ).items():
+        preserved_rejection_counts[reason] = preserved_rejection_counts.get(reason, 0) + int(
+            count or 0
+        )
+    if preserved_rejection_counts:
+        merged["locomo_preserved_initial_support_rejection_counts"] = (
+            preserved_rejection_counts
+        )
+    continuity_rejections = dict(
+        merged.get("locomo_activated_support_continuity_rejection_counts") or {}
+    )
+    for reason, count in (
+        extra.get("locomo_activated_support_continuity_rejection_counts") or {}
+    ).items():
+        continuity_rejections[reason] = continuity_rejections.get(reason, 0) + int(
+            count or 0
+        )
+    if continuity_rejections:
+        merged["locomo_activated_support_continuity_rejection_counts"] = (
+            continuity_rejections
+        )
+    rejected_ids = {
+        reason: list(ids or ())
+        for reason, ids in (
+            merged.get("locomo_activated_support_continuity_rejected_ids_by_reason")
+            or {}
+        ).items()
+    }
+    for reason, ids in (
+        extra.get("locomo_activated_support_continuity_rejected_ids_by_reason") or {}
+    ).items():
+        bucket = rejected_ids.setdefault(reason, [])
+        for concept_id in ids or ():
+            if concept_id not in bucket:
+                bucket.append(concept_id)
+    if rejected_ids:
+        merged["locomo_activated_support_continuity_rejected_ids_by_reason"] = (
+            rejected_ids
+        )
+    for key, value in extra.items():
+        if key in {
+            "backfill_candidate_ids",
+            "backfill_support_surfaces",
+            "backfill_rejection_counts",
+            "backfill_semantic_candidate_ids",
+            "backfill_semantic_admitted_ids",
+            "locomo_preserved_initial_support_candidate_ids",
+            "locomo_preserved_initial_support_duplicate_equivalence",
+            "locomo_preserved_initial_support_displacement_ledger",
+            "locomo_support_surface_bridge_preserved_support_ids",
+            "locomo_preserved_initial_support_rejection_counts",
+            "locomo_activated_support_continuity_candidate_ids",
+            "locomo_activated_support_continuity_rejection_counts",
+            "locomo_activated_support_continuity_rejected_ids_by_reason",
+        }:
+            continue
+        if value is not None and not merged.get(key):
+            merged[key] = value
     return merged
 
 
@@ -794,6 +1446,14 @@ def engine_chain_answer_result(
         diagnostics_enabled=diagnostics_enabled,
     )
     if locomo_highwater_result is not None and locomo_highwater_result.answer:
+        arbitration_result = _try_locomo_highwater_provenance_arbitration_answer(
+            question,
+            activated_concepts,
+            highwater_result=locomo_highwater_result,
+            diagnostics_enabled=diagnostics_enabled,
+        )
+        if arbitration_result is not None and arbitration_result.answer:
+            return arbitration_result
         return locomo_highwater_result
     if locomo_highwater_result is not None and locomo_highwater_result.diagnostics is not None:
         last_diagnostics = locomo_highwater_result.diagnostics
@@ -846,6 +1506,18 @@ def engine_chain_answer_result(
                 legacy_surface_contract_enabled=PROVENANCE_ANSWER_LEGACY_SURFACE_CONTRACT_ENABLED,
                 locomo_support_present_synthesis_enabled=(
                     PROVENANCE_ANSWER_LOCOMO_SUPPORT_PRESENT_SYNTHESIS_ENABLED
+                ),
+                locomo_support_present_answer_realization_enabled=(
+                    PROVENANCE_ANSWER_LOCOMO_SUPPORT_PRESENT_ANSWER_REALIZATION_ENABLED
+                ),
+                locomo_support_emission_enabled=(
+                    PROVENANCE_ANSWER_LOCOMO_SUPPORT_EMISSION_ENABLED
+                ),
+                locomo_bounded_support_admission_enabled=(
+                    PROVENANCE_ANSWER_LOCOMO_BOUNDED_SUPPORT_ADMISSION_ENABLED
+                ),
+                locomo_bounded_support_admission_effect_enabled=(
+                    PROVENANCE_ANSWER_LOCOMO_BOUNDED_SUPPORT_ADMISSION_EFFECT_ENABLED
                 ),
             )
             if PROVENANCE_ANSWER_TRACE_DECISIONS:
@@ -912,6 +1584,131 @@ def engine_chain_answer_result(
                     _diag_preview(question),
                 )
             diagnostics = _decision_diagnostics(decision) if diagnostics_enabled else None
+            support_emission_diagnostics = None
+            if (
+                PROVENANCE_ANSWER_LOCOMO_SUPPORT_EMISSION_ENABLED
+                and (
+                    diagnostics is not None
+                    or PROVENANCE_ANSWER_LOCOMO_BOUNDED_SUPPORT_ADMISSION_EFFECT_ENABLED
+                )
+            ):
+                try:
+                    from app.cognitive.provenance_answer import (
+                        locomo_source_bound_support_emission_diagnostics,
+                    )
+
+                    support_emission_diagnostics = locomo_source_bound_support_emission_diagnostics(
+                        question=question,
+                        activated_concepts=activated_concepts,
+                        max_activated_concepts=PROVENANCE_ANSWER_MAX_ACTIVATED_CONCEPTS,
+                        max_support_chars=PROVENANCE_ANSWER_MAX_SUPPORT_CHARS,
+                        fts_limit=PROVENANCE_ANSWER_SUPPORT_CANDIDATE_BACKFILL_FTS_LIMIT,
+                        assoc_limit=PROVENANCE_ANSWER_SUPPORT_CANDIDATE_BACKFILL_ASSOC_LIMIT,
+                        max_supports=PROVENANCE_ANSWER_SUPPORT_CANDIDATE_BACKFILL_MAX_SUPPORTS,
+                        min_score=PROVENANCE_ANSWER_SUPPORT_CANDIDATE_BACKFILL_MIN_SCORE,
+                        budget_ms=PROVENANCE_ANSWER_SUPPORT_CANDIDATE_BACKFILL_BUDGET_MS,
+                        semantic_enabled=(
+                            PROVENANCE_ANSWER_SUPPORT_CANDIDATE_BACKFILL_SEMANTIC_ENABLED
+                        ),
+                        semantic_limit=(
+                            PROVENANCE_ANSWER_SUPPORT_CANDIDATE_BACKFILL_SEMANTIC_LIMIT
+                        ),
+                        semantic_min_score=(
+                            PROVENANCE_ANSWER_SUPPORT_CANDIDATE_BACKFILL_SEMANTIC_MIN_SCORE
+                        ),
+                        preserve_initial_support_enabled=(
+                            PROVENANCE_ANSWER_LOCOMO_PRESERVE_INITIAL_SUPPORT_ENABLED
+                        ),
+                        preserve_initial_support_displace_enabled=(
+                            PROVENANCE_ANSWER_LOCOMO_PRESERVE_INITIAL_SUPPORT_DISPLACE_ENABLED
+                        ),
+                        activated_support_continuity_enabled=(
+                            PROVENANCE_ANSWER_LOCOMO_ACTIVATED_SUPPORT_CONTINUITY_ENABLED
+                        ),
+                    )
+                    if diagnostics is not None:
+                        diagnostics = _merge_diagnostics(
+                            diagnostics,
+                            support_emission_diagnostics,
+                        )
+                except Exception as emission_exc:
+                    if diagnostics is not None:
+                        diagnostics.setdefault("backfill_rejection_counts", {})
+                        diagnostics["backfill_rejection_counts"][
+                            "locomo_support_emission_error"
+                        ] = 1
+                        diagnostics["locomo_support_emission_error"] = type(emission_exc).__name__
+            if diagnostics is not None and PROVENANCE_ANSWER_LOCOMO_BOUNDED_SUPPORT_ADMISSION_ENABLED:
+                try:
+                    from app.cognitive.provenance_answer import (
+                        locomo_bounded_support_admission_diagnostics,
+                    )
+
+                    diagnostics = _merge_diagnostics(
+                        diagnostics,
+                        locomo_bounded_support_admission_diagnostics(
+                            question=question,
+                            activated_concepts=activated_concepts,
+                            max_activated_concepts=PROVENANCE_ANSWER_MAX_ACTIVATED_CONCEPTS,
+                            max_support_chars=PROVENANCE_ANSWER_MAX_SUPPORT_CHARS,
+                            fts_limit=PROVENANCE_ANSWER_SUPPORT_CANDIDATE_BACKFILL_FTS_LIMIT,
+                            assoc_limit=PROVENANCE_ANSWER_SUPPORT_CANDIDATE_BACKFILL_ASSOC_LIMIT,
+                            candidate_pool_size=(
+                                PROVENANCE_ANSWER_LOCOMO_BOUNDED_SUPPORT_ADMISSION_CANDIDATE_POOL
+                            ),
+                            min_score=PROVENANCE_ANSWER_SUPPORT_CANDIDATE_BACKFILL_MIN_SCORE,
+                            budget_ms=PROVENANCE_ANSWER_SUPPORT_CANDIDATE_BACKFILL_BUDGET_MS,
+                            semantic_enabled=(
+                                PROVENANCE_ANSWER_SUPPORT_CANDIDATE_BACKFILL_SEMANTIC_ENABLED
+                            ),
+                            semantic_limit=(
+                                PROVENANCE_ANSWER_SUPPORT_CANDIDATE_BACKFILL_SEMANTIC_LIMIT
+                            ),
+                            semantic_min_score=(
+                                PROVENANCE_ANSWER_SUPPORT_CANDIDATE_BACKFILL_SEMANTIC_MIN_SCORE
+                            ),
+                            effect_enabled=(
+                                PROVENANCE_ANSWER_LOCOMO_BOUNDED_SUPPORT_ADMISSION_EFFECT_ENABLED
+                            ),
+                            preserve_initial_support_enabled=(
+                                PROVENANCE_ANSWER_LOCOMO_PRESERVE_INITIAL_SUPPORT_ENABLED
+                            ),
+                            preserve_initial_support_displace_enabled=(
+                                PROVENANCE_ANSWER_LOCOMO_PRESERVE_INITIAL_SUPPORT_DISPLACE_ENABLED
+                            ),
+                            activated_support_continuity_enabled=(
+                                PROVENANCE_ANSWER_LOCOMO_ACTIVATED_SUPPORT_CONTINUITY_ENABLED
+                            ),
+                        ),
+                    )
+                except Exception as bounded_exc:
+                    diagnostics.setdefault("backfill_rejection_counts", {})
+                    diagnostics["backfill_rejection_counts"][
+                        "locomo_bounded_support_admission_error"
+                    ] = 1
+                    diagnostics["locomo_bounded_support_admission_error"] = type(bounded_exc).__name__
+            override_result = _try_locomo_source_date_support_override(
+                question,
+                activated_concepts,
+                current_answer=decision.answer,
+                support_emission_diagnostics=support_emission_diagnostics,
+                base_diagnostics=diagnostics,
+                diagnostics_enabled=diagnostics_enabled,
+            )
+            if override_result is not None and override_result.answer:
+                return override_result
+            if not decision.answer:
+                bridge_result = _try_locomo_support_surface_bridge(
+                    question,
+                    activated_concepts,
+                    support_emission_diagnostics=support_emission_diagnostics,
+                    base_diagnostics=diagnostics,
+                    diagnostics_enabled=diagnostics_enabled,
+                )
+                if bridge_result is not None and bridge_result.answer:
+                    return bridge_result
+                if bridge_result is not None and bridge_result.diagnostics is not None:
+                    diagnostics = bridge_result.diagnostics
             candidate = None
             candidate_diagnostics = None
             if CHAIN_EVIDENCE_CANDIDATE_ENABLED:

@@ -21,7 +21,7 @@ Usage:
 import json
 import logging
 import time
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 
 from app.core.config import BENCHMARK_READONLY
 from app.core.datetime_utils import _utc_now, _utc_now_iso
@@ -73,6 +73,12 @@ class MetricsCollector:
         """
         if BENCHMARK_READONLY:
             return
+        try:
+            from app.ops.local_contention import record_local_contention_metric
+
+            record_local_contention_metric(metric_name, value, labels)
+        except Exception:
+            pass
         self._buffer.append(
             {
                 "timestamp": _utc_now_iso(),
@@ -202,6 +208,72 @@ class MetricsCollector:
         except Exception as e:
             logger.warning("Metrics aggregate query failed: %s", e)
             return {"count": 0, "avg": 0, "min": 0, "max": 0, "p50": 0, "p95": 0, "p99": 0}
+
+    def query_aggregate_with_recency(
+        self,
+        metric_name: str,
+        since: str | None = None,
+    ) -> dict:
+        """Query aggregate stats plus timestamp/age metadata for a metric."""
+        self.flush()
+
+        if since is None:
+            since = (_utc_now() - timedelta(hours=1)).isoformat()
+
+        empty = {
+            "count": 0,
+            "avg": 0,
+            "min": 0,
+            "max": 0,
+            "p50": 0,
+            "p95": 0,
+            "p99": 0,
+            "oldest_timestamp": None,
+            "newest_timestamp": None,
+            "max_timestamp": None,
+            "max_age_seconds": None,
+            "window_seconds": 3600,
+        }
+        try:
+            rows = self.query(metric_name, since=since, limit=100000)
+            if not rows:
+                return dict(empty)
+
+            sorted_rows = sorted(rows, key=lambda row: (float(row.get("value", 0.0) or 0.0), str(row.get("timestamp", ""))))
+            values = [float(row.get("value", 0.0) or 0.0) for row in sorted_rows]
+            timestamps = [str(row.get("timestamp", "")) for row in sorted_rows]
+            n = len(values)
+            max_value = values[-1]
+            max_timestamp = max(ts for ts, value in zip(timestamps, values, strict=False) if value == max_value)
+
+            def _age_seconds(timestamp: str | None) -> float | None:
+                if not timestamp:
+                    return None
+                try:
+                    parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+                except ValueError:
+                    return None
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=UTC)
+                return round(max(0.0, (_utc_now() - parsed.astimezone(UTC)).total_seconds()), 2)
+
+            return {
+                "count": n,
+                "avg": round(sum(values) / n, 2),
+                "min": round(values[0], 2),
+                "max": round(max_value, 2),
+                "p50": round(values[int(n * 0.50)], 2),
+                "p95": round(values[min(int(n * 0.95), n - 1)], 2),
+                "p99": round(values[min(int(n * 0.99), n - 1)], 2),
+                "oldest_timestamp": min(timestamps),
+                "newest_timestamp": max(timestamps),
+                "max_timestamp": max_timestamp,
+                "max_age_seconds": _age_seconds(max_timestamp),
+                "window_seconds": 3600,
+            }
+        except Exception as e:
+            logger.warning("Metrics aggregate recency query failed: %s", e)
+            return dict(empty)
 
     def query_count(
         self,

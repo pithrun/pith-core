@@ -1148,12 +1148,28 @@ async def run_ka_reclassification(conn, batch_size: int = 50, full_corpus: bool 
     from app.cognitive.taxonomy import classify_ka_by_embedding
     # DEBT-107: _ensure_canonical_ka_embeddings removed — called internally by classify_ka_by_embedding
 
-    # Fetch batch: prioritize "unclassified" (newer) over "general" (legacy)
+    # Fetch batch: prioritize unresolved admission states over legacy general rows.
     # TOOLING-023: full_corpus bypasses LIMIT for one-shot corpus-wide runs
     _base_sql = """SELECT id, summary, embedding, knowledge_area
            FROM concepts
            WHERE is_current = 1 AND status = 'active'
-             AND knowledge_area IN ('general', 'unclassified')
+             AND (
+                (
+                    knowledge_area = 'unclassified'
+                    AND COALESCE(json_extract(data, '$.metadata.ka_admission_state'), '') IN (
+                        'queued_unclassified',
+                        'fallback_failure'
+                    )
+                )
+                OR (
+                    knowledge_area = 'general'
+                    AND COALESCE(json_extract(data, '$.metadata.ka_admission_state'), '') NOT IN (
+                        'intentional_general',
+                        'deterministic_ambiguous'
+                    )
+                    AND COALESCE(json_extract(data, '$.metadata.knowledge_area_review'), '') != 'deterministic_ambiguous'
+                )
+             )
              AND summary IS NOT NULL AND length(summary) > 20
            ORDER BY
              CASE WHEN knowledge_area = 'unclassified' THEN 0 ELSE 1 END,
@@ -1252,6 +1268,9 @@ async def run_ka_reclassification(conn, batch_size: int = 50, full_corpus: bool 
                     data["metadata"]["knowledge_area"] = new_ka
                     data["metadata"]["knowledge_area_source"] = ka_source
                     data["metadata"]["ka_confidence"] = ka_confidence
+                    data["metadata"]["ka_admission_state"] = "classified"
+                    data["metadata"]["ka_admission_source"] = ka_source
+                    data["metadata"]["ka_admission_at"] = _utc_now_iso()
                     data["metadata"]["ka_reclassified_from"] = old_ka
                     data["metadata"]["ka_reclassified_at"] = _utc_now_iso()
                     # KA-006: Route through write gateway for column sync

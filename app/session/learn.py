@@ -12,7 +12,7 @@ import time
 import uuid
 import re as _re
 from datetime import UTC, datetime, timedelta
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from app.core.constants import (
     FRESHNESS_EARLIER_TODAY_UPPER,
@@ -58,6 +58,12 @@ from app.core.models import (
     SessionStartResponse,
 )
 from app.cognitive.branch_provenance_population import preserve_or_build_branch_provenance
+from app.cognitive.ka_admission import resolve_ka_admission
+from app.cognitive.taxonomy import (  # DEBT-030/DEBT-108
+    classify_knowledge_area,
+    infer_knowledge_area,
+    normalize_knowledge_area_boundary,
+)
 from app.session.self_model import self_model_manager
 from app.storage import (
     _get_connection,
@@ -79,17 +85,16 @@ from app.storage import (
     save_session,
     update_session,
 )
-from app.cognitive.taxonomy import (  # DEBT-030/DEBT-108
-    classify_knowledge_area,
-    infer_knowledge_area,
-    normalize_knowledge_area_boundary,
-)
 
 from app.session.helpers import _extract_subject_key, _has_named_entities, _validate_concept_type
+from app.session.exact_detail_packet_metadata import normalise_exact_detail_packet_metadata
 from app.session.grouped_count_packet_metadata import normalise_grouped_count_packet_metadata
 
 logger = logging.getLogger(__name__)
 
+if TYPE_CHECKING:
+    from app.cognitive.retrospective import ConversationProcessor
+
 # Module-level counter for precision guard observability (used via `global` in methods)
 _PRECISION_GUARD_BLOCKS: int = 0
 
@@ -98,6 +103,130 @@ logger = logging.getLogger(__name__)
 
 # Module-level counter for precision guard observability (used via `global` in methods)
 _PRECISION_GUARD_BLOCKS: int = 0
+
+def _missing_learning_event_delta(
+    *,
+    learning_events: int,
+    baseline_count: int | None,
+    current_count: int | None,
+) -> int:
+    """Return accepted learning events not already persisted for a session."""
+    if learning_events <= 0:
+        return 0
+    baseline = max(0, int(baseline_count or 0))
+    current = max(0, int(current_count or 0))
+    already_counted = max(0, current - baseline)
+    return max(0, learning_events - already_counted)
+
+_TOOL_PARAMETER_BLOCK_RE = _re.compile(
+    r"<parameter\s+name=(['\"])[A-Za-z0-9_.:-]+\1\s*>.*?</parameter>",
+    _re.IGNORECASE | _re.DOTALL,
+)
+_STRUCTURED_CONCEPTS_PAYLOAD_KEY_RE = _re.compile(
+    r"(?i)([\"']?extracted_concepts_json[\"']?\s*[:=])"
+)
+
+
+def _strip_tool_parameter_blocks(text: str | None) -> str:
+    """Remove tool-call parameter envelopes before heuristic learning.
+
+    Raw payload storage remains lossless; this only protects prose-based
+    extraction from treating serialized tool inputs as conversation text.
+    """
+    if not text:
+        return ""
+    return _TOOL_PARAMETER_BLOCK_RE.sub(" ", text)
+
+
+def sanitize_raw_learning_text(text: str | None) -> str:
+    """Remove lifecycle/tool payload envelopes before prose extraction.
+
+    Structured ``extracted_concepts_json`` remains authoritative through
+    ``SessionLearnRequest.extracted_concepts``. This sanitizer only protects
+    heuristic/LLM extraction from learning serialized client payload text.
+    """
+    if not text:
+        return ""
+    sanitized = _strip_tool_parameter_blocks(text)
+    sanitized = _remove_structured_concepts_payloads(sanitized)
+    return sanitized
+
+
+def _remove_structured_concepts_payloads(text: str) -> str:
+    output: list[str] = []
+    cursor = 0
+    while True:
+        match = _STRUCTURED_CONCEPTS_PAYLOAD_KEY_RE.search(text, cursor)
+        if not match:
+            output.append(text[cursor:])
+            break
+        output.append(text[cursor:match.start()])
+        skip_to = _skip_payload_value(text, match.end())
+        output.append(" [structured concepts omitted] ")
+        cursor = skip_to
+    return "".join(output)
+
+
+def _skip_payload_value(text: str, index: int) -> int:
+    length = len(text)
+    while index < length and text[index].isspace():
+        index += 1
+    if index < length and text[index] in "'\"":
+        quote = text[index]
+        index += 1
+        while index < length:
+            if text[index] == "\\":
+                index += 2
+                continue
+            if text[index] == quote:
+                return index + 1
+            index += 1
+        return length
+    if index < length and text[index] in "[{":
+        pairs = {"[": "]", "{": "}"}
+        stack = [pairs[text[index]]]
+        index += 1
+        in_quote: str | None = None
+        while index < length and stack:
+            ch = text[index]
+            if in_quote:
+                if ch == "\\":
+                    index += 2
+                    continue
+                if ch == in_quote:
+                    in_quote = None
+                index += 1
+                continue
+            if ch in "'\"":
+                in_quote = ch
+            elif ch in "[{":
+                stack.append(pairs[ch])
+            elif ch == stack[-1]:
+                stack.pop()
+            index += 1
+        return index
+    newline = text.find("\n", index)
+    return length if newline == -1 else newline
+
+
+_KNOWN_BAD_OPENROUTER_MODELS = frozenset({"google/gemini-2.0-flash-001"})
+
+
+def _is_known_bad_openrouter_model(model: str | None) -> bool:
+    return str(model or "").strip().lower() in _KNOWN_BAD_OPENROUTER_MODELS
+
+
+def _record_known_bad_model_metric(source: str, model: str | None) -> None:
+    try:
+        from app.ops.metrics import metrics as _kb_metrics
+
+        _kb_metrics.record(
+            "extraction_llm_failure",
+            1.0,
+            {"source": source, "reason": "known_bad_model", "model": str(model or "unknown")},
+        )
+    except Exception:
+        pass
 
 
 _PREFERENCE_FACET_ALLOWED_KEYS = frozenset(
@@ -716,6 +845,7 @@ class SessionLearnMixin:
           Step 7: Store + bookkeeping + response
         """
         t0 = time.perf_counter()
+        _phase_marks: dict[str, float] = {"start": t0}
 
         from app.retrieval import retrieval_engine
         from app.cognitive.retrospective import ConversationProcessor
@@ -760,6 +890,17 @@ class SessionLearnMixin:
         else:
             self._resolve_session_learn_request_session(request)
 
+        _counter_sid_baseline = request.session_id or (
+            self.current_session.session_id if self.current_session else None
+        )
+        _counter_learning_event_baseline: int | None = None
+        if _counter_sid_baseline:
+            from app.storage.sessions import get_session_counts
+
+            _baseline_counts = get_session_counts(_counter_sid_baseline)
+            if _baseline_counts is not None:
+                _counter_learning_event_baseline = _baseline_counts.get("learning_event_count", 0)
+
         # --- Step 1: Rate limit + text preparation ---
         allowed, retry_after = self._check_rate_limit()
         if not allowed:
@@ -785,14 +926,126 @@ class SessionLearnMixin:
                 budget_warnings=[f"rate_limit_exceeded: retry after {retry_after}s"],
                 concepts_superseded=0,
                 supersession_details=[],
+                accepted_learning_events=0,
+                learning_capture_state="error",
+                session_linkage_state="unbound" if not request.session_id else "linked",
             )
 
-        combined_text = self._prepare_text(request.user_message, request.assistant_response)
+        extraction_user_message = sanitize_raw_learning_text(request.user_message)
+        extraction_assistant_response = sanitize_raw_learning_text(request.assistant_response)
+        combined_text = self._prepare_text(extraction_user_message, extraction_assistant_response)
+        heuristic_assistant_response = extraction_assistant_response
+        heuristic_combined_text = self._prepare_text(extraction_user_message, heuristic_assistant_response)
         _benchmark_mode = _session_learn_benchmark_mode_active()
         if _benchmark_mode:
             _normalise_session_learn_observation_timestamp(request)
         _benchmark_fastpath = _benchmark_mode and bool(getattr(request, "benchmark_ingest_fastpath", False))
+        _replay_fast_path = bool(getattr(request, "replay_fast_path", False)) and bool(request.extracted_concepts)
+        if _replay_fast_path:
+            request.auto_associate = False
+            budget_warnings.append(
+                "replay_fast_path: persisted structured concepts; deferred heuristic extraction and association enrichment"
+            )
         budget_remaining = self._check_daily_budget()
+        from app.core import config as _learn_config
+
+        _wall_budget_ms = int(getattr(_learn_config, "AUTOLEARN_WALL_BUDGET_MS", getattr(_learn_config, "AUTOLEARN_MAX_BUDGET_MS", 15000)))
+        _wall_budget_exhausted = False
+
+        def _wall_elapsed_ms() -> float:
+            return (time.perf_counter() - t0) * 1000
+
+        def _wall_budget_exhausted_at(stage: str) -> bool:
+            nonlocal _wall_budget_exhausted
+            if _benchmark_mode:
+                return False
+            elapsed_ms = _wall_elapsed_ms()
+            if elapsed_ms <= _wall_budget_ms:
+                return False
+            if not _wall_budget_exhausted:
+                _wall_budget_exhausted = True
+                budget_warnings.append(
+                    f"autolearn_wall_budget: stage={stage} elapsed_ms={elapsed_ms:.0f} budget_ms={_wall_budget_ms}"
+                )
+                try:
+                    from app.ops.metrics import metrics as _wall_metrics
+
+                    _wall_metrics.record("autolearn_wall_budget_exhausted", 1.0, {"stage": stage})
+                except Exception:
+                    pass
+            return True
+
+        def _mark_phase(name: str) -> None:
+            _phase_marks[name] = time.perf_counter()
+
+        def _phase_durations_ms() -> dict[str, float]:
+            ordered = [
+                ("tier2", "start", "after_tier2"),
+                ("tier1", "after_tier2", "after_tier1"),
+                ("demographic_enrichment", "after_tier1", "after_demographic_enrichment"),
+                ("cross_tier_dedup", "after_demographic_enrichment", "after_cross_tier_dedup"),
+                ("quality_cap", "after_cross_tier_dedup", "after_quality_cap"),
+                ("verbatim_mapping", "after_quality_cap", "after_verbatim_mapping"),
+                ("batch_dedup", "after_verbatim_mapping", "after_batch_dedup"),
+                ("insight_processing", "after_batch_dedup", "after_insight_processing"),
+                ("event_extraction_submit", "after_insight_processing", "after_event_extraction"),
+                ("conversation_verbatim", "after_event_extraction", "after_conversation_verbatim"),
+                ("trace_wave", "after_conversation_verbatim", "after_trace_wave"),
+                ("prediction_wave", "after_trace_wave", "after_prediction_wave"),
+                ("thread_autolink", "after_prediction_wave", "after_thread_autolink"),
+            ]
+            durations: dict[str, float] = {}
+            for phase, start_key, end_key in ordered:
+                start = _phase_marks.get(start_key)
+                end = _phase_marks.get(end_key)
+                if start is not None and end is not None and end >= start:
+                    durations[phase] = round((end - start) * 1000, 2)
+            return durations
+
+        def _learning_metric_labels(elapsed_ms: float) -> dict[str, str]:
+            phase_durations = _phase_durations_ms()
+            dominant_phase = "unknown"
+            if phase_durations:
+                dominant_phase = max(phase_durations.items(), key=lambda item: item[1])[0]
+            maintenance_source = "replay_fast_path" if _replay_fast_path else "session_learn"
+            return {
+                "replay_fast_path": str(bool(_replay_fast_path)).lower(),
+                "benchmark_fastpath": str(bool(_benchmark_fastpath)).lower(),
+                "extracted_count": str(len(request.extracted_concepts or [])),
+                "tier1_count": str(len(tier1_insights)),
+                "tier2_count": str(len(tier2_insights)),
+                "merged_count": str(len(merged_insights)),
+                "created_count": str(len(concepts_created)),
+                "evolved_count": str(len(concepts_evolved)),
+                "auto_associate": str(bool(request.auto_associate)).lower(),
+                "budget_exhausted": str(bool(_budget_exhausted or _wall_budget_exhausted)).lower(),
+                "maintenance_source": maintenance_source,
+                "dominant_phase": dominant_phase,
+                "verbatim_attach_source": _verbatim_attach_source,
+                "verbatim_fragment_count": str(_verbatim_fragment_count),
+                "elapsed_bucket": "high" if elapsed_ms >= 15000 else "normal",
+            }
+
+        def _record_learning_latency_metrics(elapsed_ms: float) -> None:
+            try:
+                from app.ops.metrics import metrics as _learning_metrics
+
+                labels = _learning_metric_labels(elapsed_ms)
+                _learning_metrics.record("session_learn_latency_ms", elapsed_ms, labels)
+                _learning_metrics.record("learn_pipeline_latency_ms", elapsed_ms, labels)
+                for phase, value in _phase_durations_ms().items():
+                    _learning_metrics.record(
+                        "session_learn_phase_timing_ms",
+                        value,
+                        {
+                            "phase": phase,
+                            "replay_fast_path": labels["replay_fast_path"],
+                            "dominant_phase": labels["dominant_phase"],
+                            "maintenance_source": labels["maintenance_source"],
+                        },
+                    )
+            except Exception:
+                pass  # Metrics are best-effort
 
         # --- Step 2: Tier 2 processing (client-extracted concepts) ---
         tier2_insights = []
@@ -835,7 +1088,7 @@ class SessionLearnMixin:
             # Facts are pre-validated by pith_agent; garbage detection is harmful here.
             from app.core.config import BENCHMARK as _bm_gc
             if valid_concepts:
-                if _bm_gc.skip_garbage_detection:
+                if _replay_fast_path or _bm_gc.skip_garbage_detection:
                     survivors, rejections = valid_concepts, []
                 else:
                     survivors, rejections = GarbageDetector.detect_batch(valid_concepts, combined_text)
@@ -907,16 +1160,21 @@ class SessionLearnMixin:
                             "metadata": client_metadata,
                         }
                     )
+        _wall_budget_exhausted_at("after_tier2")
+        _mark_phase("after_tier2")
 
         # --- Step 3: Tier 1 processing (heuristic extraction) ---
         tier1_insights = []
-        if _benchmark_fastpath:
-            logger.info("BENCH-FASTPATH: skipping Tier 1 heuristic extraction during diagnostic benchmark ingest")
-        elif len(combined_text) >= 50:
+        if _wall_budget_exhausted_at("before_tier1"):
+            logger.warning("session_learn: wall budget reached before Tier 1; preserving client concepts and skipping heuristic extraction")
+        elif _benchmark_fastpath or _replay_fast_path:
+            path = "replay fast path" if _replay_fast_path else "diagnostic benchmark ingest"
+            logger.info("FASTPATH: skipping Tier 1 heuristic extraction during %s", path)
+        elif len(heuristic_combined_text) >= 50:
             processor = ConversationProcessor()
             raw_insights = self._extract_insights(
-                processor, combined_text,
-                assistant_text=request.assistant_response or None,
+                processor, heuristic_combined_text,
+                assistant_text=heuristic_assistant_response or None,
             )
             for ins in raw_insights:
                 ins.setdefault("extraction_source", "heuristic")  # DATA-068: preserve factual_scan
@@ -933,13 +1191,18 @@ class SessionLearnMixin:
                     else:
                         ins["knowledge_area"] = "general"
             tier1_insights = raw_insights
+        _wall_budget_exhausted_at("after_tier1")
+        _mark_phase("after_tier1")
 
         # EXTRACT-C2: Run demographic safety net on combined Tier 1+2 before dedup
         all_pre_dedup = list(tier2_insights) + tier1_insights
-        user_msg = request.user_message or ""
-        asst_msg = request.assistant_response or ""
-        if _benchmark_fastpath:
-            logger.info("BENCH-FASTPATH: skipping demographic safety net during diagnostic benchmark ingest")
+        user_msg = extraction_user_message
+        asst_msg = heuristic_assistant_response
+        if _wall_budget_exhausted_at("before_demographic_enrichment"):
+            logger.warning("session_learn: wall budget reached before demographic enrichment; preserving extracted concepts")
+        elif _benchmark_fastpath or _replay_fast_path:
+            path = "replay fast path" if _replay_fast_path else "diagnostic benchmark ingest"
+            logger.info("FASTPATH: skipping demographic safety net during %s", path)
         elif user_msg or asst_msg:
             enriched = self._ensure_demographic_facts(all_pre_dedup, user_msg, asst_msg)
             # Any newly injected concepts go into tier1 bucket
@@ -949,6 +1212,8 @@ class SessionLearnMixin:
                 if not nd.get("knowledge_area") or nd["knowledge_area"] == "general":
                     nd["knowledge_area"] = "personal"
             tier1_insights.extend(new_demographic)
+        _wall_budget_exhausted_at("after_demographic_enrichment")
+        _mark_phase("after_demographic_enrichment")
 
         # --- Step 4: Cross-tier dedup ---
         # If both tiers produced insights, remove Tier 1 duplicates of Tier 2
@@ -969,6 +1234,9 @@ class SessionLearnMixin:
                 merged_insights.append(t1)
         elif tier1_insights:
             merged_insights = tier1_insights
+        if _wall_budget_exhausted_at("after_cross_tier_dedup"):
+            logger.warning("session_learn: wall budget reached after dedup; preserving merged concepts for core persistence")
+        _mark_phase("after_cross_tier_dedup")
 
         # --- Step 5: Quality ranking + combined cap at 7 ---
         def quality_score(insight):
@@ -984,6 +1252,9 @@ class SessionLearnMixin:
         # Production default is 7 to bound per-call latency.
         _max_insights_per_call = int(os.environ.get("PITH_MAX_INSIGHTS_PER_CALL", "7"))
         merged_insights = merged_insights[:_max_insights_per_call]
+        if _wall_budget_exhausted_at("after_quality_cap"):
+            logger.warning("session_learn: wall budget reached after quality cap; preserving capped concepts for core persistence")
+        _mark_phase("after_quality_cap")
 
         # --- INGEST-037 Phase 2a: Verbatim fragment auto-extraction ---
         # Detect high-info fragments (code, SQL, formulas, quotes) in the raw text
@@ -992,12 +1263,16 @@ class SessionLearnMixin:
         # _create_new_concept.
         try:
             from app.core.config import get_feature_flag
-            if get_feature_flag("VERBATIM_AUTO_EXTRACT_ENABLED", False):
+            if (
+                not _replay_fast_path
+                and not _wall_budget_exhausted_at("before_verbatim_mapping")
+                and get_feature_flag("VERBATIM_AUTO_EXTRACT_ENABLED", False)
+            ):
                 from app.cognitive.verbatim_detect import (
                     detect_verbatim_fragments,
                     match_fragments_to_insights,
                 )
-                _vf_fragments = detect_verbatim_fragments(combined_text)
+                _vf_fragments = detect_verbatim_fragments(heuristic_combined_text)
                 if _vf_fragments and merged_insights:
                     _vf_mapping = match_fragments_to_insights(
                         _vf_fragments, merged_insights
@@ -1021,6 +1296,7 @@ class SessionLearnMixin:
                 "INGEST-037: Verbatim auto-extraction failed (non-fatal): %s",
                 _vf_err,
             )
+        _mark_phase("after_verbatim_mapping")
 
         if not merged_insights:
             # INGEST-043: Capture verbatim even when no insights extracted.
@@ -1050,7 +1326,7 @@ class SessionLearnMixin:
                                     "for %d session concepts (%.0fms elapsed)",
                                     len(_conv_frag_ids), len(_early_ids), _elapsed_early_ms,
                                 )
-                        else:
+                        elif not _wall_budget_exhausted_at("pre_orphan_verbatim_capture"):
                             # No concept IDs at all — write directly to fts_verbatim
                             import uuid as _uuid043e
                             _orphan_fid = f"vf_orphan_{_uuid043e.uuid4().hex[:12]}"
@@ -1088,6 +1364,15 @@ class SessionLearnMixin:
                 )
 
             elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
+            _mark_phase("after_batch_dedup")
+            _mark_phase("after_insight_processing")
+            _mark_phase("after_event_extraction")
+            _mark_phase("after_conversation_verbatim")
+            _mark_phase("after_trace_wave")
+            _mark_phase("after_prediction_wave")
+            _mark_phase("after_thread_autolink")
+            _budget_exhausted = False
+            _record_learning_latency_metrics(elapsed_ms)
             return SessionLearnResponse(
                 concepts_created=[],
                 concepts_evolved=[],
@@ -1112,11 +1397,15 @@ class SessionLearnMixin:
         # Replaces N sequential encode+search+DB calls with 1 batch encode + 1 WHERE IN query.
         # Falls back to per-call search if batch fails (graceful degradation).
         _batch_dedup: list[list[dict]] | None = None
+        if _wall_budget_exhausted_at("before_batch_dedup_precompute"):
+            logger.warning("session_learn: wall budget reached before batch dedup; using per-insight fallback for core persistence")
         try:
             from app.core.config import FEATURE_FLAGS as _perf021_ff
 
             _perf021_use_embedding = _perf021_ff.get("EMBEDDING_DEDUP_ENABLED", False)
-            if len(merged_insights) > 1:
+            if _replay_fast_path:
+                budget_warnings.append("replay_fast_path: deferred batch dedup precompute")
+            elif len(merged_insights) > 1:
                 _batch_summaries = [i.get("summary", "") for i in merged_insights]
                 if _perf021_use_embedding:
                     # PERF-036: Batch embedding dedup
@@ -1130,6 +1419,9 @@ class SessionLearnMixin:
         except Exception as _perf021_e:
             logger.warning(f"PERF-021/036: batch dedup pre-compute failed, falling back to per-call: {_perf021_e}")
             _batch_dedup = None
+        if _wall_budget_exhausted_at("after_batch_dedup_precompute"):
+            logger.warning("session_learn: wall budget reached after batch dedup; preserving concepts for core persistence")
+        _mark_phase("after_batch_dedup")
 
         # --- Step 6-7: Process each insight through dedup + create/evolve ---
         # PERF-038: Separate overhead timer from per-insight timer.
@@ -1163,9 +1455,10 @@ class SessionLearnMixin:
         self._cached_association_triples = set()
         _benchmark_no_budget = os.environ.get("PITH_BENCHMARK_MODE", "").lower() in ("true", "1")
         for idx, insight in enumerate(merged_insights):
+            _insight_elapsed_ms = (time.perf_counter() - t_insights) * 1000
+            _wall_budget_exhausted_at("before_process_single_insight")
             # PERF-038: Time budget check — uses insight-only timer (excludes pipeline overhead).
             # Always process first insight regardless of budget.
-            _insight_elapsed_ms = (time.perf_counter() - t_insights) * 1000
             if idx > 0 and _insight_elapsed_ms > _effective_budget and not _benchmark_no_budget:
                 _skipped_count = len(merged_insights) - idx
                 logger.warning(
@@ -1229,6 +1522,7 @@ class SessionLearnMixin:
             except Exception as e:
                 logger.error(f"session_learn: insight processing failed: {e}")
                 errors += 1
+        _mark_phase("after_insight_processing")
 
         # --- INGEST-034: Fire background event extraction ---
         from app.core.config import EE_ENABLED, EE_MIN_CONVERSATION_LENGTH
@@ -1237,7 +1531,9 @@ class SessionLearnMixin:
             not _benchmark_mode
             and EE_ENABLED
             and concepts_created
-            and len(combined_text) >= EE_MIN_CONVERSATION_LENGTH
+            and len(heuristic_combined_text) >= EE_MIN_CONVERSATION_LENGTH
+            and not _replay_fast_path
+            and not _wall_budget_exhausted_at("before_event_extraction")
         ):
             _ee_concept_ids = [lc.concept_id for lc in concepts_created]
             import concurrent.futures as _cf_ee
@@ -1247,16 +1543,17 @@ class SessionLearnMixin:
                 )
             self._event_executor.submit(
                 self._extract_events,
-                combined_text,
+                heuristic_combined_text,
                 _ee_concept_ids,
                 request.session_id,
             )
             logger.info(
                 f"INGEST-034: Event extraction fired for {len(_ee_concept_ids)} concepts "
-                f"(text_len={len(combined_text)})"
+                f"(text_len={len(heuristic_combined_text)})"
             )
         elif _benchmark_mode:
             logger.info("INGEST-034: Skipped event extraction in benchmark mode")
+        _mark_phase("after_event_extraction")
 
         # --- INGEST-038: Capture raw conversation text as verbatim fragments ---
         # CRITICAL: Use request.user_message / request.assistant_response (raw client input),
@@ -1308,7 +1605,12 @@ class SessionLearnMixin:
                                 _attach_source,
                                 _elapsed_total_ms,
                             )
-                    elif not _attach_ids and request.user_message and request.assistant_response:
+                    elif (
+                        not _attach_ids
+                        and request.user_message
+                        and request.assistant_response
+                        and not _wall_budget_exhausted_at("pre_orphan_verbatim_capture")
+                    ):
                         # INGEST-043: No concept IDs at all (first call, dedup skipped).
                         # Write directly to fts_verbatim for R080 keyword retrieval.
                         # No verbatim_fragments row — this is retrieval-only, not concept-linked.
@@ -1349,6 +1651,7 @@ class SessionLearnMixin:
                     "INGEST-038: Conversation capture failed (non-fatal): %s",
                     _conv_err,
                 )
+        _mark_phase("after_conversation_verbatim")
         # EUNOMIA-040 Fix 5: Budget-gated skip path removed.
         # Verbatim capture always runs. No more permanent text loss.
 
@@ -1357,12 +1660,7 @@ class SessionLearnMixin:
         elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
 
         # OBS-03: emit session_learn latency to metrics DB (mirrors conversation_turn pattern)
-        try:
-            from app.ops.metrics import metrics as _sl_metrics
-
-            _sl_metrics.record("session_learn_latency_ms", elapsed_ms)
-        except Exception:
-            pass  # Metrics are best-effort
+        # LOCAL-LIVENESS: emitted after final labels are known.
 
         # Deduplicate budget_warnings
         budget_warnings = list(dict.fromkeys(budget_warnings))
@@ -1375,21 +1673,44 @@ class SessionLearnMixin:
         _counter_sid = request.session_id or (
             self.current_session.session_id if self.current_session else None
         )
+        _counter_commit_rejected = False
         if _counter_sid and learning_events > 0:
-            # Fetch current counters from DB to avoid stale in-memory state
-            from app.storage.sessions import get_session_counts
-            _current_counts = get_session_counts(_counter_sid)
-            _new_created = (_current_counts.get("concepts_created", 0) or 0) + len(concepts_created)
-            _new_evolved = (_current_counts.get("concepts_evolved", 0) or 0) + len(concepts_evolved)
-            update_session(
-                _counter_sid,
-                concepts_created=_new_created,
-                concepts_evolved=_new_evolved,
+            from app.storage.sessions import get_session_counts, record_session_learning_commit
+
+            _pre_commit_counts = get_session_counts(_counter_sid)
+            _pre_commit_learning_count = (
+                _pre_commit_counts.get("learning_event_count", 0)
+                if _pre_commit_counts is not None
+                else None
             )
+            _baseline_learning_count = (
+                _counter_learning_event_baseline
+                if _counter_sid == _counter_sid_baseline
+                else None
+            )
+            _learning_event_delta = _missing_learning_event_delta(
+                learning_events=learning_events,
+                baseline_count=_baseline_learning_count,
+                current_count=_pre_commit_learning_count,
+            )
+            _updated_counts = record_session_learning_commit(
+                _counter_sid,
+                concepts_created_delta=len(concepts_created),
+                concepts_evolved_delta=len(concepts_evolved),
+                learning_event_delta=_learning_event_delta,
+            )
+            if _updated_counts is None and _learning_event_delta > 0:
+                _counter_commit_rejected = True
             # Keep in-memory state consistent IF this is the current session
-            if self.current_session and self.current_session.session_id == _counter_sid:
-                self.current_session.concepts_created = _new_created
-                self.current_session.concepts_evolved = _new_evolved
+            if (
+                _updated_counts
+                and self.current_session
+                and self.current_session.session_id == _counter_sid
+            ):
+                self.current_session.concepts_created = _updated_counts["concepts_created"]
+                self.current_session.concepts_evolved = _updated_counts["concepts_evolved"]
+                self.current_session.learning_event_count = _updated_counts["learning_event_count"]
+                self.current_session.last_learning_at = _updated_counts.get("last_learning_at")
             # SESSION-LEARN-MISMATCH-001 F3.1: Log when counter attribution is redirected
             elif self.current_session:
                 logger.info(
@@ -1397,13 +1718,41 @@ class SessionLearnMixin:
                     f"{self.current_session.session_id} → {_counter_sid}"
                 )
 
+        accepted_learning_events = learning_events
+        if accepted_learning_events > 0:
+            learning_capture_state = "accepted"
+        elif errors > 0:
+            learning_capture_state = "error"
+        elif garbage_rejected > 0 or rejection_details:
+            learning_capture_state = "rejected"
+        else:
+            learning_capture_state = "zero_learning"
+
+        if _counter_commit_rejected:
+            learning_capture_state = "degraded_terminal_session"
+            session_linkage_state = "terminal_mismatch"
+            session_warning = (
+                (session_warning + "; " if session_warning else "")
+                + f"terminal_session_counter_rejected: session_id={_counter_sid}"
+            )
+        elif session_warning and session_warning.startswith("session_id_mismatch"):
+            session_linkage_state = "mismatch"
+        elif _counter_sid:
+            session_linkage_state = "linked"
+        else:
+            session_linkage_state = "unbound"
+
         untyped_count = sum(1 for i in merged_insights if i.get("was_untyped", False))
 
         # --- Wave 4b: Create learning event trace + set source_trace_id [X2] ---
         try:
             from app.ops.traces import create_trace
 
-            if concepts_created or concepts_evolved:
+            if (
+                (concepts_created or concepts_evolved)
+                and not _replay_fast_path
+                and not _wall_budget_exhausted_at("before_trace_wave")
+            ):
                 concept_ref_ids = [c.concept_id for c in concepts_created] + [c.concept_id for c in concepts_evolved]
                 sid = request.session_id or (self.current_session.session_id if self.current_session else "unknown")
                 trace = create_trace(
@@ -1429,15 +1778,17 @@ class SessionLearnMixin:
                         pass  # Best-effort linkage
         except Exception as e:
             logger.debug(f"Wave 4b: trace creation skipped: {e}")
+        _mark_phase("after_trace_wave")
 
         # --- Wave 4b: Resolve predictions for evolved concepts [FIX I1] ---
         try:
             from app.ops.traces import resolve_predictions_for_concept
 
-            for ec in concepts_evolved:
+            for ec in ([] if _wall_budget_exhausted_at("before_prediction_wave") else concepts_evolved):
                 resolve_predictions_for_concept(ec.concept_id, outcome="revised", outcome_source="evolution")
         except Exception as e:
             logger.debug(f"Wave 4b: prediction resolution skipped: {e}")
+        _mark_phase("after_prediction_wave")
 
         # --- Wave 5: Auto-link new concepts to active threads ---
         try:
@@ -1449,7 +1800,7 @@ class SessionLearnMixin:
             )
             from app.ops.metrics import metrics as _thread_metrics
 
-            active_threads = load_threads(status="active") if concepts_created else []
+            active_threads = load_threads(status="active") if concepts_created and not _wall_budget_exhausted_at("before_thread_autolink") else []
             guardrail_cache = build_thread_guardrail_cache(active_threads) if active_threads else {}
             if active_threads:
                 for lc in concepts_created:
@@ -1490,6 +1841,7 @@ class SessionLearnMixin:
                             )
         except Exception as e:
             logger.debug(f"Wave 5: thread auto-link skipped: {e}")
+        _mark_phase("after_thread_autolink")
 
         logger.info(
             f"session_learn_pipeline: "
@@ -1507,10 +1859,10 @@ class SessionLearnMixin:
             _lo_metrics.record("learn_pipeline_created", float(len(concepts_created)))
             _lo_metrics.record("learn_pipeline_evolved", float(len(concepts_evolved)))
             _lo_metrics.record("learn_pipeline_skipped", float(concepts_skipped + garbage_rejected))
-            _lo_metrics.record("learn_pipeline_latency_ms", elapsed_ms)
             _lo_metrics.record("learn_budget_remaining", float(self._check_daily_budget()))
         except Exception:
             pass  # Metrics are best-effort
+        _record_learning_latency_metrics(elapsed_ms)
 
         # MONITOR-133: session_learn pipeline floor alarm
         _input_count = len(request.extracted_concepts or []) + len(tier1_insights)
@@ -1543,17 +1895,18 @@ class SessionLearnMixin:
                 pass
 
         # PERF-038: Record budget exhaustion metric for monitoring
-        if _budget_exhausted:
+        if _budget_exhausted or _wall_budget_exhausted:
             try:
                 from app.ops.metrics import metrics as _d03_metrics
                 _d03_metrics.record("autolearn_budget_exhausted", 1.0, {"skipped": concepts_skipped})
             except Exception:
                 pass
-            budget_warnings.append(
-                f"autolearn_time_budget: insight_time={_insight_elapsed_ms:.0f}ms exceeded "
-                f"effective_budget={_effective_budget}ms (overhead={_overhead_ms:.0f}ms), "
-                f"{concepts_skipped} insights skipped"
-            )
+            if _budget_exhausted:
+                budget_warnings.append(
+                    f"autolearn_time_budget: insight_time={_insight_elapsed_ms:.0f}ms exceeded "
+                    f"effective_budget={_effective_budget}ms (overhead={_overhead_ms:.0f}ms), "
+                    f"{concepts_skipped} insights skipped"
+                )
 
         return SessionLearnResponse(
             concepts_created=concepts_created,
@@ -1572,6 +1925,9 @@ class SessionLearnMixin:
             session_warning=session_warning,
             concepts_superseded=concepts_superseded,
             supersession_details=supersession_details,
+            accepted_learning_events=accepted_learning_events,
+            learning_capture_state=learning_capture_state,
+            session_linkage_state=session_linkage_state,
         )
 
     def _prepare_text(self, user_message: str, assistant_response: str) -> str:
@@ -1794,6 +2150,11 @@ class SessionLearnMixin:
             )
 
             # Call LLM via OpenRouter (COST-001: switched from Anthropic direct billing to OpenRouter)
+            if _is_known_bad_openrouter_model(TIER3_LLM_MODEL):
+                logger.warning("PERF-LLM: Skipping Tier 3 extraction for known-bad OpenRouter model %s", TIER3_LLM_MODEL)
+                _record_known_bad_model_metric("tier3_extraction", TIER3_LLM_MODEL)
+                return []
+
             from openai import AsyncOpenAI as _AsyncOAI
 
             _or_key = os.environ.get("OPENROUTER_API_KEY", "")
@@ -2749,6 +3110,20 @@ class SessionLearnMixin:
                             f"match={top_match.get('concept_id', 'unknown')}"
                         )
 
+        # RUNG0 Component C (A8): a non-human (loop) turn must not silently reinforce a
+        # HUMAN-authored concept — that would raise human-tier authority/maturity from loop
+        # evidence while the row keeps provenance='human', bypassing the authority cap.
+        # Route EVOLVE→CREATE so the loop's restatement becomes its OWN capped agent_loop
+        # concept. Loop-on-loop (matched concept already agent_loop) still evolves normally.
+        if _dedup_zone == "EVOLVE" and top_match and self._resolve_provenance(request) != "human":
+            _guard_match = load_concept(top_match["concept_id"], track_access=False)
+            if _guard_match is not None and getattr(_guard_match, "provenance", "human") == "human":
+                logger.info(
+                    "RUNG0-C: provenance guard EVOLVE→CREATE — %s turn vs human match %s",
+                    self._resolve_provenance(request), top_match["concept_id"],
+                )
+                _dedup_zone = "CREATE"
+
         # Three-zone dedup logic (thresholds adapt to search method)
         if _dedup_zone == "SKIP":
             return {"action": "skipped_duplicate", "dedup_zone": "SKIP",
@@ -3252,6 +3627,7 @@ class SessionLearnMixin:
             **_normalise_advice_facet_metadata(insight, request),
             **_normalise_selection_facet_metadata(insight, request),
             **normalise_grouped_count_packet_metadata(insight, request),
+            **normalise_exact_detail_packet_metadata(insight, request),
         }
         branch_provenance_metadata = _normalise_branch_provenance_metadata(insight, request)
         grounding_metadata = _normalise_grounding_metadata(insight)
@@ -3398,6 +3774,16 @@ class SessionLearnMixin:
             knowledge_area, ka_source, ka_confidence = classify_knowledge_area(
                 summary=summary, raw_area=raw_area, strict=True
             )
+        knowledge_area, ka_admission_metadata = resolve_ka_admission(
+            summary=summary,
+            knowledge_area=knowledge_area,
+            ka_source=ka_source,
+            ka_confidence=ka_confidence,
+            raw_area=raw_area,
+            extraction_source=extraction_source,
+            trusted_intentional_general=False,
+            now=_utc_now_iso(),
+        )
 
         # S1: Build evidence with extraction_source tag
         evidence_entry = {
@@ -3485,6 +3871,7 @@ class SessionLearnMixin:
             **_normalise_advice_facet_metadata(insight, request),
             **_normalise_selection_facet_metadata(insight, request),
             **normalise_grouped_count_packet_metadata(insight, request),
+            **normalise_exact_detail_packet_metadata(insight, request),
         }
         branch_provenance_metadata = _normalise_branch_provenance_metadata(insight, request)
         grounding_metadata = _normalise_grounding_metadata(insight)
@@ -3516,10 +3903,12 @@ class SessionLearnMixin:
             original_date=_original_date,  # TEMPORAL-002
             edit_provenance=insight.get("edit_provenance"),  # RETRIEVAL-104
             session_id=request.session_id if request.session_id else None,  # AGENT-004
+            provenance=self._resolve_provenance(request),  # RUNG0 Component C (A8): authorship trust-tier
             metadata={
                 "knowledge_area": knowledge_area,
                 "knowledge_area_source": ka_source,
                 "ka_confidence": ka_confidence,  # Float or None. Used by async reclass + trust gating.
+                **ka_admission_metadata,
                 "extraction_source": extraction_source,
                 "created_by": "session_learn",
                 "source_session": request.session_id,
@@ -3691,10 +4080,11 @@ class SessionLearnMixin:
                 kick_autolearn_maintenance_drain,
             )
 
+            maintenance_source = "replay_fast_path" if getattr(request, "replay_fast_path", False) else "session_learn"
             enqueue_autolearn_maintenance(
                 concept_id,
                 new_concept.version,
-                source="session_learn",
+                source=maintenance_source,
                 include_similarity=True,
             )
         except Exception as _maint_err:
@@ -3790,17 +4180,18 @@ class SessionLearnMixin:
         try:
             from app.features.federation import detect_write_conflict
 
-            detect_write_conflict(
-                new_concept_data={
-                    "id": concept_id,
-                    "summary": summary,
-                    "knowledge_area": knowledge_area,
-                    "authority_score": getattr(new_concept, "authority_score", None),
-                    "currency_score": getattr(new_concept, "currency_score", None),
-                    "embedding": getattr(new_concept, "embedding", None),
-                },
-                source_session_id=request.session_id or "",
-            )
+            if not getattr(request, "replay_fast_path", False):
+                detect_write_conflict(
+                    new_concept_data={
+                        "id": concept_id,
+                        "summary": summary,
+                        "knowledge_area": knowledge_area,
+                        "authority_score": getattr(new_concept, "authority_score", None),
+                        "currency_score": getattr(new_concept, "currency_score", None),
+                        "embedding": getattr(new_concept, "embedding", None),
+                    },
+                    source_session_id=request.session_id or "",
+                )
         except Exception as e:
             logger.debug(f"FED-015: Propose conflict check failed (non-fatal): {e}")
 
@@ -3895,6 +4286,11 @@ class SessionLearnMixin:
         from app.cognitive.extraction import build_event_extraction_prompt, parse_event_response
 
         try:
+            if _is_known_bad_openrouter_model(EE_LLM_MODEL):
+                logger.warning("INGEST-034: Skipping event extraction for known-bad OpenRouter model %s", EE_LLM_MODEL)
+                _record_known_bad_model_metric("event_extraction", EE_LLM_MODEL)
+                return
+
             text = combined_text[:EE_MAX_INPUT_CHARS]
             prompt = build_event_extraction_prompt(text)
 
@@ -3993,6 +4389,11 @@ class SessionLearnMixin:
         )
 
         t0 = time.perf_counter()
+
+        if _is_known_bad_openrouter_model(PI_LLM_MODEL):
+            logger.warning("RETRIEVAL-057: Skipping implications for known-bad OpenRouter model %s", PI_LLM_MODEL)
+            _record_known_bad_model_metric("prospective_indexing", PI_LLM_MODEL)
+            return
 
         # Gate 1: Minimum summary length
         if len(summary) < PI_MIN_SUMMARY_LENGTH:
@@ -4167,6 +4568,17 @@ class SessionLearnMixin:
         if self.current_session and getattr(self.current_session, "agent_id", "default") != "default":
             return self.current_session.agent_id
         return "default"
+
+    def _resolve_provenance(self, request) -> str:
+        """RUNG0 Component C (A8): authorship trust-tier from the request, allowlist-guarded.
+
+        Defaults to 'human'. Unknown values collapse to 'human' so a malformed tier can
+        never escape the authority cap by masquerading as a new uncapped value.
+        """
+        from app.core.constants import PROVENANCE_VALUES
+
+        prov = getattr(request, "provenance", "human")
+        return prov if isinstance(prov, str) and prov in PROVENANCE_VALUES else "human"
 
     def _resolve_knowledge_area(self, request: SessionLearnRequest, search_results) -> str:
         """3-tier knowledge area fallback (design gap §11.7).

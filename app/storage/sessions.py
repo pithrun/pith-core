@@ -22,6 +22,7 @@ def save_session(
     agent_id: str = "default",
     model_id: str = "unknown",
     platform_hint: str = "unknown",
+    surface_id: str = "unknown",
     origin_id: str | None = None,
 ) -> None:
     """Insert a new session row."""
@@ -29,8 +30,8 @@ def save_session(
     with _conn._db() as conn:
         conn.execute(
             """INSERT INTO sessions (id, started_at, status, context_hint,
-               learning_event_count, agent_id, data, model_id, platform_hint, origin_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               learning_event_count, agent_id, data, model_id, platform_hint, surface_id, origin_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 session_id,
                 started_at,
@@ -41,6 +42,7 @@ def save_session(
                 json.dumps({"session_id": session_id}),
                 model_id or "unknown",
                 platform_hint or "unknown",
+                surface_id or "unknown",
                 origin_id,
             ),
         )
@@ -60,6 +62,7 @@ def update_session(session_id: str, **kwargs) -> bool:
         "data",
         "model_id",
         "platform_hint",
+        "surface_id",
         "origin_id",
         "last_heartbeat",
         "pressure_score",
@@ -84,17 +87,82 @@ def get_session_counts(session_id: str) -> dict:
     SESSION-LEARN-MISMATCH-001: Used when counter attribution targets a session
     different from self.current_session (whose in-memory counters are stale).
 
-    Returns dict with 'concepts_created' and 'concepts_evolved' keys.
+    Returns dict with 'concepts_created', 'concepts_evolved', and
+    'learning_event_count' keys.
     Returns empty dict if session not found.
     """
     with _conn._db() as conn:
         row = conn.execute(
-            "SELECT concepts_created, concepts_evolved FROM sessions WHERE id = ?",
+            "SELECT concepts_created, concepts_evolved, learning_event_count FROM sessions WHERE id = ?",
             (session_id,),
         ).fetchone()
     if row:
-        return {"concepts_created": row[0], "concepts_evolved": row[1]}
+        return {
+            "concepts_created": int(row[0] or 0),
+            "concepts_evolved": int(row[1] or 0),
+            "learning_event_count": int(row[2] or 0),
+        }
     return {}
+
+
+def record_session_learning_commit(
+    session_id: str,
+    *,
+    concepts_created_delta: int,
+    concepts_evolved_delta: int,
+    learning_event_delta: int | None = None,
+    learned_at: str | None = None,
+    require_active: bool = True,
+) -> dict | None:
+    """Atomically record successful learning output for a session."""
+    if not session_id:
+        return None
+    if concepts_created_delta < 0 or concepts_evolved_delta < 0:
+        raise ValueError("learning counter deltas must be non-negative")
+    if learning_event_delta is not None and learning_event_delta < 0:
+        raise ValueError("learning counter deltas must be non-negative")
+
+    if (
+        concepts_created_delta == 0
+        and concepts_evolved_delta == 0
+        and (learning_event_delta is None or learning_event_delta == 0)
+    ):
+        return get_session_counts(session_id) or None
+
+    learned_at = learned_at or _utc_now_iso()
+    if learning_event_delta is None:
+        learning_event_delta = concepts_created_delta + concepts_evolved_delta
+    where_clause = "WHERE id = ? AND status = 'active'" if require_active else "WHERE id = ?"
+    with _conn._db() as conn:
+        cursor = conn.execute(
+            f"""UPDATE sessions
+               SET concepts_created = COALESCE(concepts_created, 0) + ?,
+                   concepts_evolved = COALESCE(concepts_evolved, 0) + ?,
+                   learning_event_count = COALESCE(learning_event_count, 0) + ?,
+                   last_learning_at = ?
+               {where_clause}""",
+            (
+                concepts_created_delta,
+                concepts_evolved_delta,
+                learning_event_delta,
+                learned_at,
+                session_id,
+            ),
+        )
+        if cursor.rowcount <= 0:
+            return None
+        row = conn.execute(
+            "SELECT concepts_created, concepts_evolved, learning_event_count, last_learning_at FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+    if not row:
+        return None
+    return {
+        "concepts_created": int(row[0] or 0),
+        "concepts_evolved": int(row[1] or 0),
+        "learning_event_count": int(row[2] or 0),
+        "last_learning_at": row[3],
+    }
 
 
 def load_session(session_id: str) -> dict | None:
@@ -103,7 +171,7 @@ def load_session(session_id: str) -> dict | None:
         row = conn.execute(
             "SELECT id, started_at, ended_at, status, learning_event_count, "
             "context_hint, last_learning_at, last_heartbeat, working_context_json, "
-            "agent_id, model_id, platform_hint, origin_id "
+            "agent_id, model_id, platform_hint, surface_id, origin_id "
             "FROM sessions WHERE id = ?",
             (session_id,),
         ).fetchone()
@@ -118,7 +186,7 @@ def load_active_sessions_by_origin(origin_id: str) -> list[dict]:
         rows = conn.execute(
             "SELECT id, started_at, ended_at, status, learning_event_count, "
             "context_hint, last_learning_at, last_heartbeat, working_context_json, "
-            "agent_id, model_id, platform_hint, origin_id "
+            "agent_id, model_id, platform_hint, surface_id, origin_id "
             "FROM sessions WHERE origin_id = ? AND status = 'active' "
             "ORDER BY started_at DESC",
             (origin_id,),

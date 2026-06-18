@@ -10,6 +10,8 @@ MAX_PHASE_KEYS = 16
 MAX_SUBPHASE_KEYS = 24
 MAX_COUNT_KEYS = 24
 MAX_DEADLINE_RECORDS = 20
+MAX_PRESSURE_SOURCES = 4
+MAX_PRESSURE_REASON_CODES = 8
 MAX_STRING_CHARS = 96
 PHASE_PRIORITY_KEYS = (
     "ct_phase_autolearn_ms",
@@ -98,6 +100,19 @@ def _bounded_deadline_records(records: Sequence[Mapping[str, Any]] | None) -> li
     return bounded
 
 
+def _bounded_pressure_state(pressure_state: Mapping[str, Any] | None) -> dict[str, Any]:
+    if not pressure_state:
+        return {}
+    sources = pressure_state.get("active_sources") or []
+    reasons = pressure_state.get("reason_codes") or []
+    return {
+        "active_contention": bool(pressure_state.get("active_contention")),
+        "active_sources": [_clean_string(item) for item in list(sources)[:MAX_PRESSURE_SOURCES]],
+        "pressure_level": _clean_string(pressure_state.get("pressure_level", "unknown")),
+        "reason_codes": [_clean_string(item) for item in list(reasons)[:MAX_PRESSURE_REASON_CODES]],
+    }
+
+
 def build_turn_latency_trace(
     *,
     request_id: str | None,
@@ -107,6 +122,7 @@ def build_turn_latency_trace(
     subphase_ms: Mapping[str, Any],
     counts: Mapping[str, Any],
     answer_path_labels: Mapping[str, Any] | None = None,
+    pressure_state: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a low-cardinality per-turn trace payload for governance events."""
 
@@ -152,4 +168,5 @@ def build_turn_latency_trace(
         "deadline_skips": _bounded_deadline_records(deadline_skips),
         "deadline_overruns": _bounded_deadline_records(deadline_overruns),
         "deadline_phase_modes": _bounded_deadline_records(deadline_phase_modes),
+        "pressure_state": _bounded_pressure_state(pressure_state),
     }

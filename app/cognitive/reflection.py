@@ -8,13 +8,16 @@ Phase 1A D4: Deduplication rewrite (merge pipeline) and confidence
 recalibration (evidence strength scoring). Both share _compute_evidence_strength().
 """
 
+import json
 import logging
 import math
+import os
 import re
 import sqlite3
 import statistics
 import threading
 import time
+import uuid
 from datetime import UTC, datetime, timedelta
 
 from app.core.datetime_utils import _ensure_aware, _utc_now, _utc_now_iso
@@ -31,11 +34,13 @@ from app.storage import (
     apply_lifecycle_transition_conn,
     archive_concept,
     count_orphan_concepts,
+    get_metadata,
     list_concepts,
     list_concepts_full,
     list_concepts_modified_since,
     load_concept,
     save_concept,
+    set_metadata,
 )
 
 
@@ -63,11 +68,22 @@ FORGETTING_SALIENCE_THRESHOLD = 0.15  # Below this = candidate
 FORGETTING_ACCESS_COUNT_THRESHOLD = 2  # Below this = candidate
 FORGETTING_STALENESS_DAYS = 90  # Not accessed in N days = candidate
 MAX_FORGETTING_PER_CYCLE = 50  # REFLECT-005: Safety cap per reflect cycle
+# REFLECT-026: never forget concepts with MEASURED high retrieval utility, even if
+# low-salience/low-access/stale. salience is uncorrelated with utility (corr -0.003),
+# so the salience/access gates alone would archive genuinely useful concepts.
+# Conservative exemption: strictly narrows what is forgotten. Requires real samples.
+FORGETTING_UTILITY_EXEMPT_THRESHOLD = 0.6
 
 # Deduplication merge threshold
 # REFLECT-006: Lowered from 0.92 (unreachable with TF-IDF) to 0.85 (embedding scale)
 MERGE_SIMILARITY_THRESHOLD = 0.85  # Embedding cosine >= 0.85 = refinement merge
 MAX_MERGES_PER_CYCLE = 10  # Safety cap per reflection cycle
+MAX_MERGES_PER_CYCLE_HARD_LIMIT = 5000
+MERGE_CANDIDATE_TOP_K = 5
+MERGE_PROGRESS_SAVE_INTERVAL = 25
+MERGE_SCAN_ORDER = "knowledge_area,id"
+MERGE_STATE_METADATA_KEY = "reflection_merge_state_v1"
+MERGE_STATE_VERSION = 1
 
 # Confidence recalibration
 # Recalibration tuning (post-Tier-1-remediation, 2026-02-18):
@@ -163,6 +179,27 @@ def _batch_update_confidence_stability(updates: list[tuple]) -> int:
         return 0
     except Exception as e:
         logger.error("REFLECT-022: Unexpected batch update error: %s", e)
+        return 0
+
+
+def _batch_stamp_last_decayed_at(ids: list[str], now_iso: str) -> int:
+    """REFLECT-024: Stamp last_decayed_at for decayed concepts (decay-only watermark).
+
+    Separate from _batch_update_confidence_stability (shared by strengthen/recalibrate) so
+    only true decay writes mark the watermark. Writes the top-level SQL column only (the
+    canonical watermark); _db() commits on context exit (same pattern as the shared writer).
+    """
+    if not ids:
+        return 0
+    try:
+        with _db() as conn:
+            conn.executemany(
+                "UPDATE concepts SET last_decayed_at=? WHERE id=?",
+                [(now_iso, cid) for cid in ids],
+            )
+        return len(ids)
+    except Exception as e:
+        logger.warning("REFLECT-024: last_decayed_at stamp failed: %s", e)
         return 0
 
 
@@ -416,6 +453,7 @@ class ReflectionEngine:
         self._current_phase_timings: dict[str, float] | None = None
         self._current_counts: dict[str, int] | None = None
         self._last_completed_step: str | None = None
+        self._current_merge_progress: dict | None = None
 
     def _begin_reflection_run(
         self,
@@ -445,6 +483,7 @@ class ReflectionEngine:
             "concepts_promoted": 0,
         }
         self._last_completed_step = None
+        self._current_merge_progress = None
 
     def _end_reflection_run(self) -> None:
         self._cancel_event = None
@@ -453,6 +492,7 @@ class ReflectionEngine:
         self._current_phase_timings = None
         self._current_counts = None
         self._last_completed_step = None
+        self._current_merge_progress = None
 
     def _record_phase(self, phase_name: str, elapsed_ms: float) -> None:
         if self._current_phase_timings is not None:
@@ -462,6 +502,203 @@ class ReflectionEngine:
     def _record_count(self, key: str, value: int) -> None:
         if self._current_counts is not None:
             self._current_counts[key] = value
+
+    def _merge_cap(self) -> int:
+        raw = os.environ.get("PITH_REFLECTION_MAX_MERGES_PER_CYCLE", "").strip()
+        if not raw:
+            return MAX_MERGES_PER_CYCLE
+        try:
+            requested = int(raw)
+        except ValueError:
+            return MAX_MERGES_PER_CYCLE
+        return max(0, min(requested, MAX_MERGES_PER_CYCLE_HARD_LIMIT))
+
+    def _new_merge_state(self, *, index_size: int) -> dict:
+        pass_started_at = _utc_now_iso()
+        return {
+            "state_version": MERGE_STATE_VERSION,
+            "pass_id": str(uuid.uuid4()),
+            "pass_started_at": pass_started_at,
+            "snapshot_predicate": f"created_at <= {pass_started_at}",
+            "scan_order": MERGE_SCAN_ORDER,
+            "status": "running",
+            "last_seen_id": None,
+            "scanned_count": 0,
+            "eligible_count": 0,
+            "candidate_pairs": 0,
+            "matches_over_threshold": 0,
+            "merges_executed": 0,
+            "fallback_count": 0,
+            "index_size": index_size,
+            "updated_at": pass_started_at,
+            "completed_at": None,
+        }
+
+    def _load_merge_state(self, *, index_size: int) -> dict:
+        raw = get_metadata(MERGE_STATE_METADATA_KEY)
+        try:
+            state = json.loads(raw) if raw else None
+        except Exception:
+            state = None
+
+        if not isinstance(state, dict):
+            return self._new_merge_state(index_size=index_size)
+
+        resumable_statuses = {"running", "paused_cap", "deferred_deadline"}
+        if (
+            state.get("state_version") != MERGE_STATE_VERSION
+            or state.get("scan_order") != MERGE_SCAN_ORDER
+            or state.get("status") not in resumable_statuses
+            or int(state.get("index_size") or 0) != index_size
+            or not state.get("pass_started_at")
+        ):
+            return self._new_merge_state(index_size=index_size)
+
+        state["status"] = "running"
+        state["updated_at"] = _utc_now_iso()
+        state.setdefault("fallback_count", 0)
+        state.setdefault("completed_at", None)
+        return state
+
+    def _save_merge_state(self, state: dict) -> None:
+        state["updated_at"] = _utc_now_iso()
+        self._current_merge_progress = dict(state)
+        set_metadata(MERGE_STATE_METADATA_KEY, json.dumps(state, sort_keys=True))
+
+    def _merge_scan_rows(self, pass_started_at: str) -> list[tuple[str, str]]:
+        with _db() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, knowledge_area
+                FROM concepts
+                WHERE status = 'active'
+                  AND is_current = 1
+                  AND embedding IS NOT NULL
+                  AND created_at <= ?
+                ORDER BY knowledge_area, id
+                """,
+                (pass_started_at,),
+            ).fetchall()
+        return [(row["id"], row["knowledge_area"] or "") for row in rows]
+
+    def _merge_resume_offset(self, scan_rows: list[tuple[str, str]], last_seen_id: str | None) -> int:
+        if not last_seen_id:
+            return 0
+        for idx, (concept_id, _area) in enumerate(scan_rows):
+            if concept_id == last_seen_id:
+                return idx + 1
+        return 0
+
+    def _build_merge_embedding_blocks(self, scan_rows: list[tuple[str, str]], embedding_engine) -> dict[str, dict]:
+        try:
+            import numpy as np
+        except Exception:
+            return {}
+
+        matrix = getattr(embedding_engine, "_index_matrix", None)
+        id_to_pos = getattr(embedding_engine, "_id_to_pos", None)
+
+        grouped: dict[str, list[tuple[str, int]]] = {}
+        if matrix is not None and isinstance(id_to_pos, dict):
+            for concept_id, area in scan_rows:
+                pos = id_to_pos.get(concept_id)
+                if pos is not None:
+                    grouped.setdefault(area or "", []).append((concept_id, pos))
+
+            blocks: dict[str, dict] = {}
+            for area, values in grouped.items():
+                ids = [concept_id for concept_id, _pos in values]
+                positions = np.array([pos for _concept_id, pos in values], dtype=int)
+                blocks[area] = {
+                    "ids": ids,
+                    "matrix": matrix[positions],
+                    "id_to_pos": {concept_id: idx for idx, concept_id in enumerate(ids)},
+                }
+            if blocks:
+                return blocks
+
+        area_by_id = {concept_id: area or "" for concept_id, area in scan_rows}
+        ids = list(area_by_id)
+        embeddings_by_area: dict[str, list[tuple[str, object]]] = {}
+        for start in range(0, len(ids), 500):
+            chunk = ids[start : start + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            with _db() as conn:
+                rows = conn.execute(
+                    f"SELECT id, embedding FROM concepts WHERE id IN ({placeholders}) AND embedding IS NOT NULL",
+                    chunk,
+                ).fetchall()
+            for row in rows:
+                emb = np.frombuffer(row["embedding"], dtype=np.float32).copy()
+                area = area_by_id.get(row["id"], "")
+                embeddings_by_area.setdefault(area, []).append((row["id"], emb))
+
+        blocks = {}
+        for area, values in embeddings_by_area.items():
+            block_ids = [concept_id for concept_id, _emb in values]
+            block_matrix = np.vstack([emb for _concept_id, emb in values]).astype(np.float32)
+            blocks[area] = {
+                "ids": block_ids,
+                "matrix": block_matrix,
+                "id_to_pos": {concept_id: idx for idx, concept_id in enumerate(block_ids)},
+            }
+        return blocks
+
+    def _stored_merge_candidates(
+        self,
+        *,
+        concept_id: str,
+        concept_area: str,
+        embedding_engine,
+        embedding_blocks: dict[str, dict],
+    ) -> list[tuple[str, float]] | None:
+        block = embedding_blocks.get(concept_area or "")
+        if block is None:
+            return None
+        ids = block.get("ids")
+        block_matrix = block.get("matrix")
+        block_id_to_pos = block.get("id_to_pos")
+        if not ids or block_matrix is None or not isinstance(block_id_to_pos, dict):
+            return None
+        pos = block_id_to_pos.get(concept_id)
+        if pos is None:
+            return None
+
+        try:
+            import numpy as np
+
+            scores = block_matrix @ block_matrix[pos]
+            candidate_count = min(MERGE_CANDIDATE_TOP_K + 1, len(ids))
+            if candidate_count <= 0:
+                return []
+            if len(ids) > candidate_count:
+                selected = np.argpartition(scores, -candidate_count)[-candidate_count:]
+            else:
+                selected = np.arange(len(ids))
+            ordered = sorted(selected, key=lambda i: (-float(scores[i]), ids[int(i)]))
+            matches: list[tuple[str, float]] = []
+            for i in ordered:
+                match_id = ids[int(i)]
+                if match_id == concept_id:
+                    continue
+                score = float(scores[int(i)])
+                if score >= MERGE_SIMILARITY_THRESHOLD:
+                    matches.append((match_id, score))
+                if len(matches) >= MERGE_CANDIDATE_TOP_K:
+                    break
+            return matches
+        except Exception:
+            return None
+
+    def _save_concept_with_lock_retry(self, concept: Concept, *, attempts: int = 5) -> None:
+        for attempt in range(attempts):
+            try:
+                save_concept(concept)
+                return
+            except sqlite3.OperationalError as exc:
+                if "database is locked" not in str(exc).lower() or attempt == attempts - 1:
+                    raise
+                time.sleep(0.25 * (attempt + 1))
 
     def _abort_requested(self) -> bool:
         if self._cancel_event is not None and self._cancel_event.is_set():
@@ -500,11 +737,24 @@ class ReflectionEngine:
     ) -> ReflectionSummary:
         counts = self._current_counts or {}
         phase_timings = dict(self._current_phase_timings or {})
+        reason = abort_reason or self._abort_reason()
+        merge_progress = dict(self._current_merge_progress or {})
+        if abort_stage == "merge" and merge_progress:
+            if reason == "deadline_exceeded":
+                merge_progress["status"] = "deferred_deadline"
+                try:
+                    self._save_merge_state(merge_progress)
+                except Exception:
+                    logger.debug("REFLECT-MERGE: Failed to persist deadline merge progress", exc_info=True)
+            elif reason == "merge_cap_reached":
+                merge_progress["status"] = "paused_cap"
         return ReflectionSummary(
             concepts_consolidated=counts.get("concepts_consolidated", 0),
             concepts_decayed=counts.get("concepts_decayed", 0),
             concepts_recalibrated=counts.get("concepts_recalibrated", 0),
             concepts_archived=counts.get("concepts_archived", 0),
+            forgetting_candidates=counts.get("forgetting_candidates", 0),  # REFLECT-025
+            concepts_gc_archived=counts.get("concepts_gc_archived", 0),  # REFLECT-025
             associations_updated=counts.get("associations_updated", 0),
             questions_generated=counts.get("questions_generated", 0),
             timestamp=_utc_now_iso(),
@@ -518,9 +768,21 @@ class ReflectionEngine:
             concepts_currency_recomputed=counts.get("concepts_currency_recomputed", 0),
             concepts_promoted=counts.get("concepts_promoted", 0),
             aborted=True,
-            abort_reason=abort_reason or self._abort_reason(),
+            abort_reason=reason,
             last_completed_step=self._last_completed_step,
             abort_stage=abort_stage,
+            budget_status="deferred" if reason == "deadline_exceeded" else "aborted",
+            deferred_phases=[abort_stage] if abort_stage and reason == "deadline_exceeded" else [],
+            phase_budget_decisions={
+                abort_stage: {
+                    "decision": "deferred",
+                    "reason": reason,
+                    "last_completed_step": self._last_completed_step,
+                }
+            }
+            if abort_stage and reason == "deadline_exceeded"
+            else {},
+            merge_progress=merge_progress,
         )
 
     def should_reflect(self) -> bool:
@@ -618,13 +880,15 @@ class ReflectionEngine:
         _t["cleanup"] = _elapsed_ms(_s)
         self._record_phase("cleanup", _t["cleanup"])
         self._record_count("gc_queue_remaining", gc_remaining)
+        self._record_count("concepts_gc_archived", cleaned)  # REFLECT-025: surface GC archival (was dropped)
         self._check_abort("cleanup")
 
         _s = time.monotonic()
-        forgot = self._apply_forgetting()
+        forgot, forget_candidates = self._apply_forgetting()  # REFLECT-025: + candidate count
         _t["forgetting"] = _elapsed_ms(_s)
         self._record_phase("forgetting", _t["forgetting"])
         self._record_count("concepts_archived", forgot)
+        self._record_count("forgetting_candidates", forget_candidates)  # REFLECT-025
         self._check_abort("forgetting")
 
         if forgot > 0:
@@ -763,6 +1027,8 @@ class ReflectionEngine:
             concepts_decayed=decayed,
             concepts_recalibrated=recalibrated,
             concepts_archived=forgot,
+            forgetting_candidates=forget_candidates,  # REFLECT-025
+            concepts_gc_archived=cleaned,  # REFLECT-025
             associations_updated=auto_associated,
             questions_generated=0,
             timestamp=_utc_now_iso(),
@@ -778,6 +1044,7 @@ class ReflectionEngine:
             evidence_cv_consistency=factor_cvs.get("consistency"),
             evidence_cv_corroboration=factor_cvs.get("corroboration"),
             evidence_cv_recency=factor_cvs.get("recency"),
+            merge_progress=dict(self._current_merge_progress or {}),
         )
 
     def _recompute_currency(self) -> int:
@@ -978,6 +1245,7 @@ class ReflectionEngine:
         _t["cleanup"] = _elapsed_ms(_s)
         self._record_phase("cleanup", _t["cleanup"])
         self._record_count("gc_queue_remaining", gc_remaining)
+        self._record_count("concepts_gc_archived", cleaned)  # REFLECT-025: surface GC archival (was dropped)
         self._check_abort("cleanup")
 
         # REFLECT-004: Recompute salience BEFORE forgetting so it uses real scores
@@ -994,10 +1262,11 @@ class ReflectionEngine:
         self._check_abort("salience")
 
         _s = time.monotonic()
-        forgot = self._apply_forgetting()
+        forgot, forget_candidates = self._apply_forgetting()  # REFLECT-025: + candidate count
         _t["forgetting"] = _elapsed_ms(_s)
         self._record_phase("forgetting", _t["forgetting"])
         self._record_count("concepts_archived", forgot)
+        self._record_count("forgetting_candidates", forget_candidates)  # REFLECT-025
         self._check_abort("forgetting")
 
         # Quarantine graduation sweep (RETRIEVAL-003)
@@ -1029,7 +1298,6 @@ class ReflectionEngine:
         self._check_abort("evidence_backfill")
 
         _s = time.monotonic()
-        self._check_long_step_budget("associations_preflight")
         associations = self._update_associations()
         _t["associations"] = _elapsed_ms(_s)
         self._record_phase("associations", _t["associations"])
@@ -1092,6 +1360,8 @@ class ReflectionEngine:
             concepts_decayed=decayed,
             concepts_recalibrated=recalibrated,
             concepts_archived=forgot,
+            forgetting_candidates=forget_candidates,  # REFLECT-025
+            concepts_gc_archived=cleaned,  # REFLECT-025
             associations_updated=associations,
             questions_generated=0,
             timestamp=_utc_now_iso(),
@@ -1109,6 +1379,7 @@ class ReflectionEngine:
             evidence_cv_consistency=factor_cvs.get("consistency"),
             evidence_cv_corroboration=factor_cvs.get("corroboration"),
             evidence_cv_recency=factor_cvs.get("recency"),
+            merge_progress=dict(self._current_merge_progress or {}),
         )
 
     def _apply_decay(self, _preloaded: list | None = None) -> int:
@@ -1116,23 +1387,46 @@ class ReflectionEngine:
 
         REFLECT-022: Batch SQL pattern — compute in memory, write once.
         """
-        from app.core.config import PSIS_QUARANTINE_CONFIDENCE_CAP, PSIS_QUARANTINE_EVIDENCE_MARKER
+        from app.core.config import (
+            FEATURE_FLAGS,
+            PSIS_QUARANTINE_CONFIDENCE_CAP,
+            PSIS_QUARANTINE_EVIDENCE_MARKER,
+        )
+        # REFLECT-024: read flag once per call (call-time read → kill switch effective per run;
+        # not per-iteration → no hot-loop overhead).
+        delta_enabled = bool(FEATURE_FLAGS.get("REFLECT_DELTA_DECAY", False))
         decayed_count = 0
         batch_updates = []
+        stamp_ids = []  # REFLECT-024: concepts to stamp last_decayed_at (delta path only)
 
         all_concepts = _preloaded if _preloaded is not None else list_concepts_full()
         for idx, concept in enumerate(all_concepts, start=1):
             self._check_abort_every(idx, 100, "decay")
             if not self._validate_concept(concept):
                 continue
+            # Eligibility gate UNCHANGED: idle basis = last_accessed else created_at.
             if concept.last_accessed:
-                last_access = datetime.fromisoformat(concept.last_accessed)
-                days_since = (_utc_now() - _ensure_aware(last_access)).days
+                basis = _ensure_aware(datetime.fromisoformat(concept.last_accessed))
             else:
-                created = datetime.fromisoformat(concept.created_at)
-                days_since = (_utc_now() - _ensure_aware(created)).days
+                basis = _ensure_aware(datetime.fromisoformat(concept.created_at))
+            now = _utc_now()
+            days_since = (now - basis).days
             if days_since > 30:
-                months = days_since / 30
+                if delta_enabled:
+                    # Delta-based: accrue only over the current undecayed idle span.
+                    watermark = basis
+                    if concept.last_decayed_at:
+                        wm = _ensure_aware(datetime.fromisoformat(concept.last_decayed_at))
+                        if wm > watermark:
+                            watermark = wm
+                    months = (now - watermark).days / 30
+                else:
+                    # Legacy absolute-time path (kill switch).
+                    months = days_since / 30
+
+                if months <= 0:
+                    continue  # already decayed up to ~now (idempotent no-op)
+
                 decay_factor = (1 - DECAY_RATE) ** months
                 new_confidence = concept.confidence * decay_factor
                 if new_confidence != concept.confidence:
@@ -1141,11 +1435,14 @@ class ReflectionEngine:
                         new_confidence = min(new_confidence, PSIS_QUARANTINE_CONFIDENCE_CAP)
                     batch_updates.append((new_confidence, None, concept.id))
                     concept.confidence = new_confidence  # SCALE-004: maintain ordering consistency for shared list
+                    if delta_enabled:
+                        stamp_ids.append(concept.id)
                     decayed_count += 1
 
         written = _batch_update_confidence_stability(batch_updates)
         if written == 0 and batch_updates:
             logger.warning("REFLECT-022: Batch decay failed, falling back to per-concept save")
+            persisted_ids = []
             for conf, _, cid in batch_updates:
                 try:
                     c = load_concept(cid, track_access=False)
@@ -1157,8 +1454,20 @@ class ReflectionEngine:
                             if c.metadata:
                                 c.metadata["knowledge_area"] = original_ka
                         save_concept(c)
+                        persisted_ids.append(cid)
                 except Exception as e:
                     logger.warning("REFLECT-022: Fallback save failed for %s: %s", cid, e)
+        else:
+            # written > 0 → transactional batch persisted all rows
+            persisted_ids = [cid for _, _, cid in batch_updates]
+
+        # REFLECT-024: stamp watermark ONLY for concepts whose confidence write persisted
+        # (never stamp on failure → no permanent lost decay).
+        if delta_enabled and stamp_ids:
+            persisted_set = set(persisted_ids)
+            to_stamp = [cid for cid in stamp_ids if cid in persisted_set]
+            if to_stamp:
+                _batch_stamp_last_decayed_at(to_stamp, _utc_now_iso())
         return decayed_count
 
     def _strengthen_accessed(self, _preloaded: list | None = None) -> tuple[int, list[str], int]:
@@ -1388,51 +1697,52 @@ class ReflectionEngine:
         merged = 0
         processed_pairs = set()  # Deduplicate (A,B) and (B,A)
 
-        # REFLECT-021: SQL-narrowed merge scan — only check recently-modified concepts.
-        # Merge is symmetric: if concept A (new) is scanned, old concept B appears in
-        # top-5 embedding results. Full scan runs weekly as safety net (A10).
-        _last_ref = getattr(self, "last_reflection", None)
-        _last_full = getattr(self, "_last_full_merge_scan", None)
-        _use_full_scan = False
-        if _last_ref is None:
-            _use_full_scan = True  # Cold start
-        elif _last_full is None:
-            _use_full_scan = True  # No record of previous full scan
-        else:
-            days_since_full = (_utc_now() - _ensure_aware(_last_full)).total_seconds() / 86400
-            if days_since_full >= 7:
-                _use_full_scan = True  # A10: Weekly full scan
-
-        if _use_full_scan:
-            all_ids = list_concepts()
-            self._last_full_merge_scan = _utc_now()
-            logger.info("REFLECT-021: Full merge scan (%d concepts, cold_start=%s)", len(all_ids), _last_ref is None)
-        else:
-            cutoff = _last_ref.isoformat() if _last_ref else _utc_now_iso()
-            all_ids = list_concepts_modified_since(cutoff)
-            logger.info("REFLECT-021: Narrowed merge scan (%d concepts since %s)", len(all_ids), cutoff[:19])
-
-        # DEBT-011: Move embedding import outside merge loop (~300 iterations)
         try:
             from app.storage.embedding import embedding_engine
-
+            index_size = int(getattr(embedding_engine, "index_size", 0) or 0)
             _use_embeddings = True
         except ImportError:
+            embedding_engine = None
+            index_size = 0
             _use_embeddings = False
 
-        for idx, concept_id in enumerate(all_ids, start=1):
+        state = self._load_merge_state(index_size=index_size)
+        merge_cap = self._merge_cap()
+        state["merge_cap"] = merge_cap
+        self._save_merge_state(state)
+        scan_rows = self._merge_scan_rows(state["pass_started_at"])
+        resume_offset = self._merge_resume_offset(scan_rows, state.get("last_seen_id"))
+        embedding_blocks = self._build_merge_embedding_blocks(scan_rows, embedding_engine) if _use_embeddings else {}
+        logger.info(
+            "REFLECT-MERGE: pass=%s status=running rows=%d resume_offset=%d index_size=%d",
+            state.get("pass_id"),
+            len(scan_rows),
+            resume_offset,
+            index_size,
+        )
+
+        for idx, (concept_id, sql_area) in enumerate(scan_rows[resume_offset:], start=resume_offset + 1):
             self._check_abort_every(idx, 25, "merge")
-            if merged >= MAX_MERGES_PER_CYCLE:
-                break
+            if merged >= merge_cap:
+                state["status"] = "paused_cap"
+                self._save_merge_state(state)
+                raise ReflectionAborted("merge_cap_reached", "merge")
 
             concept = load_concept(concept_id, track_access=False)
+            state["last_seen_id"] = concept_id
+            state["scanned_count"] = max(int(state.get("scanned_count") or 0), idx)
             if not concept:
+                if idx % MERGE_PROGRESS_SAVE_INTERVAL == 0:
+                    self._save_merge_state(state)
                 continue
 
             # Goal Coexistence Rule: goals never merge
             meta = concept.metadata or {}
             if meta.get("concept_type") == "goal":
+                if idx % MERGE_PROGRESS_SAVE_INTERVAL == 0:
+                    self._save_merge_state(state)
                 continue
+            concept_area = meta.get("knowledge_area") or getattr(concept, "knowledge_area", None) or sql_area or ""
 
             # REFLECT-006: Use embedding similarity for merge detection (TF-IDF fallback).
             # TF-IDF cosine maxes ~0.52 for paraphrases; embeddings reach 0.85-0.90.
@@ -1440,22 +1750,36 @@ class ReflectionEngine:
             # A3: Added empty-result fallback — embedding search can return [] without
             # throwing, which would silently skip merge for this concept.
             if _use_embeddings:
-                try:
-                    matches = embedding_engine.search(concept.summary, top_k=5)
-                    if not matches and concept.summary:
-                        matches = retrieval_engine.index.search(concept.summary, top_k=5)
-                except Exception:
-                    matches = retrieval_engine.index.search(concept.summary, top_k=5)
+                matches = self._stored_merge_candidates(
+                    concept_id=concept_id,
+                    concept_area=concept_area,
+                    embedding_engine=embedding_engine,
+                    embedding_blocks=embedding_blocks,
+                )
+                if matches is None:
+                    state["fallback_count"] = int(state.get("fallback_count") or 0) + 1
+                    try:
+                        matches = embedding_engine.search(concept.summary, top_k=MERGE_CANDIDATE_TOP_K)
+                        if not matches and concept.summary:
+                            matches = retrieval_engine.index.search(concept.summary, top_k=MERGE_CANDIDATE_TOP_K)
+                    except Exception:
+                        matches = retrieval_engine.index.search(concept.summary, top_k=MERGE_CANDIDATE_TOP_K)
             else:
-                matches = retrieval_engine.index.search(concept.summary, top_k=5)
+                matches = retrieval_engine.index.search(concept.summary, top_k=MERGE_CANDIDATE_TOP_K)
+
+            state["eligible_count"] = int(state.get("eligible_count") or 0) + 1
+            state["candidate_pairs"] = int(state.get("candidate_pairs") or 0) + len(matches)
 
             for match_id, similarity in matches:
                 if similarity < MERGE_SIMILARITY_THRESHOLD:
                     continue
+                state["matches_over_threshold"] = int(state.get("matches_over_threshold") or 0) + 1
                 if match_id == concept_id:
                     continue
-                if merged >= MAX_MERGES_PER_CYCLE:
-                    break
+                if merged >= merge_cap:
+                    state["status"] = "paused_cap"
+                    self._save_merge_state(state)
+                    raise ReflectionAborted("merge_cap_reached", "merge")
 
                 # Deduplicate pairs — (A,B) and (B,A) are the same merge
                 pair_key = tuple(sorted([concept_id, match_id]))
@@ -1476,6 +1800,10 @@ class ReflectionEngine:
                 concept_area = meta.get("knowledge_area", "")
                 match_area = match_meta.get("knowledge_area", "")
                 if concept_area != match_area:
+                    continue
+                from app.cognitive.ka_admission import is_ka_duplicate_merge_eligible
+
+                if not is_ka_duplicate_merge_eligible(meta) or not is_ka_duplicate_merge_eligible(match_meta):
                     continue
 
                 # --- Merge execution ---
@@ -1576,8 +1904,11 @@ class ReflectionEngine:
                     survivor.knowledge_area = survivor_ka
                     if survivor.metadata:
                         survivor.metadata["knowledge_area"] = survivor_ka
-                save_concept(survivor)
+                self._save_concept_with_lock_retry(survivor)
                 merged += 1
+                state["merges_executed"] = int(state.get("merges_executed") or 0) + 1
+                self._record_count("concepts_consolidated", int(state.get("merges_executed") or merged))
+                self._save_merge_state(state)
 
                 # REFLECT-006 / GA-007: Merge audit log for traceability
                 logger.info(
@@ -1590,6 +1921,12 @@ class ReflectionEngine:
                     f"loser_summary={loser.summary[:80]!r}"
                 )
 
+            if idx % MERGE_PROGRESS_SAVE_INTERVAL == 0:
+                self._save_merge_state(state)
+
+        state["status"] = "complete"
+        state["completed_at"] = _utc_now_iso()
+        self._save_merge_state(state)
         return merged
 
     def _recalibrate_confidence(self, _preloaded: list | None = None) -> tuple[int, dict[str, float | None]]:
@@ -2436,17 +2773,40 @@ class ReflectionEngine:
         Forgetting = archiving, NOT deletion. Always recoverable.
         Uses salience field and access metrics as inputs.
 
-        All four criteria must be true (conservative AND logic):
+        All criteria must be true (conservative AND logic):
           1. salience_source != "user" (user-explicit salience is never overridden)
           2. salience < FORGETTING_SALIENCE_THRESHOLD (0.15)
           3. access_count < FORGETTING_ACCESS_COUNT_THRESHOLD (2)
           4. last_accessed > FORGETTING_STALENESS_DAYS ago (90 days)
+          5. NOT measured-high-utility (REFLECT-026): exempt when
+             utility_samples > 0 AND utility_score >= FORGETTING_UTILITY_EXEMPT_THRESHOLD (0.6)
 
         Bootstrap protection: concepts with last_accessed=None are pre-tracking
         and are SKIPPED until their first tracked access followed by dormancy.
+
+        REFLECT-INCR (A1): the four AND-criteria are pushed into SQL so we only
+        load forgetting *candidates* instead of every active concept (~26.7k per
+        run, almost all ineligible — the dominant cost of incremental reflection).
+        The per-concept Python checks below remain authoritative and unchanged, so
+        the archived set is identical to the prior full scan; the query only
+        narrows what we load. Falls back to the full scan if the query fails.
         """
         archived_count = 0
-        for concept_id in list_concepts():
+        candidate_query_ok = True
+        try:
+            concept_ids = self._forgetting_candidate_ids()
+        except Exception as e:
+            candidate_query_ok = False
+            logger.warning(
+                f"REFLECT-INCR: forgetting candidate query failed ({e}); "
+                f"falling back to full concept scan."
+            )
+            concept_ids = list_concepts()
+        # REFLECT-025 (observability): candidate count = SQL-narrowed eligible set
+        # (salience<thr AND access<thr AND staleness>thr-1d). -1 signals the rare
+        # fallback path where the candidate query failed and we scanned all concepts.
+        candidate_count = len(concept_ids) if candidate_query_ok else -1
+        for concept_id in concept_ids:
             concept = load_concept(concept_id, track_access=False)
             if not concept:
                 continue
@@ -2463,6 +2823,11 @@ class ReflectionEngine:
             if concept.salience >= FORGETTING_SALIENCE_THRESHOLD:
                 continue
             if concept.access_count >= FORGETTING_ACCESS_COUNT_THRESHOLD:
+                continue
+            # REFLECT-026: exempt MEASURED high-utility concepts (utility is the value
+            # signal forgetting actually cares about; salience is uncorrelated with it).
+            # Requires real samples so unsampled defaults are not exempted.
+            if (concept.utility_samples or 0) > 0 and (concept.utility_score or 0.0) >= FORGETTING_UTILITY_EXEMPT_THRESHOLD:
                 continue
             # Staleness calculation: last_access already set for NULL case above
             if concept.last_accessed is not None:
@@ -2488,7 +2853,55 @@ class ReflectionEngine:
                         f"Deferring remaining candidates to next cycle."
                     )
                     break
-        return archived_count
+        # REFLECT-025 (observability): aggregate per-cycle forgetting summary so the
+        # dormant->active transition is visible before it matters. No behavior change.
+        logger.info(
+            "REFLECT-025: forgetting candidates=%d forgotten=%d (staleness_days=%d cap=%d)",
+            candidate_count,
+            archived_count,
+            FORGETTING_STALENESS_DAYS,
+            MAX_FORGETTING_PER_CYCLE,
+        )
+        return archived_count, candidate_count
+
+    def _forgetting_candidate_ids(self) -> list[str]:
+        """REFLECT-INCR (A1): ids matching the forgetting criteria, via SQL.
+
+        Pushes the four AND-criteria into the DB so _apply_forgetting loads only
+        candidates instead of every active concept. The Python checks in
+        _apply_forgetting stay authoritative; this only narrows the set. Filters
+        match list_concepts() scope (status='active' AND is_current=1) plus the
+        salience/access/staleness predicates. The COALESCE(last_accessed,
+        created_at) mirrors the NULL→created_at fallback. No LIMIT: the caller's
+        MAX_FORGETTING_PER_CYCLE break preserves the original cap semantics.
+
+        The staleness window is widened by 1 day so the candidate set is always a
+        *superset* of what the authoritative Python check archives: Python uses
+        integer .days (>=90), so a concept aged exactly 90.0d is eligible there;
+        the 1-day slack guarantees the SQL never under-includes a boundary row.
+        Extra candidates are harmless — the Python re-check enforces the true
+        90-day threshold, so the archived set is unchanged.
+        """
+        cutoff = (_utc_now() - timedelta(days=FORGETTING_STALENESS_DAYS - 1)).isoformat()
+        with _db() as conn:
+            rows = conn.execute(
+                "SELECT id FROM concepts "
+                "WHERE status='active' AND is_current=1 "
+                "AND salience_source != 'user' "
+                "AND salience < ? AND COALESCE(access_count, 0) < ? "
+                "AND COALESCE(last_accessed, created_at) < ? "
+                # REFLECT-026: exclude measured-high-utility concepts (mirrors the
+                # authoritative Python check so the candidate set / observability gauge
+                # reflects what will actually be forgotten).
+                "AND NOT (COALESCE(utility_samples, 0) > 0 AND COALESCE(utility_score, 0.0) >= ?)",
+                (
+                    FORGETTING_SALIENCE_THRESHOLD,
+                    FORGETTING_ACCESS_COUNT_THRESHOLD,
+                    cutoff,
+                    FORGETTING_UTILITY_EXEMPT_THRESHOLD,
+                ),
+            ).fetchall()
+        return [r[0] for r in rows]
 
     def analyze_stability(self) -> dict:
         """Analyze overall pith stability."""

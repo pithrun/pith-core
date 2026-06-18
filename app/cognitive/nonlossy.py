@@ -282,7 +282,11 @@ def evolve_concept_nonlossy(
     _merged_evidence = merged_data.get("evidence", [])
     if PSIS_QUARANTINE_EVIDENCE_MARKER in _merged_evidence:
         new_confidence = min(new_confidence, PSIS_QUARANTINE_CONFIDENCE_CAP)
-    new_concept_type = new_data.get("concept_type") or old_data.get("concept_type", "observation")
+    new_concept_type = (
+        new_data.get("new_concept_type")
+        or new_data.get("concept_type")
+        or old_data.get("concept_type", "observation")
+    )
 
     # Stability growth: each evolution increases stability (concept is being refined)
     old_stability = old_data.get("stability", 0.5)

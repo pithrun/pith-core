@@ -94,7 +94,14 @@ logger = logging.getLogger(__name__)
 class LifecycleMixin:
     """Mixin providing lifecycle methods for SessionManager."""
 
-    def start_session(self, context_hint: str = "", agent_id: str = "default", session_date: str | None = None, platform_hint: str = "unknown") -> SessionStartResponse:
+    def start_session(
+        self,
+        context_hint: str = "",
+        agent_id: str = "default",
+        session_date: str | None = None,
+        platform_hint: str = "unknown",
+        surface_id: str = "unknown",
+    ) -> SessionStartResponse:
         """Session bootstrap protocol: start session and return bootstrap context.
 
         Default path is intentionally lightweight: it avoids hydrating the full
@@ -131,6 +138,10 @@ class LifecycleMixin:
 
         session_id = str(uuid.uuid4())[:8]
         now = _utc_now_iso()
+        from app.core.surface_identity import normalize_surface_id, resolve_platform_hint
+
+        resolved_surface_id = normalize_surface_id(surface_id)
+        resolved_platform_hint = resolve_platform_hint(platform_hint, resolved_surface_id)
 
         self._conversation_turn_called = False  # S0: reset on new session
         self._last_orientation_served_at = None  # S6.1: reset so orientation re-serves
@@ -146,12 +157,15 @@ class LifecycleMixin:
             context_hint=context_hint,
             learning_event_count=0,
             agent_id=agent_id,
+            platform_hint=resolved_platform_hint,
+            surface_id=resolved_surface_id,
         )
         self.current_session = session_info
         self._remember_in_memory_session(session_info)
 
         # SESSION-012 v0.3: Store platform hint from session_start caller
-        self._current_platform_hint = platform_hint
+        self._current_platform_hint = resolved_platform_hint
+        self._current_surface_id = resolved_surface_id
 
         if persist_session:
             save_session(
@@ -162,7 +176,8 @@ class LifecycleMixin:
                 learning_event_count=0,
                 agent_id=agent_id,
                 model_id=getattr(self, "_current_model_id", "unknown"),
-                platform_hint=platform_hint,
+                platform_hint=resolved_platform_hint,
+                surface_id=resolved_surface_id,
             )
         else:
             logger.info("SESSION-001: Session persistence skipped (PITH_BENCHMARK_READONLY)")

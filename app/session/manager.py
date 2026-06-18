@@ -248,6 +248,7 @@ class SessionManager(
         prev_response: str,
         bound_session: SessionInfo | None = None,
         raw_capture_ref: dict | None = None,
+        active_binding_snapshot: dict | None = None,
     ):
         """PERF-FORT-2: Background auto-learn — runs in executor thread.
 
@@ -382,6 +383,24 @@ class SessionManager(
                 except Exception as e:
                     logger.debug(f"PRICING-002-BG: Metering failed (non-fatal): {e}")
 
+            _workstream_link_result = None
+            if auto_learn_result and auto_learn_result.concepts_created:
+                try:
+                    from app.features.threads import link_concepts_to_active_workstream
+
+                    _workstream_link_result = link_concepts_to_active_workstream(
+                        auto_learn_result.concepts_created,
+                        binding_snapshot=active_binding_snapshot,
+                    )
+                    if _workstream_link_result.get("linked", 0) > 0:
+                        logger.info(
+                            "S-1-BG: Linked %s concepts to active Workstream %s",
+                            _workstream_link_result.get("linked"),
+                            _workstream_link_result.get("thread_id"),
+                        )
+                except Exception as e:
+                    logger.warning("S-1-BG: Active Workstream concept linking failed (non-fatal): %s", e)
+
             # Store results for next turn's consumption (A1 amendment)
             # Build the auto_learned summary dict
             _auto_learned_dict = None
@@ -393,6 +412,8 @@ class SessionManager(
                     "concepts_evolved": [c.concept_id for c in auto_learn_result.concepts_evolved],
                     "budget_warnings": _budget_warnings,
                 }
+                if _workstream_link_result:
+                    _auto_learned_dict["workstream_links"] = _workstream_link_result
             # Atomic assignment — GIL protects reference swap
             self._last_autolearn_result = _auto_learned_dict
             self._last_autolearn_result_obj = auto_learn_result

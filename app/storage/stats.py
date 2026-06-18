@@ -3,6 +3,7 @@
 Statistics aggregation and analytics.
 Extracted from storage/__init__.py during Item 2b decomposition.
 """
+
 import logging
 import math
 import sqlite3
@@ -14,6 +15,7 @@ from app.storage import concepts as _concepts_mod
 from app.storage.connection import diagnostic_read_db, read_snapshot_db
 
 logger = logging.getLogger(__name__)
+
 
 def get_pith_stats_fast(conn: sqlite3.Connection | None = None) -> dict:
     """Bounded stats summary for default health/status surfaces.
@@ -88,6 +90,185 @@ def get_pith_health_fast(conn: sqlite3.Connection | None = None) -> dict:
     }
 
 
+def compute_concept_integrity(conn: sqlite3.Connection) -> dict:
+    """Compute the 8 Surface-1 concept-integrity sub-checks on the passed-in conn.
+
+    Single-source of the integrity SQL: called by both get_pith_stats_aggregates
+    (behavior-preserving refactor) and the EUNOMIA-127 read-only integrity probe.
+    The caller owns the connection; this helper opens NO connection of its own
+    (this is a behavior change for ka_drift, which previously opened its own
+    read_snapshot_db — see EUNOMIA-127 spec §5 Fix 1 and parity test §11 T-PARITY).
+
+    Read-only: every statement is a SELECT. No writes, no side effects.
+    Returns a dict with exactly these 8 keys (shapes match the corresponding keys
+    in get_pith_stats_aggregates verbatim):
+        orphan_concepts, evidence_stats, zombie_count, currency_health,
+        factual_coverage, stuck_provisional, psis_m3_compliance, ka_canonical_drift
+    """
+    from app.core.taxonomy_utils import get_canonical_areas as _get_canonical_areas  # DEBT-234
+
+    # --- orphan (stats.py:154-159) ---
+    orphan_row = conn.execute("""
+        SELECT COUNT(*) as cnt FROM concepts c
+        WHERE c.status = 'active'
+        AND c.id NOT IN (SELECT source FROM associations)
+        AND c.id NOT IN (SELECT target FROM associations)
+    """).fetchone()
+
+    # --- evidence (stats.py:163-179) ---
+    evidence_row = conn.execute("""
+        SELECT
+            COUNT(*) as total,
+            SUM(CASE WHEN json_valid(data)
+                AND json_array_length(json_extract(data, '$.evidence')) > 0
+                THEN 1 ELSE 0 END) as with_evidence,
+            SUM(CASE WHEN NOT json_valid(data)
+                OR json_array_length(json_extract(data, '$.evidence')) = 0
+                OR json_extract(data, '$.evidence') IS NULL
+                THEN 1 ELSE 0 END) as without_evidence,
+            ROUND(AVG(CASE WHEN json_valid(data)
+                THEN json_array_length(json_extract(data, '$.evidence'))
+                ELSE 0 END), 2) as avg_evidence_count
+        FROM concepts
+        WHERE status = 'active'
+        AND json_valid(data) = 1
+    """).fetchone()
+
+    # --- zombie (stats.py:313-322) ---
+    zombie_row = conn.execute("""
+        SELECT COUNT(*) as cnt FROM concepts
+        WHERE is_current = 1
+          AND status != 'archived'
+          AND id NOT IN (
+              SELECT source FROM associations
+              UNION
+              SELECT target FROM associations
+          )
+    """).fetchone()
+
+    # --- currency (stats.py:384-391 query + 638-651 derive) ---
+    _curr_row = conn.execute("""
+        SELECT
+            COUNT(*) as total,
+            SUM(CASE WHEN currency_status = 'CONTRADICTED' THEN 1 ELSE 0 END) as contradicted,
+            AVG(currency_score) as mean_score
+        FROM concepts
+        WHERE is_current = 1 AND status != 'archived'
+    """).fetchone()
+    _curr_total = _curr_row["total"] or 0
+    _contradicted = _curr_row["contradicted"] or 0
+    _mean_score = _curr_row["mean_score"] or 0.0
+    if _curr_total == 0:
+        _curr_alert = "UNKNOWN"
+        _contradicted_pct = 0.0
+    else:
+        _contradicted_pct = round(_contradicted / _curr_total * 100, 2)
+        if _contradicted_pct > 50.0 or _mean_score < 0.5:
+            _curr_alert = "CRITICAL"
+        elif _contradicted_pct > 35.0 or _mean_score < 0.7:
+            _curr_alert = "DEGRADED"
+        else:
+            _curr_alert = "HEALTHY"
+
+    # --- factual_coverage (stats.py:394-407) ---
+    factual_row = conn.execute("""
+        SELECT
+            COUNT(*) as total_active,
+            SUM(CASE WHEN json_valid(data) AND json_extract(data, '$.metadata.is_factual') = 1
+                THEN 1 ELSE 0 END) as factual_count,
+            SUM(CASE WHEN valid_from IS NOT NULL AND valid_from != ''
+                THEN 1 ELSE 0 END) as has_valid_from
+        FROM concepts
+        WHERE status = 'active' AND is_current = 1
+    """).fetchone()
+    _factual_total = factual_row["total_active"] or 1
+    _factual_count = factual_row["factual_count"] or 0
+    _has_valid_from = factual_row["has_valid_from"] or 0
+    _factual_rate = round(_factual_count / _factual_total * 100, 1)
+
+    # --- stuck_provisional (stats.py:452-465) ---
+    _stuck_prov_row = conn.execute("""
+        SELECT
+            COUNT(*) as stuck,
+            (SELECT COUNT(*) FROM concepts
+             WHERE status='active' AND maturity='PROVISIONAL') as total_prov
+        FROM concepts
+        WHERE status='active' AND maturity='PROVISIONAL'
+        AND (
+            COALESCE(json_array_length(json_extract(data,'$.evidence')), 0) < 1
+            OR (access_count < 5 AND reinforcement_count < 8)
+        )
+    """).fetchone()
+    _stuck_prov = _stuck_prov_row["stuck"] if _stuck_prov_row else 0
+    _total_prov = _stuck_prov_row["total_prov"] if _stuck_prov_row else 0
+
+    # --- psis_m3 (stats.py:523-527) ---
+    _psis_overcap_row = conn.execute("""
+        SELECT COUNT(*) as over_cap FROM concepts
+        WHERE maturity = 'QUARANTINED' AND confidence > 0.4
+    """).fetchone()
+    _psis_overcap = _psis_overcap_row["over_cap"] if _psis_overcap_row else 0
+
+    # --- ka_canonical_drift (stats.py:673-687) — NOW on the shared conn ---
+    _canonical_kas = _get_canonical_areas()
+    _placeholders = ",".join("?" * len(_canonical_kas))
+    _ka_drift_row = conn.execute(
+        f"""
+        SELECT COUNT(*) as cnt FROM concepts
+        WHERE is_current = 1
+          AND status = 'active'
+          AND knowledge_area NOT IN ({_placeholders})
+        """,
+        list(_canonical_kas),
+    ).fetchone()
+    _ka_non_canonical_count = _ka_drift_row["cnt"] if _ka_drift_row else 0
+
+    return {
+        "orphan_concepts": orphan_row["cnt"],
+        "evidence_stats": {
+            "with_evidence": evidence_row["with_evidence"],
+            "without_evidence": evidence_row["without_evidence"],
+            "avg_evidence_per_concept": evidence_row["avg_evidence_count"],
+        },
+        "zombie_count": zombie_row["cnt"] if zombie_row else 0,
+        "currency_health": {
+            "status": _curr_alert,
+            "total_is_current": _curr_total,
+            "contradicted_pct": _contradicted_pct,
+            "mean_currency_score": round(_mean_score, 4),
+            "thresholds": {
+                "degraded_if_contradicted_pct_above": 35.0,
+                "critical_if_contradicted_pct_above": 50.0,
+                "degraded_if_mean_score_below": 0.7,
+                "critical_if_mean_score_below": 0.5,
+            },
+        },
+        "factual_coverage": {
+            "total_active": _factual_total,
+            "factual_count": _factual_count,
+            "factual_rate_pct": _factual_rate,
+            "has_valid_from": _has_valid_from,
+            "valid_from_coverage_pct": round(_has_valid_from / max(_factual_count, 1) * 100, 1),
+            "status": "healthy" if 20 <= _factual_rate <= 40 else ("low" if _factual_rate < 20 else "high"),
+        },
+        "stuck_provisional": {
+            "stuck_count": _stuck_prov,
+            "total_provisional": _total_prov,
+            "stuck_pct": round(_stuck_prov / max(_total_prov, 1) * 100, 1),
+            "alert": _stuck_prov > 200,
+        },
+        "psis_m3_compliance": {
+            "quarantined_over_cap": _psis_overcap,
+            "cap_threshold": 0.4,
+            "alert": _psis_overcap > 0,
+        },
+        "ka_canonical_drift": {
+            "non_canonical_count": _ka_non_canonical_count,
+            "alert": _ka_non_canonical_count > 0,
+        },
+    }
+
+
 def get_pith_stats_aggregates(conn: sqlite3.Connection | None = None) -> dict:
     """Aggregate pith stats (concept counts, avg confidence, KA breakdown, orphans).
 
@@ -99,6 +280,7 @@ def get_pith_stats_aggregates(conn: sqlite3.Connection | None = None) -> dict:
     # Wrapped in try/except so a stats query never fails on an audit glitch.
     try:
         from app.storage.backend import get_backend
+
         _backend = get_backend()
         with read_snapshot_db("get_pith_stats_aggregates") as _integ_conn:
             migration_integrity = _backend._check_migration_integrity(_integ_conn)
@@ -147,33 +329,11 @@ def get_pith_stats_aggregates(conn: sqlite3.Connection | None = None) -> dict:
             for r in ka_rows
         ]
 
-        # DEBT-003: Orphan concept count
-        orphan_row = conn.execute("""
-            SELECT COUNT(*) as cnt FROM concepts c
-            WHERE c.status = 'active'
-            AND c.id NOT IN (SELECT source FROM associations)
-            AND c.id NOT IN (SELECT target FROM associations)
-        """).fetchone()
-
-        # DEBT-007: Evidence provenance summary
-        # HEALTH-005: json_valid guard prevents 500 on malformed data blobs
-        evidence_row = conn.execute("""
-            SELECT
-                COUNT(*) as total,
-                SUM(CASE WHEN json_valid(data)
-                    AND json_array_length(json_extract(data, '$.evidence')) > 0
-                    THEN 1 ELSE 0 END) as with_evidence,
-                SUM(CASE WHEN NOT json_valid(data)
-                    OR json_array_length(json_extract(data, '$.evidence')) = 0
-                    OR json_extract(data, '$.evidence') IS NULL
-                    THEN 1 ELSE 0 END) as without_evidence,
-                ROUND(AVG(CASE WHEN json_valid(data)
-                    THEN json_array_length(json_extract(data, '$.evidence'))
-                    ELSE 0 END), 2) as avg_evidence_count
-            FROM concepts
-            WHERE status = 'active'
-            AND json_valid(data) = 1
-        """).fetchone()
+        # EUNOMIA-127: single-source the 8 Surface-1 integrity sub-checks
+        # (orphan, evidence, zombie, currency, factual_coverage, stuck_provisional,
+        #  psis_m3, ka_canonical_drift) via compute_concept_integrity(conn). Same SQL,
+        #  same shapes, same connection. Mapped into the return dict below.
+        _integrity = compute_concept_integrity(conn)
 
         # HEALTH-005: data quality metrics for observability
         data_quality_row = conn.execute("""
@@ -306,18 +466,6 @@ def get_pith_stats_aggregates(conn: sqlite3.Connection | None = None) -> dict:
             for r in rt_rows
         }
 
-        # MONITOR-032: zombie concepts (is_current=1, not archived, no associations)
-        zombie_row = conn.execute("""
-            SELECT COUNT(*) as cnt FROM concepts
-            WHERE is_current = 1
-              AND status != 'archived'
-              AND id NOT IN (
-                  SELECT source FROM associations
-                  UNION
-                  SELECT target FROM associations
-              )
-        """).fetchone()
-
         # MONITOR-011: Index consistency — active vs superseded concept counts
         index_consistency_row = conn.execute("""
             SELECT
@@ -340,6 +488,7 @@ def get_pith_stats_aggregates(conn: sqlite3.Connection | None = None) -> dict:
         # MONITOR-049: CTX-007 compaction survival format monitoring
         # Liveness probe: sample one eligible concept, confirm formatter produces [CRITICAL-CONTEXT].
         from app.core.config import FEATURE_FLAGS as _ff
+
         _csf_enabled = _ff.get("COMPACTION_SURVIVAL_FORMAT", False)
         _csf_row = conn.execute("""
             SELECT COUNT(*) as eligible
@@ -356,9 +505,8 @@ def get_pith_stats_aggregates(conn: sqlite3.Connection | None = None) -> dict:
             """).fetchone()
             if _probe:
                 from app.core.format_helpers import format_for_compaction_survival
-                _formatted = format_for_compaction_survival(
-                    _probe["id"], _probe["summary"], _probe["concept_type"]
-                )
+
+                _formatted = format_for_compaction_survival(_probe["id"], _probe["summary"], _probe["concept_type"])
                 _csf_probe_ok = "[CRITICAL-CONTEXT" in _formatted
 
         # ARGUS-S23-F1: Token budget monitoring for COMPACTION_SURVIVAL_FORMAT
@@ -376,32 +524,6 @@ def get_pith_stats_aggregates(conn: sqlite3.Connection | None = None) -> dict:
             # ~4 chars/token + 20 tokens tag overhead per concept; cap at 10 (always-activate pool)
             _concepts_in_budget = min(10, _csf_row["eligible"] or 0)
             _csf_est_tokens = round((_csf_avg_chars / 4 + 20) * _concepts_in_budget)
-
-        # MONITOR-035: currency health alert
-        _curr_row = conn.execute("""
-            SELECT
-                COUNT(*) as total,
-                SUM(CASE WHEN currency_status = 'CONTRADICTED' THEN 1 ELSE 0 END) as contradicted,
-                AVG(currency_score) as mean_score
-            FROM concepts
-            WHERE is_current = 1 AND status != 'archived'
-        """).fetchone()
-
-        # MONITOR-069: Factual coverage metrics
-        factual_row = conn.execute("""
-            SELECT
-                COUNT(*) as total_active,
-                SUM(CASE WHEN json_valid(data) AND json_extract(data, '$.metadata.is_factual') = 1
-                    THEN 1 ELSE 0 END) as factual_count,
-                SUM(CASE WHEN valid_from IS NOT NULL AND valid_from != ''
-                    THEN 1 ELSE 0 END) as has_valid_from
-            FROM concepts
-            WHERE status = 'active' AND is_current = 1
-        """).fetchone()
-        _factual_total = factual_row["total_active"] or 1
-        _factual_count = factual_row["factual_count"] or 0
-        _has_valid_from = factual_row["has_valid_from"] or 0
-        _factual_rate = round(_factual_count / _factual_total * 100, 1)
 
         # ARGUS-S25-F2: experiment_generation task health monitoring
         # Apply MONITOR-049 liveness pattern: last run recency + status.
@@ -445,23 +567,6 @@ def get_pith_stats_aggregates(conn: sqlite3.Connection | None = None) -> dict:
                 "items_processed": None,
             }
 
-
-        # MONITOR-034: Stuck PROVISIONAL concepts (evidence<1 OR access<5 AND reinforcement<8)
-        _stuck_prov_row = conn.execute("""
-            SELECT
-                COUNT(*) as stuck,
-                (SELECT COUNT(*) FROM concepts
-                 WHERE status='active' AND maturity='PROVISIONAL') as total_prov
-            FROM concepts
-            WHERE status='active' AND maturity='PROVISIONAL'
-            AND (
-                COALESCE(json_array_length(json_extract(data,'$.evidence')), 0) < 1
-                OR (access_count < 5 AND reinforcement_count < 8)
-            )
-        """).fetchone()
-        _stuck_prov = _stuck_prov_row["stuck"] if _stuck_prov_row else 0
-        _total_prov = _stuck_prov_row["total_prov"] if _stuck_prov_row else 0
-
         # MONITOR-018: Stale session buildup (no ended_at, started >24h ago)
         _stale_sess_row = conn.execute("""
             SELECT COUNT(*) as cnt FROM sessions
@@ -485,11 +590,7 @@ def get_pith_stats_aggregates(conn: sqlite3.Connection | None = None) -> dict:
             WHERE pressure_score IS NOT NULL
             """
         ).fetchone()
-        _p_avg_24h = (
-            float(_pressure_row["avg_24h"])
-            if _pressure_row and _pressure_row["avg_24h"] is not None
-            else None
-        )
+        _p_avg_24h = float(_pressure_row["avg_24h"]) if _pressure_row and _pressure_row["avg_24h"] is not None else None
         _p_high_24h = int(_pressure_row["high_pressure_24h"] or 0) if _pressure_row else 0
         _p_avg_7d = (
             float(_pressure_row["avg_prior_7d"])
@@ -497,8 +598,10 @@ def get_pith_stats_aggregates(conn: sqlite3.Connection | None = None) -> dict:
             else None
         )
         if _p_avg_24h is not None and _p_avg_7d is not None:
-            _p_trend = "rising" if _p_avg_24h > _p_avg_7d + 0.05 else (
-                "falling" if _p_avg_24h < _p_avg_7d - 0.05 else "stable"
+            _p_trend = (
+                "rising"
+                if _p_avg_24h > _p_avg_7d + 0.05
+                else ("falling" if _p_avg_24h < _p_avg_7d - 0.05 else "stable")
             )
         else:
             _p_trend = "unknown"
@@ -518,13 +621,6 @@ def get_pith_stats_aggregates(conn: sqlite3.Connection | None = None) -> dict:
             _episode_count = _ep_row["cnt"] if _ep_row else 0
         except Exception:
             _episode_count = -1  # Table may not exist in all environments
-
-        # MONITOR-044: PSIS M3 compliance — quarantined concepts over confidence cap
-        _psis_overcap_row = conn.execute("""
-            SELECT COUNT(*) as over_cap FROM concepts
-            WHERE maturity = 'QUARANTINED' AND confidence > 0.4
-        """).fetchone()
-        _psis_overcap = _psis_overcap_row["over_cap"] if _psis_overcap_row else 0
 
         # MONITOR-128: Correction pipeline stats — gated count, evidence appends, pattern match rate
         _corr_events_row = conn.execute("""
@@ -561,6 +657,29 @@ def get_pith_stats_aggregates(conn: sqlite3.Connection | None = None) -> dict:
         """).fetchone()
         _analogy_total_24h = int(_analogy_metric_row["total_24h"] or 0)
         _analogy_turns_24h = int(_analogy_metric_row["turns_24h"] or 0)
+
+        # MONITOR-167: Lightweight retrieval soft-timeout fallback frequency.
+        _slw_timeout_row = conn.execute("""
+            SELECT
+                COALESCE(SUM(value), 0) as total_24h,
+                COALESCE(SUM(
+                    CASE WHEN json_extract(labels, '$.action') = 'materialize'
+                    THEN value ELSE 0 END
+                ), 0) as materializations_24h,
+                COALESCE(SUM(
+                    CASE WHEN json_extract(labels, '$.action') = 'stop'
+                        AND CAST(COALESCE(json_extract(labels, '$.partial_results'), 0) AS INTEGER) = 0
+                    THEN value ELSE 0 END
+                ), 0) as empty_stops_24h,
+                MAX(timestamp) as latest_timestamp
+            FROM metrics
+            WHERE metric = 'search_lightweight.soft_timeout_total'
+            AND timestamp > datetime('now', '-1 day')
+        """).fetchone()
+        _slw_timeout_total_24h = int(_slw_timeout_row["total_24h"] or 0)
+        _slw_timeout_materializations_24h = int(_slw_timeout_row["materializations_24h"] or 0)
+        _slw_timeout_empty_stops_24h = int(_slw_timeout_row["empty_stops_24h"] or 0)
+        _slw_timeout_latest_timestamp = _slw_timeout_row["latest_timestamp"]
 
         # MONITOR-124: Recency score distribution — age distribution for post-processing
         _recency_age_rows = conn.execute("""
@@ -606,30 +725,16 @@ def get_pith_stats_aggregates(conn: sqlite3.Connection | None = None) -> dict:
     import datetime as _dt
 
     import app.core.config as _cfg
+
     _canary_start = _dt.date.fromisoformat(getattr(_cfg, "EVOLUTION_CANARY_START_DATE", "2026-03-13"))
     _canary_elapsed = (_dt.date.today() - _canary_start).days
     _canary_window_passed = _canary_elapsed >= _cfg.EVOLUTION_CANARY_DURATION_DAYS
-
-    # MONITOR-035: derive currency health alert status
-    _curr_total = _curr_row["total"] or 0
-    _contradicted = _curr_row["contradicted"] or 0
-    _mean_score = _curr_row["mean_score"] or 0.0
-    if _curr_total == 0:
-        _curr_alert = "UNKNOWN"
-        _contradicted_pct = 0.0
-    else:
-        _contradicted_pct = round(_contradicted / _curr_total * 100, 2)
-        if _contradicted_pct > 50.0 or _mean_score < 0.5:
-            _curr_alert = "CRITICAL"
-        elif _contradicted_pct > 35.0 or _mean_score < 0.7:
-            _curr_alert = "DEGRADED"
-        else:
-            _curr_alert = "HEALTHY"
 
     # MONITOR-124: compute recency score percentiles from age distribution
     import math as _math
 
     from app.core.config import RETRIEVAL_RECENCY_HALF_LIFE_DAYS as _hl_days
+
     _hl = max(0.1, _hl_days)
     _ages = [r["age_days"] for r in _recency_age_rows if r["age_days"] is not None and r["age_days"] >= 0]
     if _ages:
@@ -641,27 +746,9 @@ def get_pith_stats_aggregates(conn: sqlite3.Connection | None = None) -> dict:
     else:
         _rec_mean = _rec_p50 = _rec_p95 = None
 
-    # MONITOR-073: KA canonical drift — count active concepts with non-canonical knowledge_area
-    # KA-006: Use get_canonical_areas() (seed+established+mature from DB) instead of the
-    # hardcoded _CANONICAL_KA_DESCRIPTIONS dict, which only covers embedding-classified KAs
-    # and was missing architecture_gaps, ip_protection, product_operations, pith_benchmarks.
-    from app.core.taxonomy_utils import get_canonical_areas as _get_canonical_areas  # DEBT-234
-    _canonical_kas = _get_canonical_areas()
-    _placeholders = ",".join("?" * len(_canonical_kas))
-    with read_snapshot_db("get_pith_stats_aggregates") as _ka_conn:
-        _ka_drift_row = _ka_conn.execute(
-            f"""
-            SELECT COUNT(*) as cnt FROM concepts
-            WHERE is_current = 1
-              AND status = 'active'
-              AND knowledge_area NOT IN ({_placeholders})
-            """,
-            list(_canonical_kas),
-        ).fetchone()
-    _ka_non_canonical_count = _ka_drift_row["cnt"] if _ka_drift_row else 0
-
     # MONITOR-SESSION010: Compaction detection event count + tier distribution
     import json as _json
+
     with read_snapshot_db("get_pith_stats_aggregates") as _cmp_conn:
         _cmp_rows = _cmp_conn.execute(
             """SELECT details FROM governance_events
@@ -685,12 +772,8 @@ def get_pith_stats_aggregates(conn: sqlite3.Connection | None = None) -> dict:
         "knowledge_areas": row["knowledge_areas"],
         "total_versions": versions_row["total"],
         "ka_breakdown": ka_breakdown,
-        "orphan_concepts": orphan_row["cnt"],
-        "evidence_stats": {
-            "with_evidence": evidence_row["with_evidence"],
-            "without_evidence": evidence_row["without_evidence"],
-            "avg_evidence_per_concept": evidence_row["avg_evidence_count"],
-        },
+        "orphan_concepts": _integrity["orphan_concepts"],
+        "evidence_stats": _integrity["evidence_stats"],
         # HEALTH-005: surface data quality in stats
         "data_quality": {
             "null_timestamps": data_quality_row["null_timestamps"],
@@ -750,13 +833,11 @@ def get_pith_stats_aggregates(conn: sqlite3.Connection | None = None) -> dict:
             "total_timeouts": rt_total_row["total_timeouts"] or 0,
             "total_auto_closed": rt_total_row["total_auto_closed"] or 0,
             "avg_concepts_returned": round(rt_total_row["avg_concepts_returned"] or 0, 2),
-            "timeout_rate": round(
-                (rt_total_row["total_timeouts"] or 0) / max(rt_total_row["total"] or 0, 1), 4
-            ),
+            "timeout_rate": round((rt_total_row["total_timeouts"] or 0) / max(rt_total_row["total"] or 0, 1), 4),
             "by_trigger_type": _rt_by_trigger,
         },
         # MONITOR-032: zombie concept count
-        "zombie_count": zombie_row["cnt"] if zombie_row else 0,
+        "zombie_count": _integrity["zombie_count"],
         # MONITOR-011: index consistency — active vs superseded breakdown
         # MONITOR-060: superseded_pct alert thresholds (warn>70%, critical>85%)
         "index_consistency": {
@@ -773,13 +854,19 @@ def get_pith_stats_aggregates(conn: sqlite3.Connection | None = None) -> dict:
                 "critical"
                 if round(
                     (index_consistency_row["active_superseded"] or 0)
-                    / max(index_consistency_row["total_all"] or 0, 1) * 100, 1
-                ) > 85.0
+                    / max(index_consistency_row["total_all"] or 0, 1)
+                    * 100,
+                    1,
+                )
+                > 85.0
                 else "warn"
                 if round(
                     (index_consistency_row["active_superseded"] or 0)
-                    / max(index_consistency_row["total_all"] or 0, 1) * 100, 1
-                ) > 70.0
+                    / max(index_consistency_row["total_all"] or 0, 1)
+                    * 100,
+                    1,
+                )
+                > 70.0
                 else "ok"
             ),
         },
@@ -789,27 +876,9 @@ def get_pith_stats_aggregates(conn: sqlite3.Connection | None = None) -> dict:
             "alert": (fix1_zombie_row["cnt"] or 0) > 0,
         },
         # MONITOR-035: currency health alert
-        "currency_health": {
-            "status": _curr_alert,
-            "total_is_current": _curr_total,
-            "contradicted_pct": _contradicted_pct,
-            "mean_currency_score": round(_mean_score, 4),
-            "thresholds": {
-                "degraded_if_contradicted_pct_above": 35.0,
-                "critical_if_contradicted_pct_above": 50.0,
-                "degraded_if_mean_score_below": 0.7,
-                "critical_if_mean_score_below": 0.5,
-            },
-        },        # MONITOR-069: Factual coverage metrics
-        "factual_coverage": {
-            "total_active": _factual_total,
-            "factual_count": _factual_count,
-            "factual_rate_pct": _factual_rate,
-            "has_valid_from": _has_valid_from,
-            "valid_from_coverage_pct": round(_has_valid_from / max(_factual_count, 1) * 100, 1),
-            "status": "healthy" if 20 <= _factual_rate <= 40 else ("low" if _factual_rate < 20 else "high"),
-        },
-
+        "currency_health": _integrity["currency_health"],
+        # MONITOR-069: Factual coverage metrics
+        "factual_coverage": _integrity["factual_coverage"],
         # MONITOR-049: CTX-007 compaction survival format health
         # MONITOR-049 + ARGUS-S23-F1: CSF health + token budget metrics
         "compaction_survival": {
@@ -818,11 +887,12 @@ def get_pith_stats_aggregates(conn: sqlite3.Connection | None = None) -> dict:
             "formatter_live": _csf_probe_ok,
             "avg_summary_chars": _csf_avg_chars,
             "estimated_tokens_overhead": _csf_est_tokens,
-            "status": "disabled" if not _csf_enabled else (
-                "healthy" if _csf_probe_ok else (
-                    "no_eligible_concepts" if (_csf_row["eligible"] or 0) == 0
-                    else "formatter_broken"
-                )
+            "status": "disabled"
+            if not _csf_enabled
+            else (
+                "healthy"
+                if _csf_probe_ok
+                else ("no_eligible_concepts" if (_csf_row["eligible"] or 0) == 0 else "formatter_broken")
             ),
         },
         # ARGUS-S25-F2: experiment_generation task health
@@ -832,12 +902,7 @@ def get_pith_stats_aggregates(conn: sqlite3.Connection | None = None) -> dict:
             "activations_24h": _cross_ka_24h,
         },
         # MONITOR-034: Stuck PROVISIONAL monitoring
-        "stuck_provisional": {
-            "stuck_count": _stuck_prov,
-            "total_provisional": _total_prov,
-            "stuck_pct": round(_stuck_prov / max(_total_prov, 1) * 100, 1),
-            "alert": _stuck_prov > 200,
-        },
+        "stuck_provisional": _integrity["stuck_provisional"],
         # MONITOR-018: Stale session buildup
         "stale_sessions": {
             "count": _stale_sessions,
@@ -858,26 +923,37 @@ def get_pith_stats_aggregates(conn: sqlite3.Connection | None = None) -> dict:
             "hits": _concepts_mod._assoc_cache_hits,
             "misses": _concepts_mod._assoc_cache_misses,
             "hit_rate_pct": round(
-                _concepts_mod._assoc_cache_hits / max(_concepts_mod._assoc_cache_hits + _concepts_mod._assoc_cache_misses, 1) * 100, 1
+                _concepts_mod._assoc_cache_hits
+                / max(_concepts_mod._assoc_cache_hits + _concepts_mod._assoc_cache_misses, 1)
+                * 100,
+                1,
             ),
         },
         "adjacency_cache_stats": {
             "hits": _concepts_mod._adjacency_cache_hits,
             "misses": _concepts_mod._adjacency_cache_misses,
             "hit_rate_pct": round(
-                _concepts_mod._adjacency_cache_hits / max(_concepts_mod._adjacency_cache_hits + _concepts_mod._adjacency_cache_misses, 1) * 100, 1
+                _concepts_mod._adjacency_cache_hits
+                / max(_concepts_mod._adjacency_cache_hits + _concepts_mod._adjacency_cache_misses, 1)
+                * 100,
+                1,
             ),
         },
         # MONITOR-044: PSIS M3 compliance alert
-        "psis_m3_compliance": {
-            "quarantined_over_cap": _psis_overcap,
-            "cap_threshold": 0.4,
-            "alert": _psis_overcap > 0,
-        },
+        "psis_m3_compliance": _integrity["psis_m3_compliance"],
         # MONITOR-051: Analogy suggestion rate (24h window from metrics table)
         "analogy_suggestion_rate": {
             "total_suggestions_24h": _analogy_total_24h,
             "turns_with_suggestions_24h": _analogy_turns_24h,
+        },
+        # MONITOR-167: search_lightweight soft-timeout fallback visibility.
+        "search_lightweight_soft_timeout": {
+            "total_24h": _slw_timeout_total_24h,
+            "materializations_24h": _slw_timeout_materializations_24h,
+            "empty_stops_24h": _slw_timeout_empty_stops_24h,
+            "latest_timestamp": _slw_timeout_latest_timestamp,
+            "alert_threshold_24h": 25,
+            "alert": _slw_timeout_empty_stops_24h > 0 or _slw_timeout_total_24h > 25,
         },
         # MONITOR-070: Currency score decay distribution by is_factual
         "decay_distribution": _decay_dist,
@@ -892,10 +968,7 @@ def get_pith_stats_aggregates(conn: sqlite3.Connection | None = None) -> dict:
         # MONITOR-126: platform_hint distribution from sessions
         "platform_hint_distribution": _platform_dist,
         # MONITOR-073: KA canonical drift — active concepts with non-canonical knowledge_area
-        "ka_canonical_drift": {
-            "non_canonical_count": _ka_non_canonical_count,
-            "alert": _ka_non_canonical_count > 0,
-        },
+        "ka_canonical_drift": _integrity["ka_canonical_drift"],
         # MONITOR-SESSION010: Compaction detection events (count + tier distribution)
         "compaction_detection": {
             "total_events": _cmp_total,
@@ -1075,6 +1148,7 @@ def get_distribution_report() -> dict:
 
         return report
 
+
 def analyze_session_drops() -> dict:
     """Analyze session drop rate with full taxonomy and pressure correlation.
 
@@ -1121,18 +1195,15 @@ def analyze_session_drops() -> dict:
             "AND (julianday(ended_at) - julianday(started_at)) * 1440 > 10"
         ).fetchone()[0]
 
-        taxonomy["interrupted"] = conn.execute(
-            "SELECT COUNT(*) FROM sessions WHERE status = 'interrupted'"
-        ).fetchone()[0]
+        taxonomy["interrupted"] = conn.execute("SELECT COUNT(*) FROM sessions WHERE status = 'interrupted'").fetchone()[
+            0
+        ]
 
         taxonomy["healthy"] = conn.execute(
-            "SELECT COUNT(*) FROM sessions "
-            "WHERE status = 'ended' AND learning_event_count > 2"
+            "SELECT COUNT(*) FROM sessions WHERE status = 'ended' AND learning_event_count > 2"
         ).fetchone()[0]
 
-        taxonomy["active"] = conn.execute(
-            "SELECT COUNT(*) FROM sessions WHERE status = 'active'"
-        ).fetchone()[0]
+        taxonomy["active"] = conn.execute("SELECT COUNT(*) FROM sessions WHERE status = 'active'").fetchone()[0]
 
         # Derived metrics
         dropped = sum(v for k, v in taxonomy.items() if k not in ("healthy", "active"))

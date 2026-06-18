@@ -318,7 +318,11 @@ def link_concept_to_thread(
                 thread.concept_ids.append(concept_id)
                 save_thread(thread, conn=conn)
 
-    activity_source = "user" if added_by == "user" else ("auto" if added_by == "auto" else "session_learn")
+    activity_source = (
+        "user"
+        if added_by == "user"
+        else ("auto" if added_by in {"auto", "auto_binding", "backfill"} else "session_learn")
+    )
     record_thread_activity(thread_id, source=activity_source)
     return link
 
@@ -364,6 +368,77 @@ def classify_thread_role(
         return "evidence"
 
     return "member"
+
+
+def build_workstream_binding_snapshot(
+    *,
+    origin_id: str | None = None,
+    session_id: str | None = None,
+    current_task_id: str | None = None,
+) -> dict:
+    """Build the minimal binding metadata safe to persist in lifecycle payloads."""
+    normalized_task = _normalize_activation_task_id(current_task_id) if current_task_id else None
+    return {
+        "origin_id": _normalize_binding_authority(origin_id, "origin_id") if origin_id else None,
+        "session_id": _normalize_binding_authority(session_id, "session_id") if session_id else None,
+        "current_task_id": normalized_task,
+        "current_task_hash": _current_task_hash(normalized_task) if normalized_task else None,
+    }
+
+
+def link_concepts_to_active_workstream(
+    concepts: list,
+    *,
+    binding_snapshot: dict | None,
+) -> dict:
+    """Link newly created concepts to a strongly attributed active Workstream."""
+    from app.core.config import get_feature_flag
+
+    if not get_feature_flag("WORKSTREAM_ACTIVE_BINDING_LINKS_ENABLED", False):
+        return {"status": "disabled", "linked": 0, "reason": "feature_flag_off"}
+    if not concepts or not binding_snapshot:
+        return {"status": "skipped", "linked": 0, "reason": "missing_concepts_or_binding"}
+
+    origin_id = binding_snapshot.get("origin_id")
+    session_id = binding_snapshot.get("session_id")
+    current_task_id = binding_snapshot.get("current_task_id")
+    active = resolve_active_workstream(
+        origin_id=origin_id,
+        session_id=session_id,
+        current_task_id=current_task_id,
+        include_concept_summaries=False,
+    )
+    thread_id = active.get("thread_id")
+    binding_source = active.get("binding_source")
+    strong_binding = binding_source in {"composite_task", "session_task", "session_id"}
+    if not thread_id or not strong_binding:
+        return {
+            "status": "skipped",
+            "linked": 0,
+            "reason": "no_strong_active_binding",
+            "binding_source": binding_source,
+        }
+
+    linked = []
+    for concept in concepts:
+        concept_id = getattr(concept, "concept_id", None)
+        concept_type = getattr(concept, "concept_type", None)
+        if isinstance(concept, dict):
+            concept_id = concept.get("concept_id") or concept.get("id")
+            concept_type = concept.get("concept_type")
+        if not concept_id:
+            continue
+        role = classify_thread_role(concept_id, concept_type, thread_id)
+        link_concept_to_thread(thread_id, concept_id, role=role, added_by="auto_binding")
+        linked.append({"concept_id": concept_id, "role": role})
+
+    return {
+        "status": "linked" if linked else "skipped",
+        "linked": len(linked),
+        "thread_id": thread_id,
+        "binding_source": binding_source,
+        "links": linked,
+    }
 
 
 def unlink_concept_from_thread(thread_id: str, concept_id: str) -> None:
@@ -432,6 +507,11 @@ WORKSTREAM_BLOCKER_TEXT_MAX = 500
 WORKSTREAM_KNOWLEDGE_AREAS_MAX = 10
 WORKSTREAM_KNOWLEDGE_AREA_TEXT_MAX = 100
 WORKSTREAM_KNOWLEDGE_AREA_RE = re.compile(r"^[a-z0-9_]+$")
+WORKSTREAM_LANE_ID_MAX = 128
+WORKSTREAM_LANE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+WORKSTREAM_EXTERNAL_REFS_MAX = 16
+WORKSTREAM_EXTERNAL_REF_TYPE_MAX = 64
+WORKSTREAM_EXTERNAL_REF_ID_MAX = 256
 WORKSTREAM_QUALITY_STATES = {"ok", "needs_review", "blocked"}
 WORKSTREAM_RELATIONSHIPS = {"child", "related"}
 WORKSTREAM_DISCOVERY_TIERS = {
@@ -462,6 +542,33 @@ WORKSTREAM_ACTIVATION_SKIP_EXCEPTION_KINDS = {
     "other",
 }
 WORKSTREAM_ACTIVATION_DEFAULT_SKIP_EXCEPTION_KIND = "other"
+WORKSTREAM_LIFECYCLE_VERBS = {"start", "adopt", "progress", "complete", "reopen", "archive"}
+WORKSTREAM_LIFECYCLE_FIELDS_BY_VERB = {
+    "start": {
+        "title",
+        "description",
+        "urgency",
+        "goal_ids",
+        "knowledge_areas",
+        "agent_id",
+        "current_objective",
+        "current_summary",
+        "next_action",
+        "blockers",
+        "quality_state",
+        "created_by",
+        "lane_id",
+        "external_refs",
+        "parent_workstream_id",
+        "parent_title",
+        "relationship",
+    },
+    "adopt": {"lane_id", "external_refs"},
+    "progress": {"current_summary", "next_action", "blockers", "quality_state", "urgency", "lane_id", "external_refs"},
+    "complete": {"current_summary", "next_action", "blockers", "quality_state", "lane_id", "external_refs"},
+    "reopen": {"current_summary", "next_action", "blockers", "quality_state", "urgency", "lane_id", "external_refs"},
+    "archive": {"current_summary", "next_action", "blockers", "quality_state", "lane_id", "external_refs"},
+}
 _WORKSTREAM_PROOF_TERMS = (
     "proof",
     "control window",
@@ -552,6 +659,43 @@ def _normalize_workstream_quality_state(value: object) -> str:
     return state
 
 
+def _normalize_workstream_lane_id(value: object) -> str | None:
+    if value is None:
+        return None
+    lane_id = str(value).strip()[:WORKSTREAM_LANE_ID_MAX]
+    if not lane_id:
+        return None
+    if not WORKSTREAM_LANE_ID_RE.fullmatch(lane_id):
+        raise ValueError("invalid_lane_id")
+    return lane_id
+
+
+def _normalize_workstream_external_refs(value: object) -> list[dict[str, str]]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError("external_refs_must_be_list")
+    refs: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in value[:WORKSTREAM_EXTERNAL_REFS_MAX]:
+        if not isinstance(item, dict):
+            raise ValueError("external_ref_must_be_object")
+        ref_type = str(item.get("type") or "").strip().lower()[:WORKSTREAM_EXTERNAL_REF_TYPE_MAX]
+        ref_id = str(item.get("id") or "").strip()[:WORKSTREAM_EXTERNAL_REF_ID_MAX]
+        if not ref_type:
+            raise ValueError("external_ref_type_required")
+        if not ref_id:
+            raise ValueError("external_ref_id_required")
+        if not re.fullmatch(r"[a-z0-9_:-]+", ref_type):
+            raise ValueError("invalid_external_ref_type")
+        key = (ref_type, ref_id)
+        if key in seen:
+            continue
+        refs.append({"type": ref_type, "id": ref_id})
+        seen.add(key)
+    return refs
+
+
 def _normalize_discovery_reason_codes(value: object) -> list[str]:
     if value is None:
         return []
@@ -607,6 +751,8 @@ def _normalize_parent_workstream_id(value: object) -> str | None:
 
 
 def _build_workstream_metadata(
+    lane_id: object = None,
+    external_refs: object = None,
     current_objective: object = "",
     current_summary: object = "",
     next_action: object = "",
@@ -620,6 +766,8 @@ def _build_workstream_metadata(
     discovery_state: object = None,
 ) -> WorkstreamMetadata:
     return WorkstreamMetadata(
+        lane_id=_normalize_workstream_lane_id(lane_id),
+        external_refs=_normalize_workstream_external_refs(external_refs),
         current_objective=_normalize_workstream_text(current_objective),
         current_summary=_normalize_workstream_text(current_summary),
         next_action=_normalize_workstream_text(next_action),
@@ -634,8 +782,58 @@ def _build_workstream_metadata(
     )
 
 
+def _lifecycle_discovery_state(reason_code: str) -> dict:
+    now = _utc_now()
+    return {
+        "tier": "curated_candidate",
+        "reason_codes": [reason_code],
+        "source": "workstream_lifecycle",
+        "last_evaluated_at": now.isoformat(),
+        "eligible_until": (now + timedelta(days=WORKSTREAM_DISCOVERY_DEFAULT_TTL_DAYS)).isoformat(),
+        "promoted_by": "workstream_lifecycle",
+        "promoted_at": now.isoformat(),
+        "promotion_reason": "operator_confirmed_lifecycle_write",
+    }
+
+
+def _activation_discovery_state(reason_code: str) -> dict:
+    state = _lifecycle_discovery_state(reason_code)
+    state["source"] = "workstream_activation"
+    state["promoted_by"] = "workstream_activation"
+    state["promotion_reason"] = "operator_confirmed_activation_write"
+    return state
+
+
+def _ensure_lifecycle_discovery_state(thread: NarrativeThread, reason_code: str) -> NarrativeThread:
+    if thread.workstream is None:
+        raise ValueError("not_workstream")
+    if thread.workstream.discovery_state is None:
+        thread.workstream.discovery_state = _normalize_workstream_discovery_state(
+            _lifecycle_discovery_state(reason_code)
+        )
+        thread.updated_at = _utc_now_iso()
+        save_thread(thread)
+    return thread
+
+
+def _ensure_activation_discovery_state(thread: NarrativeThread, reason_code: str) -> NarrativeThread:
+    if thread.workstream is None:
+        raise ValueError("not_workstream")
+    if thread.workstream.discovery_state is None:
+        thread.workstream.discovery_state = _normalize_workstream_discovery_state(
+            _activation_discovery_state(reason_code)
+        )
+        thread.updated_at = _utc_now_iso()
+        save_thread(thread)
+    return thread
+
+
 def _metadata_updates_from_payload(payload: dict) -> dict:
     updates = {}
+    if "lane_id" in payload:
+        updates["lane_id"] = _normalize_workstream_lane_id(payload.get("lane_id"))
+    if "external_refs" in payload:
+        updates["external_refs"] = _normalize_workstream_external_refs(payload.get("external_refs"))
     if "current_objective" in payload:
         updates["current_objective"] = _normalize_workstream_text(payload.get("current_objective"))
     if "current_summary" in payload:
@@ -1024,6 +1222,8 @@ def create_workstream(
     goal_ids: list[str] | None = None,
     knowledge_areas: list[str] | None = None,
     agent_id: str = "default",
+    lane_id: str | None = None,
+    external_refs: list[dict[str, str]] | None = None,
     current_objective: str = "",
     current_summary: str = "",
     next_action: str = "",
@@ -1033,6 +1233,7 @@ def create_workstream(
     parent_workstream_id: str | None = None,
     parent_title: str | None = None,
     relationship: str | None = None,
+    discovery_state: dict | None = None,
 ) -> NarrativeThread:
     """Create an explicit user-curated Workstream on top of a narrative thread."""
     workstream_knowledge_areas = _normalize_workstream_knowledge_areas(knowledge_areas)
@@ -1046,6 +1247,8 @@ def create_workstream(
     )
     thread.knowledge_areas = workstream_knowledge_areas
     thread.workstream = _build_workstream_metadata(
+        lane_id=lane_id,
+        external_refs=external_refs,
         current_objective=current_objective,
         current_summary=current_summary,
         next_action=next_action,
@@ -1056,6 +1259,7 @@ def create_workstream(
         parent_workstream_id=parent_workstream_id,
         parent_title=parent_title,
         relationship=relationship,
+        discovery_state=discovery_state,
     )
     thread.updated_at = _utc_now_iso()
     save_thread(thread)
@@ -1081,6 +1285,8 @@ def promote_thread_to_workstream(
     payload = metadata or {}
     if thread.workstream is None:
         thread.workstream = _build_workstream_metadata(
+            lane_id=payload.get("lane_id"),
+            external_refs=payload.get("external_refs"),
             current_objective=payload.get("current_objective", ""),
             current_summary=payload.get("current_summary", ""),
             next_action=payload.get("next_action", ""),
@@ -1121,6 +1327,532 @@ def update_workstream_metadata(thread_id: str, updates: dict) -> NarrativeThread
     save_thread(thread)
     logger.info("workstream_updated thread_id=%s status=ok", thread.id)
     return thread
+
+
+def _normalize_lifecycle_verb(value: object) -> str:
+    verb = str(value or "").strip().lower()
+    if verb not in WORKSTREAM_LIFECYCLE_VERBS:
+        raise ValueError("invalid_lifecycle_verb")
+    return verb
+
+
+def _require_lifecycle_confirmation(operator_confirmed: bool) -> None:
+    if operator_confirmed is not True:
+        raise ValueError("operator_confirmation_required")
+
+
+def _require_lifecycle_authority(origin_id: str | None, session_id: str | None) -> None:
+    if not origin_id and not session_id:
+        raise ValueError("binding_authority_required")
+
+
+def _lifecycle_metadata(payload: dict | None, verb: str) -> dict:
+    if payload is None:
+        return {}
+    if not isinstance(payload, dict):
+        raise ValueError("metadata_must_be_object")
+    allowed = WORKSTREAM_LIFECYCLE_FIELDS_BY_VERB[verb]
+    unknown = sorted(set(payload) - allowed)
+    if unknown:
+        raise ValueError(f"unknown_lifecycle_metadata_field:{unknown[0]}")
+    return dict(payload)
+
+
+def _normalize_lifecycle_quality_state(value: object) -> str:
+    state = str(value or "ok").strip().lower()
+    return state if state in WORKSTREAM_QUALITY_STATES else "needs_review"
+
+
+def _normalize_lifecycle_urgency(value: object) -> str:
+    urgency = str(value or "normal").strip().lower()
+    return urgency if urgency in {"low", "normal", "high"} else "normal"
+
+
+def _workstream_lifecycle_error(reason: str, field: str | None = None, required_action: str | None = None) -> dict:
+    result = {"status": "rejected", "reason": reason}
+    if field:
+        result["field"] = field
+    if required_action:
+        result["required_action"] = required_action
+    return result
+
+
+def _lifecycle_thread_payload(thread: NarrativeThread) -> dict:
+    return thread.model_dump()
+
+
+def _resolve_lifecycle_thread(
+    *,
+    thread_id: str | None,
+    origin_id: str | None,
+    session_id: str | None,
+    current_task_id: str | None,
+    require_exact_when_implicit: bool = False,
+    allow_terminal_exact: bool = False,
+) -> tuple[str, dict | None]:
+    if thread_id:
+        return str(thread_id).strip(), None
+    exact = load_exact_workstream_binding_checkpoint(
+        origin_id=origin_id,
+        session_id=session_id,
+        current_task_id=current_task_id,
+    )
+    if exact:
+        resolved = (exact.get("context") or {}).get("workstream_thread_id")
+        if resolved:
+            return resolved, exact
+    if allow_terminal_exact:
+        terminal = load_terminal_exact_workstream_binding_checkpoint(
+            origin_id=origin_id,
+            session_id=session_id,
+            current_task_id=current_task_id,
+        )
+        resolved = (terminal.get("context") or {}).get("workstream_thread_id") if terminal else None
+        if resolved:
+            return resolved, terminal
+    if require_exact_when_implicit:
+        raise ValueError("thread_id_or_exact_binding_required")
+    active = load_active_workstream_binding_checkpoint(origin_id=origin_id, session_id=session_id)
+    resolved = (active.get("context") or {}).get("workstream_thread_id") if active else None
+    if not resolved:
+        raise ValueError("thread_id_or_active_binding_required")
+    return resolved, active
+
+
+def _apply_lifecycle_metadata(thread_id: str, metadata: dict | None, verb: str, *, updated_by: str = "user") -> NarrativeThread:
+    thread = load_thread(thread_id)
+    if not thread:
+        raise ValueError("thread_not_found")
+    if thread.workstream is None:
+        raise ValueError("not_workstream")
+    updates = _lifecycle_metadata(metadata, verb)
+    if "current_summary" in updates:
+        thread.workstream.current_summary = _normalize_workstream_text(updates["current_summary"], max_len=2000)
+    if "next_action" in updates:
+        thread.workstream.next_action = _normalize_workstream_text(updates["next_action"], max_len=1000)
+    if "blockers" in updates:
+        thread.workstream.blockers = _normalize_workstream_blockers(updates["blockers"])
+    if "quality_state" in updates:
+        thread.workstream.quality_state = _normalize_lifecycle_quality_state(updates["quality_state"])
+    if "urgency" in updates:
+        thread.urgency = _normalize_lifecycle_urgency(updates["urgency"])
+    if "lane_id" in updates:
+        thread.workstream.lane_id = _normalize_workstream_lane_id(updates["lane_id"])
+    if "external_refs" in updates:
+        thread.workstream.external_refs = _normalize_workstream_external_refs(updates["external_refs"])
+    thread.workstream.updated_by = _normalize_workstream_text(updated_by, max_len=128) or "user"
+    thread.updated_at = _utc_now_iso()
+    save_thread(thread)
+    return thread
+
+
+def update_workstream_lifecycle_progress(
+    thread_id: str,
+    metadata: dict,
+    *,
+    updated_by: str = "user",
+) -> NarrativeThread:
+    """Update bounded Workstream progress fields for the lifecycle surface."""
+    thread = _apply_lifecycle_metadata(thread_id, metadata, "progress", updated_by=updated_by)
+    logger.info("workstream_lifecycle_progress thread_id=%s status=ok", thread.id)
+    return thread
+
+
+def _binding_substate(result: dict) -> dict:
+    if result.get("status") == "ok":
+        return {"status": "cleared", "applied": True}
+    if result.get("status") in {"not_found", "complete", "archived"}:
+        return {"status": "already_cleared", "applied": False}
+    return {"status": result.get("binding_status") or result.get("status") or "unknown", "applied": False}
+
+
+def _clear_lifecycle_binding(
+    *,
+    thread_id: str,
+    origin_id: str | None,
+    session_id: str | None,
+    current_task_id: str | None,
+) -> dict:
+    try:
+        result = clear_workstream_binding(
+            thread_id=thread_id,
+            origin_id=origin_id,
+            session_id=session_id,
+            current_task_id=current_task_id,
+        )
+    except ValueError as exc:
+        if str(exc) == "binding_authority_required":
+            return {"status": "already_cleared", "applied": False}
+        raise
+    state = _binding_substate(result)
+    if _complete_active_workstream_binding_checkpoints(thread_id):
+        return {"status": "cleared", "applied": True}
+    return state
+
+
+def _complete_active_workstream_binding_checkpoints(thread_id: str) -> int:
+    """Complete all active binding checkpoints for a terminal Workstream.
+
+    Terminal lifecycle writes make every active binding for the same Workstream
+    stale. Completing checkpoints preserves history while removing them from
+    active binding lookup.
+    """
+    from app.storage import complete_checkpoint
+    from app.storage.connection import read_snapshot_db
+
+    target_thread_id = str(thread_id or "").strip()
+    if not target_thread_id:
+        return 0
+    with read_snapshot_db("complete_active_workstream_binding_checkpoints") as conn:
+        rows = conn.execute(
+            """
+            SELECT task_id FROM checkpoints
+            WHERE status NOT IN ('complete', 'archived')
+              AND expires_at > ?
+              AND json_extract(context, '$.workstream_thread_id') = ?
+              AND (
+                task_id LIKE 'workstream:%'
+                OR task_id LIKE 'workstream-composite:%'
+                OR task_id LIKE 'workstream-session-task:%'
+              )
+            ORDER BY updated_at DESC
+            """,
+            (_utc_now_iso(), target_thread_id),
+        ).fetchall()
+    completed = 0
+    for row in rows:
+        task_id = row["task_id"] if hasattr(row, "keys") else row[0]
+        if complete_checkpoint(task_id):
+            completed += 1
+    if completed:
+        logger.info("workstream_terminal_bindings_cleared thread_id=%s count=%d", target_thread_id, completed)
+    return completed
+
+
+def _complete_workstream_lifecycle(
+    *,
+    thread_id: str,
+    origin_id: str | None,
+    session_id: str | None,
+    current_task_id: str | None,
+    metadata: dict | None,
+) -> dict:
+    if metadata:
+        _apply_lifecycle_metadata(thread_id, metadata, "complete")
+    thread = load_thread(thread_id)
+    if not thread:
+        raise ValueError("thread_not_found")
+    if thread.workstream is None:
+        raise ValueError("not_workstream")
+    if thread.status == "completed":
+        thread_state = {"status": "already_completed", "applied": False}
+    elif thread.status in {"active", "paused"}:
+        thread = update_thread_status(thread_id, "completed", reason="workstream_lifecycle_complete")
+        thread_state = {"status": "completed", "applied": True}
+        _record_workstream_metric(
+            "workstream_lifecycle_transition",
+            {"verb": "complete", "from_status": "active_or_paused", "to_status": "completed"},
+        )
+    else:
+        raise ValueError("invalid_lifecycle_transition")
+    binding_state = _clear_lifecycle_binding(
+        thread_id=thread_id,
+        origin_id=origin_id,
+        session_id=session_id,
+        current_task_id=current_task_id,
+    )
+    return {
+        "status": "ok",
+        "verb": "complete",
+        "thread_id": thread_id,
+        "thread": _lifecycle_thread_payload(load_thread(thread_id)),
+        "thread_status": thread_state,
+        "binding_status": binding_state,
+        "idempotency": {
+            "applied": bool(thread_state["applied"] or binding_state["applied"]),
+            "mechanism": "state",
+        },
+    }
+
+
+def _archive_workstream_lifecycle(
+    *,
+    thread_id: str,
+    origin_id: str | None,
+    session_id: str | None,
+    current_task_id: str | None,
+    metadata: dict | None,
+) -> dict:
+    if metadata:
+        _apply_lifecycle_metadata(thread_id, metadata, "archive")
+    thread = load_thread(thread_id)
+    if not thread:
+        raise ValueError("thread_not_found")
+    if thread.workstream is None:
+        raise ValueError("not_workstream")
+    if thread.status == "abandoned":
+        thread_state = {"status": "already_abandoned", "applied": False}
+    elif thread.status in {"active", "paused"}:
+        thread = update_thread_status(thread_id, "abandoned", reason="workstream_lifecycle_archive")
+        thread_state = {"status": "abandoned", "applied": True}
+        _record_workstream_metric(
+            "workstream_lifecycle_transition",
+            {"verb": "archive", "from_status": "active_or_paused", "to_status": "abandoned"},
+        )
+    else:
+        raise ValueError("invalid_lifecycle_transition")
+    binding_state = _clear_lifecycle_binding(
+        thread_id=thread_id,
+        origin_id=origin_id,
+        session_id=session_id,
+        current_task_id=current_task_id,
+    )
+    return {
+        "status": "ok",
+        "verb": "archive",
+        "thread_id": thread_id,
+        "thread": _lifecycle_thread_payload(load_thread(thread_id)),
+        "thread_status": thread_state,
+        "binding_status": binding_state,
+        "idempotency": {
+            "applied": bool(thread_state["applied"] or binding_state["applied"]),
+            "mechanism": "state",
+        },
+    }
+
+
+def _reopen_workstream_lifecycle(
+    *,
+    thread_id: str,
+    origin_id: str | None,
+    session_id: str | None,
+    current_task_id: str | None,
+    metadata: dict | None,
+    op_id: int | None,
+    payload_hash: str | None,
+) -> dict:
+    if metadata:
+        _apply_lifecycle_metadata(thread_id, metadata, "reopen")
+    thread = load_thread(thread_id)
+    if not thread:
+        raise ValueError("thread_not_found")
+    if thread.workstream is None:
+        raise ValueError("not_workstream")
+    if thread.status == "active":
+        thread_state = {"status": "already_active", "applied": False}
+    elif thread.status in {"completed", "abandoned", "paused"}:
+        thread = update_thread_status(thread_id, "active", reason="workstream_lifecycle_reopen")
+        thread_state = {"status": "active", "applied": True}
+        _record_workstream_metric(
+            "workstream_lifecycle_transition",
+            {"verb": "reopen", "from_status": "terminal_or_paused", "to_status": "active"},
+        )
+    else:
+        raise ValueError("invalid_lifecycle_transition")
+    bound = bind_workstream_checkpoint(
+        thread_id,
+        origin_id=origin_id,
+        session_id=session_id,
+        current_task_id=current_task_id,
+        op_id=op_id,
+        payload_hash=payload_hash,
+    )
+    return {
+        "status": "ok",
+        "verb": "reopen",
+        "thread_id": thread_id,
+        "thread": _lifecycle_thread_payload(load_thread(thread_id)),
+        "thread_status": thread_state,
+        "binding_status": {"status": bound.get("binding_status"), "applied": True},
+        "checkpoint": bound.get("checkpoint"),
+    }
+
+
+def workstream_lifecycle(
+    verb: str,
+    origin_id: str | None = None,
+    session_id: str | None = None,
+    current_task_id: str | None = None,
+    thread_id: str | None = None,
+    metadata: dict | None = None,
+    operator_confirmed: bool = False,
+    request_id: str | None = None,
+    op_id: int | None = None,
+    payload_hash: str | None = None,
+) -> dict:
+    """Production-safe Workstream lifecycle verbs."""
+    try:
+        normalized_verb = _normalize_lifecycle_verb(verb)
+        _require_lifecycle_confirmation(operator_confirmed)
+        if normalized_verb in {"start", "adopt", "complete", "reopen", "archive"}:
+            _require_lifecycle_authority(origin_id, session_id)
+        payload = _lifecycle_metadata(metadata, normalized_verb)
+        _record_workstream_metric(
+            "workstream_lifecycle_request",
+            {
+                "verb": normalized_verb,
+                "status": "accepted",
+                "reason": "",
+                "origin_id_present": bool(origin_id),
+                "session_id_present": bool(session_id),
+                "current_task_id_present": bool(current_task_id),
+            },
+        )
+
+        if normalized_verb == "start":
+            title = _normalize_workstream_text(payload.get("title"), max_len=500)
+            if not title:
+                raise ValueError("title_required")
+            thread = create_workstream(
+                title=title,
+                description=_normalize_workstream_text(payload.get("description"), max_len=500),
+                urgency=_normalize_lifecycle_urgency(payload.get("urgency")),
+                goal_ids=payload.get("goal_ids"),
+                knowledge_areas=payload.get("knowledge_areas"),
+                agent_id=_normalize_workstream_text(payload.get("agent_id"), max_len=128) or "default",
+                lane_id=payload.get("lane_id"),
+                external_refs=payload.get("external_refs"),
+                current_objective=_normalize_workstream_text(payload.get("current_objective"), max_len=2000),
+                current_summary=_normalize_workstream_text(payload.get("current_summary"), max_len=2000),
+                next_action=_normalize_workstream_text(payload.get("next_action"), max_len=1000),
+                blockers=payload.get("blockers"),
+                quality_state=_normalize_lifecycle_quality_state(payload.get("quality_state")),
+                created_by=_normalize_workstream_text(payload.get("created_by"), max_len=128) or "user",
+                parent_workstream_id=payload.get("parent_workstream_id"),
+                parent_title=payload.get("parent_title"),
+                relationship=payload.get("relationship"),
+                discovery_state=_lifecycle_discovery_state("lifecycle_start_operator_confirmed"),
+            )
+            try:
+                bound = bind_workstream_checkpoint(
+                    thread.id,
+                    origin_id=origin_id,
+                    session_id=session_id,
+                    current_task_id=current_task_id,
+                    op_id=op_id,
+                    payload_hash=payload_hash,
+                )
+            except Exception:
+                update_thread_status(thread.id, "abandoned", reason="lifecycle_bind_failed")
+                raise
+            return {
+                "status": "ok",
+                "verb": "start",
+                "thread_id": thread.id,
+                "thread": _lifecycle_thread_payload(load_thread(thread.id)),
+                "binding_status": {"status": bound.get("binding_status"), "applied": True},
+                "checkpoint": bound.get("checkpoint"),
+                "request_id": request_id,
+            }
+
+        if normalized_verb == "adopt":
+            if not thread_id:
+                raise ValueError("thread_id_required")
+            thread = load_thread(thread_id)
+            if not thread:
+                raise ValueError("thread_not_found")
+            if thread.workstream is None:
+                raise ValueError("not_workstream")
+            thread = _ensure_lifecycle_discovery_state(thread, "lifecycle_adopt_operator_confirmed")
+            if payload:
+                thread = _apply_lifecycle_metadata(thread.id, payload, "adopt")
+            bound = bind_workstream_checkpoint(
+                thread.id,
+                origin_id=origin_id,
+                session_id=session_id,
+                current_task_id=current_task_id,
+                op_id=op_id,
+                payload_hash=payload_hash,
+            )
+            return {
+                "status": "ok",
+                "verb": "adopt",
+                "thread_id": thread.id,
+                "thread": _lifecycle_thread_payload(thread),
+                "binding_status": {"status": bound.get("binding_status"), "applied": True},
+                "checkpoint": bound.get("checkpoint"),
+                "request_id": request_id,
+            }
+
+        resolved_thread_id, _ = _resolve_lifecycle_thread(
+            thread_id=thread_id,
+            origin_id=origin_id,
+            session_id=session_id,
+            current_task_id=current_task_id,
+            require_exact_when_implicit=normalized_verb in {"complete", "archive"},
+            allow_terminal_exact=normalized_verb in {"complete", "archive"},
+        )
+
+        if normalized_verb == "progress":
+            thread = update_workstream_lifecycle_progress(resolved_thread_id, payload)
+            return {
+                "status": "ok",
+                "verb": "progress",
+                "thread_id": thread.id,
+                "thread": _lifecycle_thread_payload(thread),
+                "request_id": request_id,
+            }
+        if normalized_verb == "complete":
+            result = _complete_workstream_lifecycle(
+                thread_id=resolved_thread_id,
+                origin_id=origin_id,
+                session_id=session_id,
+                current_task_id=current_task_id,
+                metadata=payload,
+            )
+            result["request_id"] = request_id
+            _record_workstream_metric(
+                "workstream_lifecycle_idempotency",
+                {"verb": "complete", "applied": result["idempotency"]["applied"], "mechanism": "state"},
+            )
+            return result
+        if normalized_verb == "archive":
+            result = _archive_workstream_lifecycle(
+                thread_id=resolved_thread_id,
+                origin_id=origin_id,
+                session_id=session_id,
+                current_task_id=current_task_id,
+                metadata=payload,
+            )
+            result["request_id"] = request_id
+            _record_workstream_metric(
+                "workstream_lifecycle_idempotency",
+                {"verb": "archive", "applied": result["idempotency"]["applied"], "mechanism": "state"},
+            )
+            return result
+        if normalized_verb == "reopen":
+            if not thread_id:
+                raise ValueError("thread_id_required")
+            result = _reopen_workstream_lifecycle(
+                thread_id=thread_id,
+                origin_id=origin_id,
+                session_id=session_id,
+                current_task_id=current_task_id,
+                metadata=payload,
+                op_id=op_id,
+                payload_hash=payload_hash,
+            )
+            result["request_id"] = request_id
+            return result
+    except ValueError as exc:
+        reason = str(exc)
+        _record_workstream_metric(
+            "workstream_lifecycle_request",
+            {
+                "verb": str(verb or ""),
+                "status": "rejected",
+                "reason": reason.split(":", 1)[0],
+                "origin_id_present": bool(origin_id),
+                "session_id_present": bool(session_id),
+                "current_task_id_present": bool(current_task_id),
+            },
+        )
+        field = reason.split(":", 1)[1] if reason.startswith("unknown_lifecycle_metadata_field:") else None
+        return _workstream_lifecycle_error(reason.split(":", 1)[0], field=field)
+    except Exception:
+        logger.exception("workstream_lifecycle failed verb=%s", verb)
+        return _workstream_lifecycle_error("internal_error")
+    return _workstream_lifecycle_error("invalid_lifecycle_verb")
 
 
 def bind_workstream_checkpoint(
@@ -1229,6 +1961,13 @@ def bind_workstream_checkpoint(
     result["context"] = context
     result["origin_id"] = origin_id
     result["session_id"] = session_id
+    thread.workstream.activation_origin_id = normalized_origin
+    thread.workstream.activation_session_id = normalized_session
+    thread.workstream.activation_current_task_id = normalized_task
+    thread.workstream.activation_binding_source = binding_authority
+    thread.workstream.activation_bound_at = _utc_now_iso()
+    thread.updated_at = _utc_now_iso()
+    save_thread(thread)
     logger.info("workstream_bound thread_id=%s authority=%s status=ok", thread.id, binding_authority)
     return {"status": "ok", "binding_status": binding_authority, "thread_id": thread.id, "checkpoint": result}
 
@@ -1296,6 +2035,74 @@ def load_exact_workstream_binding_checkpoint(
         return _checkpoint_row_to_dict(
             row,
             selection_source="session_task",
+            selection_authority="authoritative",
+        )
+    return None
+
+
+def load_terminal_exact_workstream_binding_checkpoint(
+    origin_id: str | None = None,
+    session_id: str | None = None,
+    current_task_id: str | None = None,
+    max_age_hours: int = 24,
+) -> dict | None:
+    """Load a recently completed exact binding for terminal lifecycle retries."""
+    if not current_task_id or not session_id:
+        return None
+    normalized_task = _normalize_activation_task_id(current_task_id)
+    task_hash = _current_task_hash(normalized_task)
+    max_age_hours = max_age_hours or 24
+    cutoff = (_utc_now() - timedelta(hours=max_age_hours)).isoformat()
+    from app.storage.connection import read_snapshot_db
+
+    normalized_origin = _normalize_binding_authority(origin_id, "origin_id") if origin_id else None
+    normalized_session = _normalize_binding_authority(session_id, "session_id")
+    with read_snapshot_db("load_terminal_exact_workstream_binding_checkpoint") as conn:
+        if normalized_origin:
+            row = conn.execute(
+                """
+                SELECT * FROM checkpoints
+                WHERE status IN ('complete', 'archived')
+                  AND expires_at > ?
+                  AND updated_at > ?
+                  AND task_id LIKE ?
+                  AND origin_id = ?
+                  AND session_id = ?
+                  AND json_extract(context, '$.binding_authority') = 'composite'
+                  AND json_extract(context, '$.current_task_hash') = ?
+                  AND json_extract(context, '$.workstream_thread_id') IS NOT NULL
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                (_utc_now_iso(), cutoff, f"workstream-composite:%:{task_hash}", normalized_origin, normalized_session, task_hash),
+            ).fetchone()
+            if row:
+                return _checkpoint_row_to_dict(
+                    row,
+                    selection_source="terminal_composite_task",
+                    selection_authority="authoritative",
+                )
+
+        row = conn.execute(
+            """
+            SELECT * FROM checkpoints
+            WHERE status IN ('complete', 'archived')
+              AND expires_at > ?
+              AND updated_at > ?
+              AND task_id LIKE ?
+              AND session_id = ?
+              AND json_extract(context, '$.binding_authority') = 'session_task'
+              AND json_extract(context, '$.current_task_hash') = ?
+              AND json_extract(context, '$.workstream_thread_id') IS NOT NULL
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            (_utc_now_iso(), cutoff, f"workstream-session-task:%:{task_hash}", normalized_session, task_hash),
+        ).fetchone()
+    if row:
+        return _checkpoint_row_to_dict(
+            row,
+            selection_source="terminal_session_task",
             selection_authority="authoritative",
         )
     return None
@@ -1915,6 +2722,28 @@ def ensure_workstream_activation(
             return {"status": "not_found", "mode": normalized_mode, "read_only": True}
         if thread.workstream is None:
             return {"status": "rejected", "mode": normalized_mode, "read_only": True, "reason": "not_workstream"}
+        thread = _ensure_activation_discovery_state(thread, "activation_bind_operator_confirmed")
+        if metadata is not None:
+            if not isinstance(metadata, dict):
+                return {
+                    "status": "rejected",
+                    "mode": normalized_mode,
+                    "read_only": True,
+                    "reason": "metadata_must_be_object",
+                    "field": "metadata",
+                    "required_action": "send_metadata_object",
+                }
+            try:
+                thread = update_workstream_metadata(
+                    normalized_thread_id,
+                    {
+                        key: metadata[key]
+                        for key in ("lane_id", "external_refs")
+                        if key in metadata
+                    },
+                )
+            except ValueError as exc:
+                return {"status": "rejected", "mode": normalized_mode, "read_only": True, "reason": str(exc)}
         previous = load_exact_workstream_binding_checkpoint(
             origin_id=origin_id,
             session_id=session_id,
@@ -1983,6 +2812,8 @@ def ensure_workstream_activation(
             goal_ids=payload.get("goal_ids"),
             knowledge_areas=payload.get("knowledge_areas"),
             agent_id=payload.get("agent_id", "default"),
+            lane_id=payload.get("lane_id"),
+            external_refs=payload.get("external_refs"),
             current_objective=payload.get("current_objective", ""),
             current_summary=payload.get("current_summary", ""),
             next_action=payload.get("next_action", ""),
@@ -1992,6 +2823,7 @@ def ensure_workstream_activation(
             parent_workstream_id=payload.get("parent_workstream_id"),
             parent_title=payload.get("parent_title"),
             relationship=payload.get("relationship"),
+            discovery_state=_activation_discovery_state("activation_create_operator_confirmed"),
         )
         bound = bind_workstream_checkpoint(
             thread.id,
@@ -2425,6 +3257,7 @@ def apply_workstream_hygiene(
     fingerprints: dict[str, str],
     proposed_states: dict[str, dict],
     operator_confirmed: bool = False,
+    agent_id: str = "default",
 ) -> dict:
     """Apply a previously reviewed hygiene dry-run if fingerprints still match."""
     if operator_confirmed is not True:
@@ -2439,7 +3272,7 @@ def apply_workstream_hygiene(
     except ValueError as exc:
         return {"status": "rejected", "read_only": True, "reason": str(exc)}
 
-    rows = _hygiene_rows_by_id()
+    rows = _hygiene_rows_by_id(agent_id=agent_id)
     stale_thread_ids: list[str] = []
     mismatched_state_ids: list[str] = []
     previous_states: dict[str, dict | None] = {}
