@@ -5,7 +5,7 @@
 
 param(
     [switch]$Force = $false,
-    [string]$PithVersion = "1.0.1"
+    [string]$PithVersion = "1.0.2"
 )
 
 # Strict error handling
@@ -94,7 +94,7 @@ catch {
 # If not found, check Microsoft Store Python and offer to install
 if (-not $PythonPath) {
     Write-Warning "Python 3 not found in PATH"
-
+    
     # Check if winget is available
     try {
         $WingetAvailable = $null -ne (Get-Command winget -ErrorAction SilentlyContinue)
@@ -223,30 +223,30 @@ if (-not $DownloadSuccess) {
 # Strategy 3: Download from hosted URL (future)
 if (-not $DownloadSuccess) {
     Write-Host "Attempting download from: $DownloadUrl"
-
+    
     $TempDir = [System.IO.Path]::GetTempPath() + [System.Guid]::NewGuid().ToString()
     New-Item -ItemType Directory -Path $TempDir -Force | Out-Null
-
+    
     try {
         # Download server package
         $ServerUrl = "$DownloadUrl/$PithServerFilename"
         $ServerPath = Join-Path $TempDir $PithServerFilename
         Invoke-WebRequest -Uri $ServerUrl -OutFile $ServerPath -TimeoutSec 30 -ErrorAction SilentlyContinue
-
+        
         # Download checksum
         $ChecksumPath = Join-Path $TempDir $PithChecksumFilename
         $ChecksumUrl = "$ChecksumUrl/$PithChecksumFilename"
         Invoke-WebRequest -Uri $ChecksumUrl -OutFile $ChecksumPath -TimeoutSec 30 -ErrorAction SilentlyContinue
-
+        
         # Verify checksum
         if ((Test-Path $ServerPath) -and (Test-Path $ChecksumPath)) {
             $FileHash = (Get-FileHash -Path $ServerPath -Algorithm SHA256).Hash
             $ChecksumContent = (Get-Content $ChecksumPath | Select-Object -First 1) -split ' '
             $ExpectedHash = $ChecksumContent[0]
-
+            
             if ($FileHash -eq $ExpectedHash) {
                 Write-Success "Download successful and checksum verified"
-
+                
                 # Extract server
                 if (-not (Test-Path $PithServerPath)) {
                     New-Item -ItemType Directory -Path $PithServerPath -Force | Out-Null
@@ -380,10 +380,10 @@ $ApiKeyFile = "$PithHome\config\api.key"
 if (-not (Test-Path $ApiKeyFile)) {
     # Generate 32-byte random key as hex (64 chars)
     $ApiKey = -join ((1..32) | ForEach-Object { "{0:x2}" -f (Get-Random -Minimum 0 -Maximum 256) })
-
+    
     # Write with restricted permissions
     Set-Content -Path $ApiKeyFile -Value $ApiKey -NoNewline
-
+    
     # FIX S2: Set restrictive ACL (owner read-only)
     $Acl = Get-Acl -Path $ApiKeyFile
     $Acl.SetAccessRuleProtection($true, $false)
@@ -395,7 +395,7 @@ if (-not (Test-Path $ApiKeyFile)) {
     )
     $Acl.AddAccessRule($Rule)
     Set-Acl -Path $ApiKeyFile -AclObject $Acl
-
+    
     Write-Success "Generated API key: $($ApiKey.Substring(0, 16))... (saved to $ApiKeyFile)"
 }
 else {
@@ -573,7 +573,7 @@ try {
         -WorkingDirectory $PithServerPath `
         -WindowStyle Hidden `
         -PassThru
-
+    
     $Stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     while ($Stopwatch.Elapsed.TotalSeconds -lt 30) {
         try {
@@ -589,7 +589,7 @@ try {
             Start-Sleep -Milliseconds 500
         }
     }
-
+    
     Stop-Process -Id $proc.Id -ErrorAction SilentlyContinue
 }
 catch {

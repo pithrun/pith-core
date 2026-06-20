@@ -15,7 +15,7 @@ PITH_REPAIR_RUNTIME="${PITH_REPAIR_RUNTIME:-0}"
 PITH_FORCE_MANAGED_PYTHON="${PITH_FORCE_MANAGED_PYTHON:-0}"
 # Keep PITH_VERSION on line 18.
 # scripts/version-bump.sh and TEST-090 depend on this exact location.
-PITH_VERSION="1.0.1"
+PITH_VERSION="1.0.2"
 detect_account_home() {
     if command -v dscl >/dev/null 2>&1; then
         dscl . -read "/Users/$(id -un)" NFSHomeDirectory 2>/dev/null | awk '{print $2; exit}' && return
@@ -2841,12 +2841,15 @@ echo "  • ${YELLOW}pith update${NC}  - Update Pith"
 echo "  • ${YELLOW}pith version${NC} - Show version and system info"
 echo ""
 echo -e "${BLUE}Required setup:${NC}"
-echo "  1. Open a new terminal (or reload your shell profile)"
+SETUP_STEP=1
+echo "  ${SETUP_STEP}. Open a new terminal (or reload your shell profile)"
+SETUP_STEP=$((SETUP_STEP + 1))
 if surface_selected_and_detected claude_desktop; then
-    echo "  2. Claude Desktop instructions: if you pasted them during Step 7, this is already done."
+    echo "  ${SETUP_STEP}. Claude Desktop instructions: if you pasted them during Step 7, this is already done."
     echo "     To redo later: ${YELLOW}pith protocol${NC}  (copies prompt for Settings → General → Instructions for Claude)"
+    SETUP_STEP=$((SETUP_STEP + 1))
 fi
-echo "  3. Restart each configured AI client completely before testing it"
+echo "  ${SETUP_STEP}. Restart each configured AI client completely before testing it"
 if surface_selected_and_detected cursor; then
     echo "  Cursor: MCP config is installed, but Cursor also needs a Global/User Rule for default Pith invocation."
     echo "     Paste ${YELLOW}$CURSOR_GLOBAL_RULE_PATH${NC} into Cursor Settings → Rules."

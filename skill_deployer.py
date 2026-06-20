@@ -355,7 +355,7 @@ def _deploy_to_claude_compat(skills, log_fn, strategy="symlink"):
 
 def _find_all_cowork_slots(base_path):
     """SKILLS-001: Return ALL Cowork session slots — eliminates session-targeting race condition.
-
+    
     Prior heuristic (most recently created/modified slot) was unreliable: Cowork updates
     manifests independently, so the deploy could target a stale slot. Returning all slots
     guarantees every session gets skills, regardless of timing.
@@ -1222,16 +1222,16 @@ def _deployer_owned_generated_hard_failures(status):
 
 def auto_deploy_if_needed():
     """Auto-deploy skills to Cowork if needed, with 5-minute debounce.
-
+    
     Called from conversation_turn pipeline. Returns deploy result or None if skipped.
     """
     import time
     global _last_auto_deploy_ts
-
+    
     now = time.time()
     if now - _last_auto_deploy_ts < _AUTO_DEPLOY_COOLDOWN_SECONDS:
         return None
-
+    
     # Check if deploy is needed
     try:
         status = deploy_skills(status_only=True)
@@ -1241,11 +1241,11 @@ def auto_deploy_if_needed():
             return None
     except Exception:
         return None
-
+    
     # Deploy — set cooldown AFTER deploy so failed deploys don't eat retry window (DEBT-225)
     result = deploy_skills(status_only=False, repair=needs_repair)
     _last_auto_deploy_ts = time.time()
-
+    
     # Post-deploy verification
     verify = deploy_skills(status_only=True)
     cowork_verify = verify.get("surfaces", {}).get("cowork", {})
@@ -1256,5 +1256,5 @@ def auto_deploy_if_needed():
         result["warning"] = (
             "Post-deploy verification failed: generated skill metadata still has hard failures"
         )
-
+    
     return result
