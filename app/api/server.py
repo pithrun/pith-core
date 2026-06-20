@@ -949,8 +949,12 @@ def auto_associate_single(*args: Any, **kwargs: Any) -> Any:
 # MATURITY-001: Maturities blocked from external API results
 _BLOCKED_MATURITIES = {"QUARANTINED", "DISCARDED"}
 
+SERVER_VERSION = os.environ.get("PITH_VERSION", "1.0.2")
+
 app = FastAPI(
-    title="Pith Server", version="1.1.0", description="AI Learning Architecture with versioned conceptual memory"
+    title="Pith Server",
+    version=SERVER_VERSION,
+    description="AI Learning Architecture with versioned conceptual memory",
 )
 
 _PITH_ORIENT_CACHE_LOCK = threading.Lock()
@@ -1368,7 +1372,7 @@ def _build_ready_state() -> dict:
         "status": "healthy" if process_state in {"starting", "running"} else "stopping",
         "service": "pith",
         "timestamp": _utc_now_iso(),
-        "version": "1.1.0",
+        "version": SERVER_VERSION,
         **git_provenance,
         "mode": mode,
         "process_state": process_state,
@@ -2228,7 +2232,7 @@ async def _complete_startup_initialization():
 async def startup_event():
     """Initialize components on startup."""
     logger.info("Pith Server starting up...")
-    logger.info("Server version: 1.1.0")
+    logger.info("Server version: %s", SERVER_VERSION)
     app.state.process_state = "starting"
     app.state.write_state = "queued"
     app.state.retrieval_state = "recovering"
@@ -2577,7 +2581,7 @@ def healthz() -> dict:
         else "stopping",
         "service": "pith",
         "timestamp": _utc_now_iso(),
-        "version": "1.1.0",
+        "version": SERVER_VERSION,
         "git_commit": _GIT_COMMIT,
         "git_branch": _GIT_BRANCH,
         "git_dirty": _GIT_DIRTY,
@@ -3015,7 +3019,7 @@ def health_check(request: Request, detail: str | None = None):
                 "status": "unhealthy",
                 "service": "pith",
                 "timestamp": _utc_now_iso(),
-                "version": "1.1.0",
+                "version": SERVER_VERSION,
                 "error": _safe_error(e),
             }
 
@@ -6501,7 +6505,7 @@ def status_endpoint():
             "circuit_open": _circuit_open,
             "consecutive_failures": _consecutive_failures,
         },
-        "server_version": "1.1.0",
+        "server_version": SERVER_VERSION,
     }
 
 
