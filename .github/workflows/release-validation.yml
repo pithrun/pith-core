@@ -17,10 +17,12 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          fetch-depth: 0
 
       - name: Describe validation boundary
         run: |
-          echo "release-validation checks repository syntax and launch-surface hygiene only."
+          echo "release-validation checks repository syntax and public-surface hygiene."
           echo "It does not publish a release, upload assets, deploy workers, write R2, or prove an end-to-end install."
 
       - name: Verify required release files
@@ -44,7 +46,7 @@ jobs:
 
       - name: Python syntax check
         run: |
-          python -m compileall -q app migrations pith_mcp.py skill_deployer.py scripts/configure_clients.py
+          python3 -m compileall -q app migrations pith_mcp.py skill_deployer.py scripts/configure_clients.py .github/scripts/public_safety_scan.py
 
       - name: Bash syntax check
         run: |
@@ -72,7 +74,7 @@ jobs:
 
       - name: Local Markdown link check
         run: |
-          python - <<'PY'
+          python3 - <<'PY'
           import re
           import sys
           from pathlib import Path
@@ -139,43 +141,6 @@ jobs:
               sys.exit(1)
           PY
 
-      - name: Scoped public-surface hygiene scan
+      - name: Public-safety scan
         run: |
-          python - <<'PY'
-          import sys
-          from pathlib import Path
-
-          scanned_paths = [
-              Path("README.md"),
-              Path("QUICKSTART.md"),
-              Path("BENCHMARKS.md"),
-              Path("CHANGELOG.md"),
-              Path("SECURITY.md"),
-              Path("CONTRIBUTING.md"),
-              Path("scripts/install.sh"),
-              Path("scripts/install.ps1"),
-          ]
-          forbidden = [
-              "esteyangandrew/" + "pith-core",
-              "_session" + "_worktrees",
-              "/Volumes/Pith-Archive",
-              "PITH_INSTALL_RC_TOKEN",
-              "install-rc",
-              "pith-release-rc",
-              "internal launch",
-              "approval packet",
-              "private staging",
-          ]
-
-          failures = []
-          for path in scanned_paths:
-              text = path.read_text(encoding="utf-8", errors="replace")
-              lowered = text.lower()
-              for term in forbidden:
-                  if term.lower() in lowered:
-                      failures.append(f"{path}: forbidden public-surface term: {term}")
-
-          if failures:
-              print("\n".join(failures), file=sys.stderr)
-              sys.exit(1)
-          PY
+          python3 .github/scripts/public_safety_scan.py
