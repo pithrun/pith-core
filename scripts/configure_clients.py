@@ -315,11 +315,25 @@ CODEX_AGENTS_BODY = """# Pith Cognitive Loop
 
 Pith is installed locally. For Codex, use the local HTTP/API command as the primary cognitive lifecycle path because Codex MCP stdio transport can restart or close between turns.
 
-On every substantive user message, run `conversation_turn` before composing the response. Include `"surface_id": "codex_local_api"` and a stable `origin_id` for this Codex thread/workspace. After the first successful call returns `resolved_session_id`, include that value as `session_id` on later lifecycle calls when available. Also include `previous_message`, `previous_response`, and `extracted_concepts_json` after the first exchange. Send JSON on stdin and parse the last non-empty output line as JSON because the wrapper may print a profile banner first:
+On every substantive user message, run `conversation_turn` before composing the response. Include `"surface_id": "codex_local_api"` and a stable `origin_id` for this Codex thread/workspace. The `origin_id` must match `^[A-Za-z0-9._:-]{1,128}$`; use a compact value such as `codex_<short-workspace-or-thread-id>` with no slashes or spaces. Send JSON on stdin and parse the last non-empty output line as JSON because the wrapper may print a profile banner first:
 
 ```bash
 ~/.pith/bin/pith api conversation_turn --stdin-json
 ```
+
+Use this first-turn payload shape:
+
+```json
+{
+  "surface_id": "codex_local_api",
+  "origin_id": "codex_<short-workspace-or-thread-id>",
+  "workspace_id": "<absolute workspace path>",
+  "message": "<current user message>",
+  "extracted_concepts_json": "[]"
+}
+```
+
+After the first successful call returns `resolved_session_id`, include that value as `session_id` on later lifecycle calls when available. Also include `previous_message`, `previous_response`, and `extracted_concepts_json` after the first exchange. For trivial exchanges, the outer JSON value for `extracted_concepts_json` must be the string value `"[]"`, not a JSON array. For substantive implementation or deployment work, use a JSON string containing extracted concepts with concrete `verified: <check>` evidence.
 
 For checkpoints and closeout, use the matching lifecycle operations:
 
@@ -332,7 +346,6 @@ For lifecycle evidence reports, use `~/.pith/bin/pith api lifecycle_status --std
 
 `pith api-fallback ...` remains as a legacy/recovery alias. Pith MCP tools with the `pith_` prefix may also be available in Codex and are useful for richer tool access when the MCP transport is healthy. Do not depend on MCP-only access for the core cognitive lifecycle.
 
-For trivial exchanges, use `[]` for `extracted_concepts_json`. For substantive implementation or deployment work, extracted concepts must include concrete `verified: <check>` evidence.
 """
 
 
