@@ -5,7 +5,7 @@
 
 param(
     [switch]$Force = $false,
-    [string]$PithVersion = "1.0.2"
+    [string]$PithVersion = "1.0.3"
 )
 
 # Strict error handling
