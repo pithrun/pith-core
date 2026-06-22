@@ -1,0 +1,11 @@
+* @esteyangandrew
+.github/workflows/* @esteyangandrew
+.github/scripts/* @esteyangandrew
+.github/CODEOWNERS @esteyangandrew
+.github/pull_request_template.md @esteyangandrew
+.github/public-safety-allowlist.txt @esteyangandrew
+scripts/install.sh @esteyangandrew
+scripts/install.ps1 @esteyangandrew
+SECURITY.md @esteyangandrew
+CONTRIBUTING.md @esteyangandrew
+pith-server-latest.* @esteyangandrew
