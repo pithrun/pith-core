@@ -68,6 +68,64 @@ ALLOWED = {
 }
 AUTH_EXEMPT_OPERATIONS = frozenset({"health", "readyz"})
 PSEUDO_OPERATIONS = frozenset({"lifecycle_status", "list"})
+OPERATION_DISCOVERY_SCHEMA_VERSION = "pith_cli_operation_discovery.v1"
+OPERATION_EXAMPLES = {
+    "conversation_turn": {
+        "schema_version": OPERATION_DISCOVERY_SCHEMA_VERSION,
+        "operation": "conversation_turn",
+        "kind": "example",
+        "command": "~/.pith/bin/pith api conversation_turn --stdin-json",
+        "payload": {
+            "surface_id": "codex_local_api",
+            "origin_id": "codex_<short-workspace-or-thread-id>",
+            "workspace_id": "<absolute workspace path>",
+            "message": "<current user message>",
+            "extracted_concepts_json": "[]",
+        },
+        "notes": [
+            "Use message, not user_message.",
+            "origin_id must match ^[A-Za-z0-9._:-]{1,128}$; do not use filesystem paths.",
+            "extracted_concepts_json is a string containing JSON, not a raw array or object.",
+        ],
+    }
+}
+OPERATION_SCHEMAS = {
+    "conversation_turn": {
+        "schema_version": OPERATION_DISCOVERY_SCHEMA_VERSION,
+        "operation": "conversation_turn",
+        "kind": "operation_schema",
+        "command": "~/.pith/bin/pith api conversation_turn --stdin-json",
+        "method": "POST",
+        "path": "/conversation_turn",
+        "required": ["message"],
+        "fields": {
+            "surface_id": {"type": "string", "recommended": "codex_local_api"},
+            "origin_id": {
+                "type": "string",
+                "pattern": r"^[A-Za-z0-9._:-]{1,128}$",
+                "example": "codex_new_project",
+            },
+            "workspace_id": {"type": "string", "example": "/absolute/workspace/path"},
+            "session_id": {"type": "string", "required_after_first_success": True},
+            "message": {"type": "string", "required": True},
+            "previous_message": {"type": "string", "required": False},
+            "previous_response": {"type": "string", "required": False},
+            "extracted_concepts_json": {
+                "type": "string",
+                "format": "JSON-encoded array string",
+                "trivial_value": "[]",
+            },
+        },
+        "invalid_common_shapes": [
+            {"field": "user_message", "reason": "Use message for conversation_turn."},
+            {"field": "origin_id", "reason": "Do not use filesystem paths or slashes."},
+            {
+                "field": "extracted_concepts_json",
+                "reason": "Pass a JSON string, not a raw array or object.",
+            },
+        ],
+    }
+}
 LIFECYCLE_STATUS_SCHEMA_VERSION = "surface_lifecycle_status.v1"
 LIFECYCLE_STATUS_DEFAULT_MAX_SCAN_FILES = int(
     os.environ.get("PITH_LIFECYCLE_STATUS_MAX_SCAN_FILES", "500")
@@ -675,6 +733,8 @@ def _operation_catalog() -> list[dict[str, Any]]:
             "method": method,
             "path": path,
             "auth_required": operation not in AUTH_EXEMPT_OPERATIONS,
+            "example_available": operation in OPERATION_EXAMPLES,
+            "schema_available": operation in OPERATION_SCHEMAS,
         }
         for operation, (method, path) in sorted(ALLOWED.items())
     ]
@@ -684,6 +744,8 @@ def _operation_catalog() -> list[dict[str, Any]]:
             "method": "LOCAL",
             "path": "",
             "auth_required": False,
+            "example_available": operation in OPERATION_EXAMPLES,
+            "schema_available": operation in OPERATION_SCHEMAS,
         }
         for operation in sorted(PSEUDO_OPERATIONS)
         if operation != "list"
@@ -696,6 +758,18 @@ def _validate_operation(parser: argparse.ArgumentParser, operation: str) -> None
         return
     choices = ", ".join(sorted([*ALLOWED, *PSEUDO_OPERATIONS]))
     parser.error(f"invalid choice: {operation!r} (choose from {choices})")
+
+
+def _operation_discovery_payload(operation: str, kind: str) -> dict[str, Any]:
+    registry = OPERATION_EXAMPLES if kind == "example" else OPERATION_SCHEMAS
+    payload = registry.get(operation)
+    if payload is not None:
+        return payload
+    available = ", ".join(sorted(registry)) or "none"
+    raise SystemExit(
+        f"No local {kind} registered for operation {operation!r}. "
+        f"Available operations: {available}"
+    )
 
 
 def _response_detail(body: Any) -> str:
@@ -1452,9 +1526,24 @@ def main(argv: list[str] | None = None) -> int:
         or DEFAULT_BASE_URL,
     )
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
+    discovery_group = parser.add_mutually_exclusive_group()
+    discovery_group.add_argument(
+        "--example",
+        action="store_true",
+        help="Print local example JSON for the operation and exit.",
+    )
+    discovery_group.add_argument(
+        "--schema",
+        action="store_true",
+        help="Print local schema metadata for the operation and exit.",
+    )
     args = parser.parse_args(argv)
 
     _validate_operation(parser, args.operation)
+    if args.example or args.schema:
+        kind = "example" if args.example else "schema"
+        print(json.dumps(_operation_discovery_payload(args.operation, kind), sort_keys=True))
+        return 0
     if args.operation == "list":
         print(json.dumps({"operations": _operation_catalog()}))
         return 0

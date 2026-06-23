@@ -284,7 +284,9 @@ SURFACE_LIFECYCLE_ADAPTERS: dict[str, SurfaceAdapterManifest] = {
         config_markers=("UserPromptSubmit", "Stop", "pith", "conversation_turn"),
         conformance_expectation=(
             "A UserPromptSubmit hook runs conversation_turn before response composition; "
-            "a Stop hook captures the assistant response after the turn."
+            "a Stop hook captures the assistant response after the turn; "
+            "the model-visible binding must also call pith_conversation_turn each substantive turn "
+            "so hook capture and model/tool coherence can be verified."
         ),
         supports_fresh_consumer=True,
         supports_cold_start=True,

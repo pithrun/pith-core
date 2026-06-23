@@ -271,11 +271,39 @@ private_beta_pause() {
         echo ""
         read -r -p "$prompt" _ || true
         echo ""
+    elif [[ "${PITH_PRIVATE_BETA:-0}" == "1" && "${PITH_SKIP_PAUSES:-0}" != "1" && -r /dev/tty && -w /dev/tty ]]; then
+        echo ""
+        printf "%s" "$prompt" > /dev/tty
+        IFS= read -r _ < /dev/tty || true
+        echo ""
     fi
 }
 
 show_interactive_manual_setup() {
-    [[ "${PITH_PRIVATE_BETA:-0}" == "1" && "${PITH_SKIP_PAUSES:-0}" != "1" && -t 0 ]]
+    [[ "${PITH_SKIP_CLIENT_SETUP:-0}" != "1" && "${PITH_SKIP_PAUSES:-0}" != "1" && ( -t 0 || ( -r /dev/tty && -w /dev/tty ) ) ]]
+}
+
+confirm_manual_setup_step() {
+    local prompt="${1:-Press Return after completing this step, or type skip to finish it later: }"
+    local reply=""
+    if ! show_interactive_manual_setup; then
+        return 1
+    fi
+    echo ""
+    if [[ -t 0 ]]; then
+        read -r -p "$prompt" reply || reply="skip"
+    else
+        printf "%s" "$prompt" > /dev/tty
+        IFS= read -r reply < /dev/tty || reply="skip"
+    fi
+    echo ""
+    reply="$(printf '%s' "$reply" | tr '[:upper:]' '[:lower:]')"
+    case "$reply" in
+        skip|s|later)
+            return 1
+            ;;
+    esac
+    return 0
 }
 
 summarize_client_config_result() {
@@ -296,6 +324,7 @@ except Exception:
 configured = data.get("configured") or []
 errors = data.get("errors") or []
 detected = data.get("detected") or []
+readiness = data.get("readiness") or []
 print(f"Detected AI app surfaces: {', '.join(detected) if detected else 'none'}")
 if configured:
     print(f"Configured AI app items: {len(configured)}")
@@ -313,9 +342,78 @@ if configured:
         print(f"  - ... {len(labels) - 8} more")
 else:
     print("Configured AI app items: 0")
+if readiness:
+    print("AI client readiness diagnostics:")
+    for item in readiness:
+        label = item.get("client") or item.get("client_id") or "client"
+        state = item.get("state") or "unknown"
+        reason = item.get("reason") or ""
+        print(f"  - {label}: {state}" + (f" — {reason}" if reason else ""))
 if errors:
     print(f"Client configuration errors: {len(errors)} (see diagnostics log)")
 PY
+}
+
+CLIENT_READINESS_HAS_INCOMPLETE=0
+CLAUDE_DESKTOP_MANUAL_STATE="manual_action_required"
+CURSOR_MANUAL_STATE="manual_action_required"
+
+print_readiness_line() {
+    local label="$1"
+    local state="$2"
+    local detail="$3"
+    echo -e "  • ${YELLOW}${label}${NC}: ${state} — ${detail}"
+    case "$state" in
+        ready|manual_action_confirmed)
+            ;;
+        *)
+            CLIENT_READINESS_HAS_INCOMPLETE=1
+            ;;
+    esac
+}
+
+print_ai_client_readiness() {
+    echo -e "${BLUE}AI client readiness:${NC}"
+    print_readiness_line "Core Pith service" "ready" "local API is healthy at http://localhost:$PITH_PORT"
+    if surface_selected_and_detected claude_desktop; then
+        if [[ "$CLAUDE_DESKTOP_MANUAL_STATE" == "manual_action_confirmed" ]]; then
+            print_readiness_line "Claude Desktop" "manual_action_confirmed" "Instructions for Claude were confirmed by the installer operator; restart Claude Desktop and verify a Pith tool call"
+        else
+            print_readiness_line "Claude Desktop" "manual_action_required" "paste $SYSTEM_PROMPT_PATH into Settings -> General -> Instructions for Claude"
+        fi
+    elif surface_selected claude_desktop; then
+        print_readiness_line "Claude Desktop" "manual_action_required" "Claude Desktop was selected but not detected; rerun setup after installing it"
+    fi
+    if surface_selected_and_detected claude_code; then
+        print_readiness_line "Claude Code" "partial_hook_capture" "hooks are installed; model-visible binding now tells Claude Code to call pith_conversation_turn each substantive turn"
+    elif surface_selected claude_code; then
+        print_readiness_line "Claude Code" "manual_action_required" "Claude Code was selected but not detected"
+    fi
+    if surface_selected_and_detected cursor; then
+        if [[ "$CURSOR_MANUAL_STATE" == "manual_action_confirmed" ]]; then
+            print_readiness_line "Cursor" "manual_action_confirmed" "Global/User Rule was confirmed by the installer operator; restart Cursor and verify tool activity"
+        else
+            print_readiness_line "Cursor" "manual_action_required" "paste $CURSOR_GLOBAL_RULE_PATH into Cursor Settings -> Rules"
+        fi
+    elif surface_selected cursor; then
+        print_readiness_line "Cursor" "manual_action_required" "Cursor was selected but not detected; rerun setup after installing it"
+    fi
+    if surface_selected_and_detected codex; then
+        print_readiness_line "Codex" "ready" "~/.codex/AGENTS.md contains the local API cognitive-loop instructions"
+    elif surface_selected codex; then
+        print_readiness_line "Codex" "manual_action_required" "Codex was selected but not detected; rerun setup after installing it"
+    fi
+    if surface_selected_and_detected vscode; then
+        print_readiness_line "VS Code Copilot" "ready" "MCP user config and Copilot instruction file were installed"
+    elif surface_selected vscode; then
+        print_readiness_line "VS Code Copilot" "manual_action_required" "VS Code was selected but not detected; rerun setup after installing it"
+    fi
+    if surface_selected_and_detected windsurf; then
+        print_readiness_line "Windsurf" "unsupported" "experimental MCP template only; automatic invocation is not launch-verified"
+    fi
+    if surface_selected_and_detected cline; then
+        print_readiness_line "Cline" "unsupported" "MCP template only; automatic invocation is not launch-verified"
+    fi
 }
 
 migrate_legacy_env_aliases() {
@@ -1501,12 +1599,20 @@ if surface_selected_and_detected claude_desktop; then
         echo ""
         echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
         echo ""
-        private_beta_pause "Private beta pause: note the Claude Desktop instructions above, then press Return to continue..."
+        if confirm_manual_setup_step "Press Return after saving Claude Desktop Instructions, or type skip to finish later: "; then
+            CLAUDE_DESKTOP_MANUAL_STATE="manual_action_confirmed"
+            mark_success "Claude Desktop manual instruction step confirmed"
+        else
+            CLAUDE_DESKTOP_MANUAL_STATE="manual_action_required"
+            mark_warning "Claude Desktop still needs Instructions for Claude setup. Run: pith protocol"
+        fi
     else
-        mark_success "Claude Desktop instructions saved to $SYSTEM_PROMPT_PATH"
+        CLAUDE_DESKTOP_MANUAL_STATE="manual_action_required"
+        mark_warning "Claude Desktop MCP config is installed, but Instructions for Claude still need setup from $SYSTEM_PROMPT_PATH"
     fi
 else
     if surface_selected claude_desktop; then
+        CLAUDE_DESKTOP_MANUAL_STATE="manual_action_required"
         mark_warning "Claude Desktop was selected but not detected. Claude instructions are saved at $SYSTEM_PROMPT_PATH."
     fi
 fi
@@ -1540,11 +1646,19 @@ if surface_selected_and_detected cursor; then
         echo ""
         echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
         echo ""
-        private_beta_pause "Private beta pause: note the Cursor Global Rule instructions above, then press Return to continue..."
+        if confirm_manual_setup_step "Press Return after saving the Cursor Global/User Rule, or type skip to finish later: "; then
+            CURSOR_MANUAL_STATE="manual_action_confirmed"
+            mark_success "Cursor manual rule step confirmed"
+        else
+            CURSOR_MANUAL_STATE="manual_action_required"
+            mark_warning "Cursor still needs the Global/User Rule setup from $CURSOR_GLOBAL_RULE_PATH"
+        fi
     else
-        mark_success "Cursor Global/User Rule saved to $CURSOR_GLOBAL_RULE_PATH"
+        CURSOR_MANUAL_STATE="manual_action_required"
+        mark_warning "Cursor MCP config is installed, but the Global/User Rule still needs setup from $CURSOR_GLOBAL_RULE_PATH"
     fi
 elif surface_selected cursor; then
+    CURSOR_MANUAL_STATE="manual_action_required"
     mark_warning "Cursor was selected but not detected. Cursor Global Rule snippet is saved at $CURSOR_GLOBAL_RULE_PATH."
 fi
 
@@ -2914,10 +3028,17 @@ fi
 # ============================================================================
 print_banner
 
-echo -e "${GREEN}✓ Installation Complete!${NC}"
+echo -e "${GREEN}✓ Core Pith service installed${NC}"
 echo ""
 echo -e "Pith is installed at: ${BLUE}$PITH_HOME${NC}"
 echo -e "Pith API URL:       ${BLUE}http://localhost:$PITH_PORT${NC}"
+echo ""
+print_ai_client_readiness
+if [[ "$CLIENT_READINESS_HAS_INCOMPLETE" == "1" ]]; then
+    echo ""
+    echo -e "${YELLOW}AI client setup is incomplete. Pith core is installed, but not every selected AI app is ready.${NC}"
+    echo "Complete the manual actions below, restart each AI app, then verify a fresh conversation."
+fi
 echo ""
 echo -e "${BLUE}Quick Start:${NC}"
 if [[ "$PATH_ADDED" == true ]]; then
@@ -2945,14 +3066,22 @@ SETUP_STEP=1
 echo "  ${SETUP_STEP}. Open a new terminal (or reload your shell profile)"
 SETUP_STEP=$((SETUP_STEP + 1))
 if surface_selected_and_detected claude_desktop; then
-    echo "  ${SETUP_STEP}. Claude Desktop instructions are saved at $SYSTEM_PROMPT_PATH."
-    echo -e "     To redo later: ${YELLOW}pith protocol${NC}  (copies prompt for Settings → General → Instructions for Claude)"
+    if [[ "$CLAUDE_DESKTOP_MANUAL_STATE" == "manual_action_confirmed" ]]; then
+        echo "  ${SETUP_STEP}. Claude Desktop instructions: confirmed during install; restart Claude Desktop."
+    else
+        echo "  ${SETUP_STEP}. Claude Desktop instructions: paste $SYSTEM_PROMPT_PATH into Settings -> General -> Instructions for Claude."
+        echo -e "     To copy later: ${YELLOW}pith protocol${NC}"
+    fi
     SETUP_STEP=$((SETUP_STEP + 1))
 fi
 echo "  ${SETUP_STEP}. Restart each configured AI client completely before testing it"
 if surface_selected_and_detected cursor; then
-    echo "  Cursor: MCP config is installed, but Cursor also needs a Global/User Rule for default Pith invocation."
-    echo -e "     Paste ${YELLOW}$CURSOR_GLOBAL_RULE_PATH${NC} into Cursor Settings → Rules."
+    if [[ "$CURSOR_MANUAL_STATE" == "manual_action_confirmed" ]]; then
+        echo "  Cursor: Global/User Rule confirmed during install; restart Cursor before testing."
+    else
+        echo "  Cursor: MCP config is installed, but Cursor also needs a Global/User Rule for default Pith invocation."
+        echo -e "     Paste ${YELLOW}$CURSOR_GLOBAL_RULE_PATH${NC} into Cursor Settings -> Rules."
+    fi
 fi
 if surface_selected_and_detected windsurf; then
     echo "  Windsurf: experimental MCP template is installed; this path is not launch-verified."
