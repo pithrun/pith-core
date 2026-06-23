@@ -473,8 +473,19 @@ def _read_lifecycle_state(path: Path) -> dict[str, Any] | None:
 
 
 def _claude_code_context_phase(state: dict[str, Any]) -> dict[str, Any]:
+    hook_status = state.get("hook_pre_response_ct_status")
     pre_status = state.get("pre_response_ct_status")
     session_id = state.get("pre_response_ct_session_id") or state.get("pith_session_id")
+    if hook_status == "recovered_by_backstop" and session_id:
+        return _lifecycle_phase(
+            "degraded",
+            verdict="recovered",
+            reason="hook_backstop_conversation_turn_recovered_after_pre_response_failure",
+            session_id=str(session_id),
+            origin_id=state.get("pre_response_ct_origin_id"),
+            workspace_id=state.get("pre_response_ct_workspace_id"),
+            request_id=state.get("hook_pre_response_ct_request_id") or state.get("pre_response_ct_request_id"),
+        )
     if pre_status == "ok" and session_id:
         return _lifecycle_phase(
             "passed",
@@ -502,10 +513,20 @@ def _claude_code_context_phase(state: dict[str, Any]) -> dict[str, Any]:
 
 def _claude_code_model_visible_phase(state: dict[str, Any]) -> dict[str, Any]:
     session_id = state.get("model_ct_session_id")
-    if session_id:
+    if state.get("model_visible_ct_ok") and session_id:
         return _lifecycle_phase(
             "passed",
             verdict="observed",
+            session_id=str(session_id),
+            origin_id=state.get("model_ct_origin_id"),
+            surface_id=state.get("model_ct_surface_id"),
+            response_mode=state.get("model_ct_response_mode"),
+        )
+    if session_id:
+        return _lifecycle_phase(
+            "failed",
+            verdict="not_enforced",
+            reason=state.get("model_ct_coherence_reason") or "model_visible_conversation_turn_not_accepted",
             session_id=str(session_id),
             origin_id=state.get("model_ct_origin_id"),
             surface_id=state.get("model_ct_surface_id"),
@@ -525,6 +546,12 @@ def _claude_code_coherence_phase(state: dict[str, Any]) -> dict[str, Any]:
             "passed",
             verdict="matched",
             reason=state.get("model_ct_coherence_reason"),
+        )
+    if status == "skipped_not_observed":
+        return _lifecycle_phase(
+            "not_observed",
+            verdict="not_observed",
+            reason=state.get("model_ct_coherence_reason") or "model_visible_conversation_turn_not_observed",
         )
     if status in {"failed", "unknown"}:
         return _lifecycle_phase(
@@ -591,14 +618,22 @@ def _claude_code_learning_phase(state: dict[str, Any]) -> dict[str, Any]:
 
 def _overall_lifecycle_verdict(
     context_phase: dict[str, Any],
+    model_visible_phase: dict[str, Any],
+    coherence_phase: dict[str, Any],
     learning_phase: dict[str, Any],
 ) -> str:
-    if context_phase.get("status") == "passed" and learning_phase.get("status") == "passed":
+    statuses = [
+        context_phase.get("status"),
+        model_visible_phase.get("status"),
+        coherence_phase.get("status"),
+        learning_phase.get("status"),
+    ]
+    if all(status == "passed" for status in statuses):
         return "enforced"
-    if context_phase.get("status") == "passed":
-        return "partial"
-    if context_phase.get("status") == "not_observed" and learning_phase.get("status") == "not_observed":
+    if all(status == "not_observed" for status in statuses):
         return "not_observed"
+    if any(status == "passed" for status in statuses):
+        return "partial"
     return "failed"
 
 
@@ -699,7 +734,12 @@ def _claude_code_lifecycle_status(payload: dict[str, Any]) -> dict[str, Any]:
             "model_visible_phase": model_visible_phase,
             "coherence_phase": coherence_phase,
             "learning_phase": learning_phase,
-            "overall_verdict": _overall_lifecycle_verdict(context_phase, learning_phase),
+            "overall_verdict": _overall_lifecycle_verdict(
+                context_phase,
+                model_visible_phase,
+                coherence_phase,
+                learning_phase,
+            ),
         }
     )
     return result

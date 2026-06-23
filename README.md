@@ -51,7 +51,7 @@ For methodology, score terms, caveats, and evidence files, see the [Pith benchma
 
 - **macOS developer preview** — Pith's initial public preview is macOS-first.
 - **Python 3.10+** — on macOS arm64, the installer can provision a Pith-managed Python 3.12 runtime inside `~/.pith` if no compatible Python is present. It does not replace or modify system Python.
-- **A supported AI app** — verified launch workflows are Claude Desktop, Cursor, VS Code, and Codex.
+- **A supported AI app** — verified launch workflows are Claude Cowork, Claude Desktop, Claude Code, Cursor, VS Code, and Codex.
 
 ### macOS Developer Preview Client Matrix
 
@@ -59,7 +59,9 @@ For methodology, score terms, caveats, and evidence files, see the [Pith benchma
 |---|---|---|
 | Terminal CLI | Verified | `pith status`, `pith health`, `pith start`, `pith logs`, `pith doctor`, `pith clients`, `pith support bundle`, `pith import`, and backups run locally. |
 | launchd service | Verified | macOS auto-start is installed by the native installer. |
-| Claude Desktop | Verified config + manual instructions step | MCP config is written automatically; if you did not complete the instructions step during install, run `pith protocol` and paste into Claude Desktop `Settings > General > Instructions for Claude`. Once configured, users should not have to remind Claude to use Pith. |
+| Claude Cowork | Full lifecycle automation after system prompt setup | Pith-managed Cowork sessions run the full lifecycle automatically once the Cowork system prompt/instructions are installed: pre-response context, response learning, checkpointing, and session closeout. No separate local MCP config is required inside Cowork. |
+| Claude Desktop | Verified config + manual instructions step | MCP config is written automatically; if you did not complete the instructions step during install, run `pith protocol` and paste into Claude Desktop `Settings > General > Instructions for Claude`. Tools are available after restart, but Claude decides whether to call them for a given turn; full lifecycle proof requires an observed `pith_conversation_turn` call or an explicit user request for Claude to use Pith. |
+| Claude Code | Verified hook registration + model-visible instruction | Hooks register/capture Claude Code turns and ask the model to call `pith_conversation_turn`. Full model-visible lifecycle proof requires observing the Claude Code MCP tool call, not just hook installation. |
 | Codex app | Verified config + HTTP/API-first lifecycle instructions | Uses `~/.pith/bin/pith api ...` for lifecycle calls; MCP remains available for richer tools when healthy. `api-fallback` remains a legacy/recovery alias. |
 | VS Code | Configurable MCP + Copilot instruction file; beta behavior not yet equivalent to Claude/Codex | User config lives at `~/Library/Application Support/Code/User/mcp.json`; project config lives at `~/.pith/pith-server/.vscode/mcp.json`; Copilot instruction lives at `~/.copilot/instructions/pith-cognitive-loop.instructions.md`. Agent Chat must be in Agent mode with Pith tools enabled, and the model may not call Pith automatically on every turn. |
 | Cursor | MCP config template + Global/User Rule step | The installer writes `~/.cursor/mcp.json`, saves a Cursor rule snippet at `~/.pith/CURSOR_GLOBAL_RULE.txt`, and copies it to the clipboard on macOS. Cursor can see the Pith server, but current user testing shows Cursor does not automatically call Pith every turn from MCP config alone. Paste the snippet into Cursor Settings > Rules as a Global/User Rule, or use project `AGENTS.md`, until the installer has a verified automatic Cursor instruction flow. |
@@ -93,9 +95,11 @@ The installer handles everything: Python venv, dependencies, API key generation,
 **Verification checks**
 
 1. **Core install:** run `pith status` and confirm it reports `Health: OK (Pith)`.
-2. **Claude Desktop:** open a fresh conversation and ask a normal project-context question, without reminding Claude to use Pith. A working setup should call Pith automatically or use retrieved Pith context. If needed, check `~/Library/Logs/Claude/mcp-server-pith.log` for a new `pith_conversation_turn` call.
-3. **Codex:** confirm `~/.codex/AGENTS.md` exists and references `pith api conversation_turn`. If Codex was installed after Pith, rerun the installer or client configuration.
-4. **VS Code:** restart VS Code, run **MCP: List Servers**, and confirm `pith` appears from `~/Library/Application Support/Code/User/mcp.json`. Open Chat Diagnostics and confirm `~/.copilot/instructions/pith-cognitive-loop.instructions.md` is loaded for Agent Chat. If Agent Chat says Pith is not connected but can find the active server/config, treat that as a VS Code tool-selection/instruction-loading issue, not a failed Pith service.
+2. **Claude Cowork:** confirm the Cowork system prompt/instructions are installed and active. After that, Pith-managed Cowork sessions have full lifecycle automation built in; use local diagnostics only when you need evidence reporting.
+3. **Claude Desktop / Claude Chat:** open a fresh conversation and ask a normal project-context question. Verify a real `pith_conversation_turn` call in `~/Library/Logs/Claude/mcp-server-pith.log`; MCP startup alone only proves tool availability. If Claude does not choose the tool, explicitly ask Claude to use Pith for the request and verify the observed call.
+4. **Claude Code:** run `claude mcp get pith`, then start a fresh Claude Code session. Hooks should register the turn, but full proof requires an observed model-visible `pith_conversation_turn` tool call.
+5. **Codex:** confirm `~/.codex/AGENTS.md` exists and references `pith api conversation_turn`. If Codex was installed after Pith, rerun the installer or client configuration.
+6. **VS Code:** restart VS Code, run **MCP: List Servers**, and confirm `pith` appears from `~/Library/Application Support/Code/User/mcp.json`. Open Chat Diagnostics and confirm `~/.copilot/instructions/pith-cognitive-loop.instructions.md` is loaded for Agent Chat. If Agent Chat says Pith is not connected but can find the active server/config, treat that as a VS Code tool-selection/instruction-loading issue, not a failed Pith service.
 
 ### Verify
 
@@ -216,10 +220,13 @@ Each profile gets its own database, indexes, backups, and logs under `~/pith-dat
 - Run **MCP: List Servers** and start or restart the `pith` server if needed.
 - Open Chat Diagnostics and confirm the Pith instruction file is loaded. VS Code MCP availability means the tools are available to the agent; it does not guarantee the model will call them on every turn.
 
-**Claude Desktop lists Pith but does not call it every turn?**
+**Claude Desktop / Claude Chat lists Pith but does not call it every turn?**
 - Run `pith protocol` and paste the prompt into Claude Desktop `Settings > General > Instructions for Claude`.
 - Restart Claude Desktop and start a fresh conversation.
-- `tools/list` or `resources/list` in `~/Library/Logs/Claude/mcp-server-pith.log` proves MCP startup. A 600-second idle transport close can be normal bridge lifecycle noise. Missing `pith_conversation_turn` after a fresh prompt usually means the custom instructions are not active.
+- `tools/list` or `resources/list` in `~/Library/Logs/Claude/mcp-server-pith.log` proves MCP startup only. A 600-second idle transport close can be normal bridge lifecycle noise. Missing `pith_conversation_turn` after a fresh prompt usually means the custom instructions are not active or the model did not choose the lifecycle tool; you can explicitly ask Claude to use Pith for the request and then verify the observed call.
+
+**Claude Cowork lifecycle not firing?**
+- Confirm the Cowork system prompt/instructions are installed and active first. After that, Cowork is the managed surface with full lifecycle automation; remaining missing lifecycle events should be treated as service or session-routing issues, not as local MCP config issues.
 
 **API not responding?**
 - Check status: `pith status`

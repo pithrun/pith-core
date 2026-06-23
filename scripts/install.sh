@@ -375,9 +375,10 @@ print_readiness_line() {
 print_ai_client_readiness() {
     echo -e "${BLUE}AI client readiness:${NC}"
     print_readiness_line "Core Pith service" "ready" "local API is healthy at http://localhost:$PITH_PORT"
+    print_readiness_line "Claude Cowork" "ready" "managed lifecycle automation is available after the Cowork system prompt is installed; no separate local MCP config is required inside Cowork"
     if surface_selected_and_detected claude_desktop; then
         if [[ "$CLAUDE_DESKTOP_MANUAL_STATE" == "manual_action_confirmed" ]]; then
-            print_readiness_line "Claude Desktop" "manual_action_confirmed" "Instructions for Claude were confirmed by the installer operator; restart Claude Desktop and verify a Pith tool call"
+            print_readiness_line "Claude Desktop" "manual_action_confirmed" "Instructions for Claude were confirmed by the installer operator; restart Claude Desktop, then verify an observed pith_conversation_turn call or explicitly ask Claude to use Pith"
         else
             print_readiness_line "Claude Desktop" "manual_action_required" "paste $SYSTEM_PROMPT_PATH into Settings -> General -> Instructions for Claude"
         fi
@@ -385,7 +386,7 @@ print_ai_client_readiness() {
         print_readiness_line "Claude Desktop" "manual_action_required" "Claude Desktop was selected but not detected; rerun setup after installing it"
     fi
     if surface_selected_and_detected claude_code; then
-        print_readiness_line "Claude Code" "partial_hook_capture" "hooks are installed; model-visible binding now tells Claude Code to call pith_conversation_turn each substantive turn"
+        print_readiness_line "Claude Code" "partial_hook_capture" "hooks are installed for turn registration/capture; verify an observed model-visible pith_conversation_turn call for full lifecycle proof"
     elif surface_selected claude_code; then
         print_readiness_line "Claude Code" "manual_action_required" "Claude Code was selected but not detected"
     fi
@@ -709,11 +710,25 @@ body = """# Pith Cognitive Loop
 
 Pith is installed locally. For Codex, use the local HTTP/API command as the primary cognitive lifecycle path because Codex MCP stdio transport can restart or close between turns.
 
-On every substantive user message, run `conversation_turn` before composing the response. Include `"surface_id": "codex_local_api"` and a stable `origin_id` for this Codex thread/workspace. After the first successful call returns `resolved_session_id`, include that value as `session_id` on later lifecycle calls when available. Also include `previous_message`, `previous_response`, and `extracted_concepts_json` after the first exchange. Send JSON on stdin and parse the last non-empty output line as JSON because the wrapper may print a profile banner first:
+On every substantive user message, run `conversation_turn` before composing the response. Include `"surface_id": "codex_local_api"` and a stable `origin_id` for this Codex thread/workspace. The `origin_id` must match `^[A-Za-z0-9._:-]{1,128}$`; use a compact value such as `codex_<short-workspace-or-thread-id>` with no slashes or spaces. Send JSON on stdin and parse the last non-empty output line as JSON because the wrapper may print a profile banner first:
 
 ```bash
 ~/.pith/bin/pith api conversation_turn --stdin-json
 ```
+
+Use this first-turn payload shape:
+
+```json
+{
+  "surface_id": "codex_local_api",
+  "origin_id": "codex_<short-workspace-or-thread-id>",
+  "workspace_id": "<absolute workspace path>",
+  "message": "<current user message>",
+  "extracted_concepts_json": "[]"
+}
+```
+
+After the first successful call returns `resolved_session_id`, include that value as `session_id` on later lifecycle calls when available. Also include `previous_message`, `previous_response`, and `extracted_concepts_json` after the first exchange. For trivial exchanges, the outer JSON value for `extracted_concepts_json` must be the string value `"[]"`, not a JSON array. For substantive implementation or deployment work, use a JSON string containing extracted concepts with concrete `verified: <check>` evidence.
 
 For checkpoints and closeout, use the matching lifecycle operations:
 
@@ -725,8 +740,6 @@ For checkpoints and closeout, use the matching lifecycle operations:
 For lifecycle evidence reports, use `~/.pith/bin/pith api lifecycle_status --stdin-json` with the relevant `surface_id`, `session_id`, `origin_id`, or `workspace_id`. For cross-surface source coverage evidence, use `~/.pith/bin/pith api surface_activity --stdin-json` with `requested_surfaces` such as `"claude_code,codex_local_api,local_api_cli"` and `include_codex_local=true`. Unsupported or sparse surfaces must report that state rather than inferring success from instructions or memory.
 
 `pith api-fallback ...` remains as a legacy/recovery alias. Pith MCP tools with the `pith_` prefix may also be available in Codex and are useful for richer tool access when the MCP transport is healthy. Do not depend on MCP-only access for the core cognitive lifecycle.
-
-For trivial exchanges, use `[]` for `extracted_concepts_json`. For substantive implementation or deployment work, extracted concepts must include concrete `verified: <check>` evidence.
 """
 block = f"{start}\n{body}\n{end}\n"
 
@@ -1595,7 +1608,7 @@ if surface_selected_and_detected claude_desktop; then
             echo "  2. Paste the contents of:"
             echo -e "     ${YELLOW}$SYSTEM_PROMPT_PATH${NC}"
         fi
-        echo "  3. Save — Claude will now use Pith's cognitive loop automatically"
+        echo "  3. Save — Claude has Pith's cognitive-loop instructions; verify a pith_conversation_turn call in a fresh chat"
         echo ""
         echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
         echo ""
@@ -3090,13 +3103,15 @@ echo ""
 echo -e "${BLUE}Verification checks:${NC}"
 echo -e "  1. Core install: ${YELLOW}pith status${NC}  (expect Health: OK (Pith))"
 VERIFY_STEP=2
+echo "  ${VERIFY_STEP}. Claude Cowork: confirm the Cowork system prompt is installed; managed Cowork sessions then have full lifecycle automation"
+VERIFY_STEP=$((VERIFY_STEP + 1))
 if surface_selected_and_detected claude_desktop; then
-    echo "  ${VERIFY_STEP}. Claude Desktop: start a fresh conversation and confirm a Pith tool call"
+    echo "  ${VERIFY_STEP}. Claude Desktop / Claude Chat: start a fresh conversation and confirm an observed pith_conversation_turn call; if Claude does not choose it, ask Claude to use Pith for the request"
     echo -e "     Log: ${YELLOW}~/Library/Logs/Claude/mcp-server-pith.log${NC}"
     VERIFY_STEP=$((VERIFY_STEP + 1))
 fi
 if surface_selected_and_detected claude_code; then
-    echo -e "  ${VERIFY_STEP}. Claude Code: run ${YELLOW}claude mcp get pith${NC}, then start a fresh Claude Code session and confirm a Pith tool call"
+    echo -e "  ${VERIFY_STEP}. Claude Code: run ${YELLOW}claude mcp get pith${NC}, then start a fresh Claude Code session and confirm an observed model-visible pith_conversation_turn call"
     VERIFY_STEP=$((VERIFY_STEP + 1))
 fi
 if surface_selected_and_detected codex; then
