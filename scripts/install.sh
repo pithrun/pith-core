@@ -43,11 +43,11 @@ CURRENT_STEP=0
 # Color codes. Disable colors when stdout is not a terminal so install.command
 # logs and tee output never show raw escape sequences.
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
-    RED='\033[0;31m'
-    GREEN='\033[0;32m'
-    YELLOW='\033[1;33m'
-    BLUE='\033[0;34m'
-    NC='\033[0m'
+    RED=$'\033[0;31m'
+    GREEN=$'\033[0;32m'
+    YELLOW=$'\033[1;33m'
+    BLUE=$'\033[0;34m'
+    NC=$'\033[0m'
 else
     RED=''
     GREEN=''
@@ -86,7 +86,9 @@ download_release_file() {
 
 # Print banner
 print_banner() {
-    clear 2>/dev/null || true
+    if [[ "${PITH_CLEAR_SCREEN:-0}" == "1" && -t 0 && -t 1 ]]; then
+        clear 2>/dev/null || true
+    fi
     echo -e "${BLUE}"
     echo "╔════════════════════════════════════════╗"
     echo "║   🧠 Pith Installer v${PITH_VERSION}       ║"
@@ -122,6 +124,20 @@ mark_error() {
 error_exit() {
     echo -e "${RED}✗ ERROR:${NC} $1" >&2
     exit 1
+}
+
+print_python_runtime_recovery_hint() {
+    echo ""
+    echo "No compatible Python 3.10-3.12 was found."
+    echo "Pith can install a managed Python $PITH_RUNTIME_VERSION under $PITH_RUNTIME_ROOT when you opt in."
+    echo ""
+    echo "To retry the public installer:"
+    echo "  curl -fsSL https://pith.run/install | PITH_AUTO_PYTHON=1 bash"
+    echo ""
+    echo "If you are running from an extracted release artifact:"
+    echo "  PITH_AUTO_PYTHON=1 bash scripts/install.sh"
+    echo ""
+    echo "Important: set PITH_AUTO_PYTHON=1 on bash, not on curl."
 }
 
 validate_port_value() {
@@ -256,6 +272,50 @@ private_beta_pause() {
         read -r -p "$prompt" _ || true
         echo ""
     fi
+}
+
+show_interactive_manual_setup() {
+    [[ "${PITH_PRIVATE_BETA:-0}" == "1" && "${PITH_SKIP_PAUSES:-0}" != "1" && -t 0 ]]
+}
+
+summarize_client_config_result() {
+    local result_json="$1"
+    [[ -s "$result_json" ]] || return 0
+    python3 - "$result_json" <<'PY' || true
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+try:
+    data = json.loads(path.read_text(encoding="utf-8"))
+except Exception:
+    print("Client configuration completed; diagnostics saved for support.")
+    sys.exit(0)
+
+configured = data.get("configured") or []
+errors = data.get("errors") or []
+detected = data.get("detected") or []
+print(f"Detected AI app surfaces: {', '.join(detected) if detected else 'none'}")
+if configured:
+    print(f"Configured AI app items: {len(configured)}")
+    labels = []
+    for item in configured:
+        label = item.get("client") or item.get("file") or "item"
+        scope = item.get("scope")
+        action = item.get("action") or "updated"
+        if scope and item.get("client"):
+            label = f"{label} ({scope})"
+        labels.append(f"{label}: {action}")
+    for label in labels[:8]:
+        print(f"  - {label}")
+    if len(labels) > 8:
+        print(f"  - ... {len(labels) - 8} more")
+else:
+    print("Configured AI app items: 0")
+if errors:
+    print(f"Client configuration errors: {len(errors)} (see diagnostics log)")
+PY
 }
 
 migrate_legacy_env_aliases() {
@@ -727,10 +787,11 @@ ensure_python_runtime() {
             read -r -p "Install Pith-managed Python now? [y/N] " REPLY
             case "$REPLY" in
                 y|Y|yes|YES) ;;
-                *) error_exit "Python 3.10-3.12 required. Install Python manually or rerun with PITH_AUTO_PYTHON=1." ;;
+                *) print_python_runtime_recovery_hint; error_exit "Python 3.10-3.12 required. Install Python manually or rerun with PITH_AUTO_PYTHON=1." ;;
             esac
         else
-            error_exit "Python 3.10-3.12 required. Noninteractive install needs PITH_AUTO_PYTHON=1 to provision a Pith-managed runtime."
+            print_python_runtime_recovery_hint
+            error_exit "Python 3.10-3.12 required. Noninteractive install did not opt into Pith-managed Python."
         fi
     fi
 
@@ -957,7 +1018,7 @@ echo ""
 # ============================================================================
 # STEP 3: Download Pith Server with Checksum Verification
 # ============================================================================
-print_step 3 "Download Pith server with SHA-256 checksum verification [FIX S1]"
+print_step 3 "Download Pith server with SHA-256 checksum verification"
 
 PITH_SERVER_PATH="$PITH_HOME/pith-server"
 SCRIPT_SOURCE="${BASH_SOURCE[0]:-}"
@@ -1047,7 +1108,7 @@ echo ""
 # ============================================================================
 # STEP 4: Python venv Setup with Health Check
 # ============================================================================
-print_step 4 "Python venv setup with health check [FIX R1, R2, R3]"
+print_step 4 "Python venv setup with health check"
 
 VENV_PATH="$PITH_HOME/venv"
 
@@ -1185,7 +1246,7 @@ echo ""
 # ============================================================================
 # STEP 5: Generate API Key with Secure Permissions
 # ============================================================================
-print_step 5 "Generate API key with secure file permissions [FIX S2]"
+print_step 5 "Generate API key with secure file permissions"
 
 API_KEY_FILE="$PITH_HOME/config/api.key"
 if [[ ! -f "$API_KEY_FILE" ]]; then
@@ -1227,6 +1288,9 @@ select_install_surfaces
 # Try real configure_clients.py first (supports standard MCP clients including Codex)
 source "$VENV_PATH/bin/activate"
 CONFIGURE_SCRIPT="$PITH_SERVER_PATH/scripts/configure_clients.py"
+CLIENT_CONFIG_RESULT_JSON="$PITH_HOME/logs/configure-clients.json"
+CLIENT_CONFIG_RESULT_ERR="$PITH_HOME/logs/configure-clients.err"
+mkdir -p "$PITH_HOME/logs"
 
 if [[ "${PITH_SELECTED_SURFACES:-all}" == "none" ]]; then
     mark_warning "No AI app surfaces selected. Local service and CLI installation will continue."
@@ -1238,9 +1302,14 @@ elif [[ -f "$CONFIGURE_SCRIPT" ]] && python3 "$CONFIGURE_SCRIPT" \
     --platform "$OS_TYPE" \
     --api-url "http://localhost:$PITH_PORT" \
     --clients "${PITH_SELECTED_SURFACES:-all}" \
-    --json 2>/dev/null; then
+    --json > "$CLIENT_CONFIG_RESULT_JSON" 2> "$CLIENT_CONFIG_RESULT_ERR"; then
+    summarize_client_config_result "$CLIENT_CONFIG_RESULT_JSON"
+    mark_success "Client configuration diagnostics saved to $CLIENT_CONFIG_RESULT_JSON"
     mark_success "Selected MCP clients configured"
 else
+    if [[ -s "$CLIENT_CONFIG_RESULT_ERR" ]]; then
+        mark_warning "Client configuration diagnostics saved to $CLIENT_CONFIG_RESULT_ERR"
+    fi
     # Fallback: configure Claude Desktop only
     if ! surface_selected claude_desktop; then
         mark_warning "Full client config unavailable and Claude Desktop was not selected; skipping AI app config."
@@ -1405,33 +1474,37 @@ mark_success "Cursor Global Rule snippet saved to $CURSOR_GLOBAL_RULE_PATH"
 
 PROMPT_COPIED=false
 if surface_selected_and_detected claude_desktop; then
-    # Copy to clipboard on macOS for easy paste into Claude Desktop
-    if [[ "$OS_TYPE" == "macos" ]] && command -v pbcopy &>/dev/null; then
-        if pbcopy < "$SYSTEM_PROMPT_PATH" 2>/dev/null; then
-            PROMPT_COPIED=true
-            mark_success "Copied to clipboard — paste into Claude Desktop Instructions for Claude"
-        else
-            mark_warning "Could not copy to clipboard. Paste from $SYSTEM_PROMPT_PATH instead."
+    if show_interactive_manual_setup; then
+        # Copy to clipboard on macOS for easy paste into Claude Desktop
+        if [[ "$OS_TYPE" == "macos" ]] && command -v pbcopy &>/dev/null; then
+            if pbcopy < "$SYSTEM_PROMPT_PATH" 2>/dev/null; then
+                PROMPT_COPIED=true
+                mark_success "Copied to clipboard — paste into Claude Desktop Instructions for Claude"
+            else
+                mark_warning "Could not copy to clipboard. Paste from $SYSTEM_PROMPT_PATH instead."
+            fi
         fi
-    fi
 
-    echo ""
-    echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${BLUE}  Add Pith's cognitive instructions to Claude Desktop:${NC}"
-    echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo ""
-    echo "  1. Open Claude Desktop → Settings → General → Instructions for Claude"
-    if [[ "$PROMPT_COPIED" == true ]]; then
-        echo "  2. Paste (already in your clipboard)"
+        echo ""
+        echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        echo -e "${BLUE}  Add Pith's cognitive instructions to Claude Desktop:${NC}"
+        echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        echo ""
+        echo "  1. Open Claude Desktop → Settings → General → Instructions for Claude"
+        if [[ "$PROMPT_COPIED" == true ]]; then
+            echo "  2. Paste (already in your clipboard)"
+        else
+            echo "  2. Paste the contents of:"
+            echo -e "     ${YELLOW}$SYSTEM_PROMPT_PATH${NC}"
+        fi
+        echo "  3. Save — Claude will now use Pith's cognitive loop automatically"
+        echo ""
+        echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        echo ""
+        private_beta_pause "Private beta pause: note the Claude Desktop instructions above, then press Return to continue..."
     else
-        echo "  2. Paste the contents of:"
-        echo "     ${YELLOW}$SYSTEM_PROMPT_PATH${NC}"
+        mark_success "Claude Desktop instructions saved to $SYSTEM_PROMPT_PATH"
     fi
-    echo "  3. Save — Claude will now use Pith's cognitive loop automatically"
-    echo ""
-    echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo ""
-    private_beta_pause "Private beta pause: note the Claude Desktop instructions above, then press Return to continue..."
 else
     if surface_selected claude_desktop; then
         mark_warning "Claude Desktop was selected but not detected. Claude instructions are saved at $SYSTEM_PROMPT_PATH."
@@ -1440,33 +1513,37 @@ fi
 
 CURSOR_RULE_COPIED=false
 if surface_selected_and_detected cursor; then
-    if [[ "$OS_TYPE" == "macos" ]] && command -v pbcopy &>/dev/null; then
-        if pbcopy < "$CURSOR_GLOBAL_RULE_PATH" 2>/dev/null; then
-            CURSOR_RULE_COPIED=true
-            mark_success "Copied to clipboard — paste into Cursor Global/User Rule"
-        else
-            mark_warning "Could not copy Cursor rule to clipboard. Paste from $CURSOR_GLOBAL_RULE_PATH instead."
+    if show_interactive_manual_setup; then
+        if [[ "$OS_TYPE" == "macos" ]] && command -v pbcopy &>/dev/null; then
+            if pbcopy < "$CURSOR_GLOBAL_RULE_PATH" 2>/dev/null; then
+                CURSOR_RULE_COPIED=true
+                mark_success "Copied to clipboard — paste into Cursor Global/User Rule"
+            else
+                mark_warning "Could not copy Cursor rule to clipboard. Paste from $CURSOR_GLOBAL_RULE_PATH instead."
+            fi
         fi
-    fi
 
-    echo ""
-    echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${BLUE}  Add Pith's cognitive instructions to Cursor:${NC}"
-    echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo ""
-    echo "  1. Open Cursor Settings → Rules"
-    echo "  2. Add a Global/User Rule"
-    if [[ "$CURSOR_RULE_COPIED" == true ]]; then
-        echo "  3. Paste (already in your clipboard)"
+        echo ""
+        echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        echo -e "${BLUE}  Add Pith's cognitive instructions to Cursor:${NC}"
+        echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        echo ""
+        echo "  1. Open Cursor Settings → Rules"
+        echo "  2. Add a Global/User Rule"
+        if [[ "$CURSOR_RULE_COPIED" == true ]]; then
+            echo "  3. Paste (already in your clipboard)"
+        else
+            echo "  3. Paste the contents of:"
+            echo -e "     ${YELLOW}$CURSOR_GLOBAL_RULE_PATH${NC}"
+        fi
+        echo "  4. Save — Cursor will have default instructions to call Pith before substantive responses"
+        echo ""
+        echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        echo ""
+        private_beta_pause "Private beta pause: note the Cursor Global Rule instructions above, then press Return to continue..."
     else
-        echo "  3. Paste the contents of:"
-        echo "     ${YELLOW}$CURSOR_GLOBAL_RULE_PATH${NC}"
+        mark_success "Cursor Global/User Rule saved to $CURSOR_GLOBAL_RULE_PATH"
     fi
-    echo "  4. Save — Cursor will have default instructions to call Pith before substantive responses"
-    echo ""
-    echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo ""
-    private_beta_pause "Private beta pause: note the Cursor Global Rule instructions above, then press Return to continue..."
 elif surface_selected cursor; then
     mark_warning "Cursor was selected but not detected. Cursor Global Rule snippet is saved at $CURSOR_GLOBAL_RULE_PATH."
 fi
@@ -2821,85 +2898,85 @@ echo -e "Pith API URL:       ${BLUE}http://localhost:$PITH_PORT${NC}"
 echo ""
 echo -e "${BLUE}Quick Start:${NC}"
 if [[ "$PATH_ADDED" == true ]]; then
-    echo "  1. Reload your shell: ${YELLOW}source ${SHELL_RC_FILES[0]}${NC} (or open a new terminal)"
+    echo -e "  1. Reload your shell: ${YELLOW}source ${SHELL_RC_FILES[0]}${NC} (or open a new terminal)"
 else
-    echo "  1. Add to PATH: ${YELLOW}export PATH=\"$PITH_HOME/bin:\$PATH\"${NC}"
-    echo "     Add this line to your ${YELLOW}~/.bashrc${NC}, ${YELLOW}~/.zshrc${NC}, or equivalent"
+    echo -e "  1. Add to PATH: ${YELLOW}export PATH=\"$PITH_HOME/bin:\$PATH\"${NC}"
+    echo -e "     Add this line to your ${YELLOW}~/.bashrc${NC}, ${YELLOW}~/.zshrc${NC}, or equivalent"
 fi
 echo ""
 echo -e "${BLUE}Available Commands:${NC}"
-echo "  • ${YELLOW}pith start${NC}   - Start the Pith server"
-echo "  • ${YELLOW}pith stop${NC}    - Stop the server"
-echo "  • ${YELLOW}pith status${NC}  - Check server status"
-echo "  • ${YELLOW}pith health${NC}  - Check operational health/readiness"
-echo "  • ${YELLOW}pith logs${NC}    - View server logs"
-echo "  • ${YELLOW}pith import${NC}  - Import conversation exports safely"
-echo "  • ${YELLOW}pith api${NC}     - First-class local HTTP/API lifecycle calls"
-echo "  • ${YELLOW}pith backup${NC}  - Create manual backup (WAL-safe)"
-echo "  • ${YELLOW}pith restore${NC} - Restore from backup"
-echo "  • ${YELLOW}pith update${NC}  - Update Pith"
-echo "  • ${YELLOW}pith version${NC} - Show version and system info"
+echo -e "  • ${YELLOW}pith start${NC}   - Start the Pith server"
+echo -e "  • ${YELLOW}pith stop${NC}    - Stop the server"
+echo -e "  • ${YELLOW}pith status${NC}  - Check server status"
+echo -e "  • ${YELLOW}pith health${NC}  - Check operational health/readiness"
+echo -e "  • ${YELLOW}pith logs${NC}    - View server logs"
+echo -e "  • ${YELLOW}pith import${NC}  - Import conversation exports safely"
+echo -e "  • ${YELLOW}pith api${NC}     - First-class local HTTP/API lifecycle calls"
+echo -e "  • ${YELLOW}pith backup${NC}  - Create manual backup (WAL-safe)"
+echo -e "  • ${YELLOW}pith restore${NC} - Restore from backup"
+echo -e "  • ${YELLOW}pith update${NC}  - Update Pith"
+echo -e "  • ${YELLOW}pith version${NC} - Show version and system info"
 echo ""
 echo -e "${BLUE}Required setup:${NC}"
 SETUP_STEP=1
 echo "  ${SETUP_STEP}. Open a new terminal (or reload your shell profile)"
 SETUP_STEP=$((SETUP_STEP + 1))
 if surface_selected_and_detected claude_desktop; then
-    echo "  ${SETUP_STEP}. Claude Desktop instructions: if you pasted them during Step 7, this is already done."
-    echo "     To redo later: ${YELLOW}pith protocol${NC}  (copies prompt for Settings → General → Instructions for Claude)"
+    echo "  ${SETUP_STEP}. Claude Desktop instructions are saved at $SYSTEM_PROMPT_PATH."
+    echo -e "     To redo later: ${YELLOW}pith protocol${NC}  (copies prompt for Settings → General → Instructions for Claude)"
     SETUP_STEP=$((SETUP_STEP + 1))
 fi
 echo "  ${SETUP_STEP}. Restart each configured AI client completely before testing it"
 if surface_selected_and_detected cursor; then
     echo "  Cursor: MCP config is installed, but Cursor also needs a Global/User Rule for default Pith invocation."
-    echo "     Paste ${YELLOW}$CURSOR_GLOBAL_RULE_PATH${NC} into Cursor Settings → Rules."
+    echo -e "     Paste ${YELLOW}$CURSOR_GLOBAL_RULE_PATH${NC} into Cursor Settings → Rules."
 fi
 if surface_selected_and_detected windsurf; then
     echo "  Windsurf: experimental MCP template is installed; this path is not launch-verified."
 fi
 echo ""
 echo -e "${BLUE}Verification checks:${NC}"
-echo "  1. Core install: ${YELLOW}pith status${NC}  (expect Health: OK (Pith))"
+echo -e "  1. Core install: ${YELLOW}pith status${NC}  (expect Health: OK (Pith))"
 VERIFY_STEP=2
 if surface_selected_and_detected claude_desktop; then
     echo "  ${VERIFY_STEP}. Claude Desktop: start a fresh conversation and confirm a Pith tool call"
-    echo "     Log: ${YELLOW}~/Library/Logs/Claude/mcp-server-pith.log${NC}"
+    echo -e "     Log: ${YELLOW}~/Library/Logs/Claude/mcp-server-pith.log${NC}"
     VERIFY_STEP=$((VERIFY_STEP + 1))
 fi
 if surface_selected_and_detected claude_code; then
-    echo "  ${VERIFY_STEP}. Claude Code: run ${YELLOW}claude mcp get pith${NC}, then start a fresh Claude Code session and confirm a Pith tool call"
+    echo -e "  ${VERIFY_STEP}. Claude Code: run ${YELLOW}claude mcp get pith${NC}, then start a fresh Claude Code session and confirm a Pith tool call"
     VERIFY_STEP=$((VERIFY_STEP + 1))
 fi
 if surface_selected_and_detected codex; then
-    echo "  ${VERIFY_STEP}. Codex: confirm ${YELLOW}~/.codex/AGENTS.md${NC} exists and references ${YELLOW}pith api conversation_turn${NC}"
+    echo -e "  ${VERIFY_STEP}. Codex: confirm ${YELLOW}~/.codex/AGENTS.md${NC} exists and references ${YELLOW}pith api conversation_turn${NC}"
     echo "     If Codex was installed after Pith, rerun this installer or client configuration"
     VERIFY_STEP=$((VERIFY_STEP + 1))
 fi
 if surface_selected_and_detected vscode; then
-    echo "  ${VERIFY_STEP}. VS Code: restart VS Code, then run ${YELLOW}MCP: List Servers${NC}"
-    echo "     User config: ${YELLOW}~/Library/Application Support/Code/User/mcp.json${NC}"
-    echo "     Copilot instructions: ${YELLOW}~/.copilot/instructions/pith-cognitive-loop.instructions.md${NC}"
+    echo -e "  ${VERIFY_STEP}. VS Code: restart VS Code, then run ${YELLOW}MCP: List Servers${NC}"
+    echo -e "     User config: ${YELLOW}~/Library/Application Support/Code/User/mcp.json${NC}"
+    echo -e "     Copilot instructions: ${YELLOW}~/.copilot/instructions/pith-cognitive-loop.instructions.md${NC}"
     echo "     In Chat Diagnostics, confirm that instruction file is loaded for Agent Chat"
     VERIFY_STEP=$((VERIFY_STEP + 1))
 fi
 if surface_selected_and_detected cursor; then
     echo "  ${VERIFY_STEP}. Cursor: ask a normal project-context question and confirm a Pith tool call in Cursor's tool activity"
-    echo "     Config: ${YELLOW}~/.cursor/mcp.json${NC}; rule setup is separate from MCP config"
+    echo -e "     Config: ${YELLOW}~/.cursor/mcp.json${NC}; rule setup is separate from MCP config"
     VERIFY_STEP=$((VERIFY_STEP + 1))
 fi
 if surface_selected_and_detected windsurf; then
     echo "  ${VERIFY_STEP}. Windsurf (experimental): manually confirm whether Cascade calls Pith"
-    echo "     Config: ${YELLOW}~/.codeium/windsurf/mcp_config.json${NC}"
+    echo -e "     Config: ${YELLOW}~/.codeium/windsurf/mcp_config.json${NC}"
     VERIFY_STEP=$((VERIFY_STEP + 1))
 fi
-echo "  ${VERIFY_STEP}. View logs if a check fails: ${YELLOW}pith logs${NC}"
+echo -e "  ${VERIFY_STEP}. View logs if a check fails: ${YELLOW}pith logs${NC}"
 echo ""
 if [[ "${PITH_PRIVATE_BETA:-0}" == "1" || "${PITH_LOCAL_ONLY_INSTALL:-0}" == "1" || -f "$DIST_DIR/.private-beta" ]]; then
     echo -e "${BLUE}Private Beta:${NC}"
     echo "  Use the instructions included with this artifact."
     echo "  Do not use public repository release flows for this build."
     if [[ -n "${PITH_INSTALL_LOG:-}" ]]; then
-        echo "  Install log: ${YELLOW}$PITH_INSTALL_LOG${NC}"
+        echo -e "  Install log: ${YELLOW}$PITH_INSTALL_LOG${NC}"
     fi
 else
     echo -e "${BLUE}Documentation:${NC}"
