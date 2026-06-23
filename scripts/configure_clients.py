@@ -752,6 +752,23 @@ def _claude_code_hook_script_content():
             return response
 
 
+        def _reset_current_turn_lifecycle_flags(state):
+            state["hook_pre_response_ct_ok"] = False
+            state["model_visible_ct_ok"] = False
+            state["model_fired_ct"] = False
+            state["manual_ct_fired"] = False
+            for key in (
+                "model_ct_session_id",
+                "model_ct_surface_id",
+                "model_ct_origin_id",
+                "model_ct_response_mode",
+                "model_ct_response_chars",
+                "model_ct_coherence_status",
+                "model_ct_coherence_reason",
+            ):
+                state.pop(key, None)
+
+
         def _format_model_visible_binding(state):
             session_id = state.get("pith_session_id") or state.get("pre_response_ct_session_id")
             origin_id = state.get("pre_response_ct_origin_id")
@@ -902,12 +919,12 @@ def _claude_code_hook_script_content():
         def _handle_user_prompt(event, state_path, state):
             prompt = event.get("prompt") or ""
             _next_turn_seq(state)
-            state["model_fired_ct"] = False
-            state["manual_ct_fired"] = False
+            _reset_current_turn_lifecycle_flags(state)
             state["pending_prompt"] = prompt
             state["last_prompt_at"] = time.time()
             _prune_retry_queue(state)
             if os.environ.get("PITH_CLAUDE_CODE_T0_LIFECYCLE", "1").lower() in ("0", "false", "off", "no"):
+                state["hook_pre_response_ct_status"] = "skipped_disabled"
                 state["pre_response_ct_status"] = "skipped_disabled"
                 _write_state(state_path, state)
                 return
@@ -928,14 +945,17 @@ def _claude_code_hook_script_content():
                 state["pre_response_ct_workspace_id"] = payload.get("workspace_id")
                 state["pre_response_ct_surface_id"] = payload.get("surface_id")
                 state["pre_response_ct_status"] = "ok"
-                state["model_fired_ct"] = True
+                state["hook_pre_response_ct_ok"] = True
+                state["hook_pre_response_ct_status"] = "ok"
                 if error:
                     state["pre_response_ct_warning"] = error
                 _emit_user_prompt_context(_format_context(response, state))
             else:
                 reason = error or "missing_resolved_session_id"
+                degraded_status = "degraded_" + str(reason).split(":", 1)[0].replace(" ", "_")[:80]
                 state["pre_response_ct_request_id"] = payload.get("request_id")
-                state["pre_response_ct_status"] = "degraded_" + str(reason).split(":", 1)[0].replace(" ", "_")[:80]
+                state["pre_response_ct_status"] = degraded_status
+                state["hook_pre_response_ct_status"] = degraded_status
                 _emit_user_prompt_context(_format_degraded_context(reason))
             _write_state(state_path, state)
 
@@ -1057,9 +1077,12 @@ def _claude_code_hook_script_content():
             state["model_ct_coherence_status"] = status
             state["model_ct_coherence_reason"] = reason
             if status == "passed" or (status == "unknown" and not state.get("pith_session_id")):
+                state["model_visible_ct_ok"] = True
                 state["model_fired_ct"] = True
                 state["manual_ct_fired"] = True
             else:
+                state["model_visible_ct_ok"] = False
+                state["model_fired_ct"] = False
                 state["manual_ct_fired"] = False
             _write_state(state_path, state)
 
@@ -1086,7 +1109,11 @@ def _claude_code_hook_script_content():
                 "message": state.get("pending_prompt", ""),
                 "previous_message": state.get("previous_message", ""),
                 "previous_response": previous_response,
-                "conversation_context": "Claude Code backstop lifecycle hook (model did not call conversation_turn)",
+                "conversation_context": "Claude Code backstop lifecycle hook (hook T0 and model-visible conversation_turn were not observed)",
+                "surface_id": "claude_code",
+                "workspace_id": _workspace_id_for(event),
+                "context_delivery_mode": "hook_backstop",
+                "surface_lifecycle_version": "1.0",
             }
             if state.get("pith_session_id"):
                 payload["session_id"] = state["pith_session_id"]
@@ -1232,18 +1259,44 @@ def _claude_code_hook_script_content():
             _log(f"backstop_retry_queued request_id={payload.get('request_id')} error={error}")
 
 
+        def _needs_backstop_ct(state, pending):
+            return bool(
+                pending
+                and not state.get("hook_pre_response_ct_ok")
+                and not state.get("model_visible_ct_ok")
+            )
+
+
+        def _mark_model_visible_not_observed_if_needed(state):
+            if state.get("model_visible_ct_ok"):
+                return
+            if state.get("model_ct_coherence_status"):
+                return
+            state["model_ct_coherence_status"] = "skipped_not_observed"
+            state["model_ct_coherence_reason"] = "hook_registered_turn_but_model_visible_conversation_turn_not_observed"
+
+
         def _fire_backstop_ct(event, state, assistant_response):
             payload = _build_backstop_payload(event, state)
             if not payload:
-                return
+                return False
             resp, error = _call_pith_result("conversation_turn", payload, timeout=3.0)
-            if isinstance(resp, dict):
-                resolved = resp.get("resolved_session_id")
-                if resolved:
-                    state["pith_session_id"] = resolved
+            resolved = resp.get("resolved_session_id") if isinstance(resp, dict) else None
+            if resolved and not error:
+                state["pith_session_id"] = resolved
+                state["hook_pre_response_ct_ok"] = True
+                state["hook_pre_response_ct_status"] = "recovered_by_backstop"
+                state["hook_pre_response_ct_request_id"] = payload.get("request_id")
+                state["pre_response_ct_status"] = state.get("pre_response_ct_status") or "recovered_by_backstop"
+                state["pre_response_ct_request_id"] = payload.get("request_id")
+                state["pre_response_ct_session_id"] = resolved
+                state["pre_response_ct_origin_id"] = payload.get("origin_id")
+                state["pre_response_ct_workspace_id"] = payload.get("workspace_id")
+                state["pre_response_ct_surface_id"] = payload.get("surface_id")
                 _log(f"backstop_sent request_id={payload.get('request_id')}")
-                return
+                return True
             _queue_backstop_retry(state, payload, error)
+            return False
 
 
         def _replay_one_retry(state):
@@ -1311,8 +1364,9 @@ def _claude_code_hook_script_content():
             # this turn, fire a capture-only conversation_turn so no turn is lost.
             # _fire_backstop_ct reads state['previous_*'] as the PRIOR turn, so it
             # must run BEFORE we advance the pointers below.
-            if not state.get("model_fired_ct") and pending:
+            if _needs_backstop_ct(state, pending):
                 _fire_backstop_ct(event, state, response)
+            _mark_model_visible_not_observed_if_needed(state)
             if pending and response:
                 _fire_stop_learn(event, state, pending, response)
             if pending:
@@ -1347,9 +1401,9 @@ def _claude_code_hook_script_content():
             # un-fired in-flight turn so its learning is not lost, then checkpoint so
             # pre-compaction state is durable. This is a compaction_checkpoint, NOT a
             # session_end (the session continues after compaction).
-            if not state.get("model_fired_ct") and state.get("pending_prompt"):
+            if _needs_backstop_ct(state, state.get("pending_prompt")):
                 _fire_backstop_ct(event, state, state.get("previous_response", ""))
-                state["model_fired_ct"] = True
+            _mark_model_visible_not_observed_if_needed(state)
             payload = {
                 "origin_id": _origin_for(event),
                 "action": "save",
