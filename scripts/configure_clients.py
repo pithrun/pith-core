@@ -771,7 +771,7 @@ def _claude_code_hook_script_content():
             return [
                 "Model-visible Pith lifecycle binding:",
                 json.dumps(payload, sort_keys=True, separators=(",", ":")),
-                "When calling mcp__pith__pith_conversation_turn for this turn, reuse these exact fields.",
+                "Call mcp__pith__pith_conversation_turn before composing any substantive response for this turn, reusing these exact fields.",
                 "For lifecycle evidence reports, run ~/.pith/bin/pith api lifecycle_status --stdin-json with the same session_id, origin_id, and surface_id.",
                 "For cross-surface source coverage evidence, run ~/.pith/bin/pith api surface_activity --stdin-json with requested_surfaces such as claude_code,codex_local_api,local_api_cli; treat this as coverage evidence, not a semantic summary.",
             ]
@@ -1942,6 +1942,160 @@ def configure_vscode_user_instructions(plat, dry_run=False):
     return result
 
 
+def _readiness_entry(client, state, reason, path=None, scope=None, client_id=None):
+    entry = {
+        "client": client,
+        "state": state,
+        "reason": reason,
+    }
+    if client_id:
+        entry["client_id"] = client_id
+    if path:
+        entry["path"] = path
+    if scope:
+        entry["scope"] = scope
+    return entry
+
+
+def _configured_items(results, client=None, scope=None):
+    matches = []
+    for item in results.get("configured", []):
+        if client is not None and item.get("client") != client:
+            continue
+        if scope is not None and item.get("scope") != scope:
+            continue
+        matches.append(item)
+    return matches
+
+
+def _client_errors(results, client):
+    return [item for item in results.get("errors", []) if item.get("client") == client]
+
+
+def _first_path(items):
+    for item in items:
+        if item.get("path"):
+            return item.get("path")
+    return None
+
+
+def _build_readiness_summary(results):
+    readiness = []
+    detected = set(results.get("detected", []))
+
+    for client_id in ("claude_desktop", "claude_code", "cursor", "windsurf", "cline"):
+        if client_id not in detected:
+            continue
+        label = CLIENT_REGISTRY[client_id]["label"]
+        errors = _client_errors(results, label)
+        configured = _configured_items(results, label)
+        if errors:
+            readiness.append(_readiness_entry(
+                label,
+                "failed",
+                errors[0].get("error", "client configuration failed"),
+                path=errors[0].get("path"),
+                scope=errors[0].get("scope"),
+                client_id=client_id,
+            ))
+        elif client_id == "claude_desktop":
+            readiness.append(_readiness_entry(
+                label,
+                "manual_action_required",
+                "MCP config is installed; Instructions for Claude must still be pasted by the user.",
+                path=_first_path(configured),
+                client_id=client_id,
+            ))
+        elif client_id == "claude_code":
+            hook_items = _configured_items(results, label, scope="lifecycle-hooks")
+            readiness.append(_readiness_entry(
+                label,
+                "partial_hook_capture",
+                "MCP config and lifecycle hooks are installed; model-visible binding must call pith_conversation_turn each substantive turn.",
+                path=_first_path(hook_items or configured),
+                scope="lifecycle-hooks",
+                client_id=client_id,
+            ))
+        elif client_id == "cursor":
+            readiness.append(_readiness_entry(
+                label,
+                "manual_action_required",
+                "MCP config is installed; Cursor Global/User Rule must still be pasted by the user.",
+                path=_first_path(configured),
+                client_id=client_id,
+            ))
+        else:
+            readiness.append(_readiness_entry(
+                label,
+                "unsupported",
+                "MCP template may be installed, but automatic invocation is not launch-verified for this surface.",
+                path=_first_path(configured),
+                client_id=client_id,
+            ))
+
+    if "codex" in detected:
+        label = CODEX_CONFIG["label"]
+        errors = _client_errors(results, label)
+        agents_items = _configured_items(results, label, scope="agents-instructions")
+        if errors:
+            readiness.append(_readiness_entry(
+                label,
+                "failed",
+                errors[0].get("error", "Codex configuration failed"),
+                path=errors[0].get("path"),
+                scope=errors[0].get("scope"),
+                client_id="codex",
+            ))
+        elif agents_items:
+            readiness.append(_readiness_entry(
+                label,
+                "ready",
+                "AGENTS.md local API cognitive-loop instructions were installed.",
+                path=_first_path(agents_items),
+                scope="agents-instructions",
+                client_id="codex",
+            ))
+        else:
+            readiness.append(_readiness_entry(
+                label,
+                "manual_action_required",
+                "Codex was detected, but AGENTS.md cognitive-loop instructions were not installed.",
+                client_id="codex",
+            ))
+
+    if "vscode" in detected:
+        label = "VS Code"
+        errors = _client_errors(results, label)
+        instruction_items = _configured_items(results, label, scope="user-instructions")
+        if errors:
+            readiness.append(_readiness_entry(
+                label,
+                "failed",
+                errors[0].get("error", "VS Code configuration failed"),
+                path=errors[0].get("path"),
+                scope=errors[0].get("scope"),
+                client_id="vscode",
+            ))
+        elif instruction_items:
+            readiness.append(_readiness_entry(
+                label,
+                "ready",
+                "VS Code MCP user config and Copilot instruction file were installed.",
+                path=_first_path(instruction_items),
+                scope="user-instructions",
+                client_id="vscode",
+            ))
+        else:
+            readiness.append(_readiness_entry(
+                label,
+                "manual_action_required",
+                "VS Code was detected, but Copilot instructions were not installed.",
+                client_id="vscode",
+            ))
+
+    return readiness
+
+
 def generate_project_mcp_json(server_path, api_key, project_dir, dry_run=False, python_cmd=None, api_url="http://localhost:8000"):
     """Generate .mcp.json (Claude Code project-level config) in project root."""
     cmd = _resolve_python_or_exit(server_path, python_cmd)
@@ -2214,6 +2368,8 @@ def main():
             results["gitignore"] = r
         except Exception as e:
             results["gitignore"] = {"action": "error", "error": str(e)}
+
+    results["readiness"] = _build_readiness_summary(results)
 
     # --- Output ---
     if args.json_output:
