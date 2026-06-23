@@ -1769,7 +1769,30 @@ cat > "$PITH_HOME/bin/pith" << 'PITH_CLI_SCRIPT'
 PITH_VERSION="__PITH_VERSION__"
 
 PITH_CLI_SOURCE="${BASH_SOURCE[0]:-$0}"
-PITH_CLI_BIN_DIR="$(cd "$(dirname "$PITH_CLI_SOURCE")" && pwd -P)"
+resolve_pith_cli_source() {
+    local source="$1"
+    if [[ "$source" != */* ]]; then
+        local resolved=""
+        resolved="$(command -v "$source" 2>/dev/null || true)"
+        [[ -n "$resolved" ]] && source="$resolved"
+    fi
+    while [[ -L "$source" ]]; do
+        local source_dir target
+        source_dir="$(cd -P "$(dirname "$source")" && pwd)"
+        target="$(readlink "$source")"
+        if [[ "$target" == /* ]]; then
+            source="$target"
+        else
+            source="$source_dir/$target"
+        fi
+    done
+    local real_dir real_base
+    real_dir="$(cd -P "$(dirname "$source")" && pwd)"
+    real_base="$(basename "$source")"
+    printf '%s/%s\n' "$real_dir" "$real_base"
+}
+PITH_CLI_REAL_SOURCE="$(resolve_pith_cli_source "$PITH_CLI_SOURCE")"
+PITH_CLI_BIN_DIR="$(cd "$(dirname "$PITH_CLI_REAL_SOURCE")" && pwd -P)"
 PITH_CLI_DEFAULT_HOME="$(cd "$PITH_CLI_BIN_DIR/.." && pwd -P)"
 PITH_HOME="${PITH_HOME:-$PITH_CLI_DEFAULT_HOME}"
 VENV_PATH="$PITH_HOME/venv"
