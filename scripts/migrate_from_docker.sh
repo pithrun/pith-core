@@ -575,7 +575,7 @@ echo -e "${GREEN}${BOLD}╔═════════════════�
 echo -e "${GREEN}${BOLD}║     ✓ Migration Complete!              ║${NC}"
 echo -e "${GREEN}${BOLD}╚════════════════════════════════════════╝${NC}"
 echo ""
-echo -e "Your Pith Pith has been migrated from Docker to native installation."
+echo -e "Your Pith data has been migrated from Docker to native installation."
 echo ""
 if [[ "$PRE_CONCEPT_COUNT" -gt 0 ]]; then
     echo -e "  Pith data:  ${GREEN}$PRE_CONCEPT_COUNT concepts preserved${NC}"
