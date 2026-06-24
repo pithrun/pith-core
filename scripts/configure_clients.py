@@ -17,8 +17,8 @@ import platform
 import shutil
 import subprocess
 import sys
-import time
 import textwrap
+import time
 from pathlib import Path
 
 try:
@@ -30,14 +30,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.governance.runtime_install_guard import classify_runtime_path
 
-
 # ============================================================
 # Constants
 # ============================================================
 
 LEGACY_SERVER_NAMES = ["pith-mcp", "pith", "pith-mcp-wrapper"]
 PITH_CLAUDE_CODE_HOOK_SCRIPT_NAME = "claude-code-pith-lifecycle.py"
-PITH_CLAUDE_CODE_HOOK_VERSION = "claude-code-pith-lifecycle.v5"
+PITH_CLAUDE_CODE_HOOK_VERSION = "claude-code-pith-lifecycle.v6"
+PITH_CLAUDE_CODE_CONVERSATION_TURN_TOOL = "mcp__pith__pith_conversation_turn"
 
 
 def _session_audit_script_path():
@@ -63,7 +63,7 @@ def _load_api_key_from_file(path):
     if not os.path.isfile(expanded):
         raise argparse.ArgumentTypeError(f"API key source file not found: {expanded}")
 
-    with open(expanded, "r", encoding="utf-8") as f:
+    with open(expanded, encoding="utf-8") as f:
         content = f.read().strip()
 
     if expanded.endswith(".key"):
@@ -73,9 +73,7 @@ def _load_api_key_from_file(path):
         if line.startswith("PITH_API_KEY="):
             return _normalize_api_key(line.split("=", 1)[1])
 
-    raise argparse.ArgumentTypeError(
-        f"No PITH_API_KEY entry found in API key source file: {expanded}"
-    )
+    raise argparse.ArgumentTypeError(f"No PITH_API_KEY entry found in API key source file: {expanded}")
 
 
 def _reject_archive_only_workspace(server_path, allow_noncanonical_server=False):
@@ -108,7 +106,10 @@ def _reject_archive_only_workspace(server_path, allow_noncanonical_server=False)
 
     classification = payload.get("classification")
     usage_policy = payload.get("usage_policy")
-    if classification in {"archive_only_lane", "unregistered_worktree", "canonical_checkout"} or usage_policy == "archive_only":
+    if (
+        classification in {"archive_only_lane", "unregistered_worktree", "canonical_checkout"}
+        or usage_policy == "archive_only"
+    ):
         raise argparse.ArgumentTypeError(
             "Refusing to configure MCP clients with a non-runnable workspace target. "
             "Use ~/.pith/pith-server or a registered active session worktree instead."
@@ -145,9 +146,11 @@ def _validate_server_path(server_path, allow_noncanonical_server=False):
         "--allow-noncanonical-server for an intentional override."
     )
 
+
 # ============================================================
 # Client Definitions
 # ============================================================
+
 
 def _detect_platform():
     s = platform.system().lower()
@@ -178,13 +181,13 @@ CLIENT_REGISTRY = {
     "claude_desktop": {
         "label": "Claude Desktop",
         "detect_dirs": {
-            "macos":   "~/Library/Application Support/Claude",
-            "linux":   "~/.config/Claude",
+            "macos": "~/Library/Application Support/Claude",
+            "linux": "~/.config/Claude",
             "windows": "%APPDATA%/Claude",
         },
         "config_file": {
-            "macos":   "~/Library/Application Support/Claude/claude_desktop_config.json",
-            "linux":   "~/.config/Claude/claude_desktop_config.json",
+            "macos": "~/Library/Application Support/Claude/claude_desktop_config.json",
+            "linux": "~/.config/Claude/claude_desktop_config.json",
             "windows": "%APPDATA%/Claude/claude_desktop_config.json",
         },
         "json_root": "mcpServers",
@@ -193,13 +196,13 @@ CLIENT_REGISTRY = {
     "claude_code": {
         "label": "Claude Code",
         "detect_dirs": {
-            "macos":   "~/.claude",
-            "linux":   "~/.claude",
+            "macos": "~/.claude",
+            "linux": "~/.claude",
             "windows": "~/.claude",
         },
         "config_file": {
-            "macos":   "~/.claude.json",
-            "linux":   "~/.claude.json",
+            "macos": "~/.claude.json",
+            "linux": "~/.claude.json",
             "windows": "~/.claude.json",
         },
         "json_root": "mcpServers",
@@ -208,13 +211,13 @@ CLIENT_REGISTRY = {
     "cursor": {
         "label": "Cursor",
         "detect_dirs": {
-            "macos":   "~/.cursor",
-            "linux":   "~/.cursor",
+            "macos": "~/.cursor",
+            "linux": "~/.cursor",
             "windows": "~/.cursor",
         },
         "config_file": {
-            "macos":   "~/.cursor/mcp.json",
-            "linux":   "~/.cursor/mcp.json",
+            "macos": "~/.cursor/mcp.json",
+            "linux": "~/.cursor/mcp.json",
             "windows": "~/.cursor/mcp.json",
         },
         "json_root": "mcpServers",
@@ -223,13 +226,13 @@ CLIENT_REGISTRY = {
     "windsurf": {
         "label": "Windsurf",
         "detect_dirs": {
-            "macos":   "~/.codeium/windsurf",
-            "linux":   "~/.codeium/windsurf",
+            "macos": "~/.codeium/windsurf",
+            "linux": "~/.codeium/windsurf",
             "windows": "~/.codeium/windsurf",
         },
         "config_file": {
-            "macos":   "~/.codeium/windsurf/mcp_config.json",
-            "linux":   "~/.codeium/windsurf/mcp_config.json",
+            "macos": "~/.codeium/windsurf/mcp_config.json",
+            "linux": "~/.codeium/windsurf/mcp_config.json",
             "windows": "~/.codeium/windsurf/mcp_config.json",
         },
         "json_root": "mcpServers",
@@ -238,13 +241,13 @@ CLIENT_REGISTRY = {
     "cline": {
         "label": "Cline",
         "detect_dirs": {
-            "macos":   "~/Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev",
-            "linux":   "~/.config/Code/User/globalStorage/saoudrizwan.claude-dev",
+            "macos": "~/Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev",
+            "linux": "~/.config/Code/User/globalStorage/saoudrizwan.claude-dev",
             "windows": "%APPDATA%/Code/User/globalStorage/saoudrizwan.claude-dev",
         },
         "config_file": {
-            "macos":   "~/Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json",
-            "linux":   "~/.config/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json",
+            "macos": "~/Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json",
+            "linux": "~/.config/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json",
             "windows": "%APPDATA%/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json",
         },
         "json_root": "mcpServers",
@@ -288,13 +291,13 @@ CODEX_CONFIG = {
 VSCODE_CONFIG = {
     "label": "VS Code",
     "detect_dirs": {
-        "macos":   "~/.vscode",
-        "linux":   "~/.vscode",
+        "macos": "~/.vscode",
+        "linux": "~/.vscode",
         "windows": "~/.vscode",
     },
     "config_file": {
-        "macos":   "~/Library/Application Support/Code/User/mcp.json",
-        "linux":   "~/.config/Code/User/mcp.json",
+        "macos": "~/Library/Application Support/Code/User/mcp.json",
+        "linux": "~/.config/Code/User/mcp.json",
         "windows": "%APPDATA%/Code/User/mcp.json",
     },
     "app_dirs": {
@@ -368,10 +371,10 @@ Use `[]` for `extracted_concepts_json` when the exchange is trivial. For impleme
 """
 
 
-
 # ============================================================
 # Core Logic
 # ============================================================
+
 
 def detect_clients(plat):
     """Detect which MCP clients are installed by checking config directories."""
@@ -399,16 +402,14 @@ def detect_clients(plat):
 
 class ResolutionError(RuntimeError):
     """Raised when no usable Python interpreter can be located. MCP-PYTHON-RES-001."""
+
     pass
 
 
 def _interpreter_has_mcp(python_path):
     """Return True iff the given python interpreter can import `mcp`."""
     try:
-        result = subprocess.run(
-            [python_path, "-c", "import mcp"],
-            capture_output=True, timeout=5
-        )
+        result = subprocess.run([python_path, "-c", "import mcp"], capture_output=True, timeout=5)
         return result.returncode == 0
     except (subprocess.TimeoutExpired, OSError):
         return False
@@ -430,6 +431,7 @@ def _detect_python_cmd(server_path):
     parent_dir = os.path.dirname(server_dir)
     # FED-033: Check Unix (bin/python3) and Windows (Scripts/python.exe) venv layouts.
     import sys as _sys
+
     if _sys.platform == "win32":
         venv_candidates = [("Scripts", "python.exe")]
     else:
@@ -488,13 +490,17 @@ def _resolve_python_or_exit(server_path, python_cmd):
         try:
             os.makedirs(os.path.dirname(diag_path), exist_ok=True)
             with open(diag_path, "w") as f:
-                json.dump({
-                    "error": "mcp_python_resolution_failed",
-                    "reason": str(e)[:500],
-                    "server_path": server_path,
-                    "remediation": "Run scripts/install.sh to create ~/.pith/venv with mcp installed.",
-                    "doctor_command": "bash ~/.pith/pith-server/scripts/pith_mcp_doctor.sh",
-                }, f, indent=2)
+                json.dump(
+                    {
+                        "error": "mcp_python_resolution_failed",
+                        "reason": str(e)[:500],
+                        "server_path": server_path,
+                        "remediation": "Run scripts/install.sh to create ~/.pith/venv with mcp installed.",
+                        "doctor_command": "bash ~/.pith/pith-server/scripts/pith_mcp_doctor.sh",
+                    },
+                    f,
+                    indent=2,
+                )
         except OSError:
             pass
         print(f"ERROR: {e}", file=sys.stderr)
@@ -542,9 +548,9 @@ def _read_json(filepath):
     if not os.path.isfile(filepath):
         return {}
     try:
-        with open(filepath, "r") as f:
+        with open(filepath) as f:
             return json.load(f)
-    except (json.JSONDecodeError, IOError):
+    except (OSError, json.JSONDecodeError):
         return {}
 
 
@@ -590,7 +596,7 @@ def _claude_code_hook_script_content():
 
         PITH_HOME = Path(__file__).resolve().parents[1]
         PITH_CLI = PITH_HOME / "bin" / "pith"
-        HOOK_VERSION = "claude-code-pith-lifecycle.v5"
+        HOOK_VERSION = "claude-code-pith-lifecycle.v6"
         STATE_DIR = PITH_HOME / "cache" / "claude-code-lifecycle"
         LOG_PATH = PITH_HOME / "logs" / "claude-code-lifecycle.log"
         MIN_LEARNABLE_RESPONSE_CHARS = 30
@@ -599,6 +605,8 @@ def _claude_code_hook_script_content():
         RETRY_MAX_ATTEMPTS = 3
         RETRY_TTL_SECONDS = 24 * 60 * 60
         RETRY_QUEUE_KEY = "retry_queue"
+        TURN_HISTORY_KEY = "turn_history"
+        TURN_HISTORY_MAX_ITEMS = 50
 
 
         def _log(message):
@@ -634,6 +642,40 @@ def _claude_code_hook_script_content():
             current += 1
             state["hook_turn_seq"] = current
             return current
+
+
+        def _turn_history(state):
+            history = state.get(TURN_HISTORY_KEY)
+            return history if isinstance(history, list) else []
+
+
+        def _set_turn_history(state, history):
+            state[TURN_HISTORY_KEY] = history[-TURN_HISTORY_MAX_ITEMS:]
+
+
+        def _current_turn_record(state):
+            seq = state.get("hook_turn_seq")
+            if not seq:
+                return None
+            for record in reversed(_turn_history(state)):
+                if isinstance(record, dict) and record.get("turn_seq") == seq:
+                    return record
+            return None
+
+
+        def _update_current_turn(state, **fields):
+            seq = state.get("hook_turn_seq")
+            if not seq:
+                return
+            history = _turn_history(state)
+            record = _current_turn_record(state)
+            if record is None:
+                record = {"turn_seq": seq, "started_at": time.time()}
+                history.append(record)
+            for key, value in fields.items():
+                if value is not None:
+                    record[key] = value
+            _set_turn_history(state, history)
 
 
         def _retry_queue(state):
@@ -769,10 +811,18 @@ def _claude_code_hook_script_content():
                 state.pop(key, None)
 
 
+        def _binding_origin_id(state):
+            return state.get("pre_response_ct_origin_id") or state.get("session_start_origin_id")
+
+
+        def _binding_workspace_id(state):
+            return state.get("pre_response_ct_workspace_id") or state.get("session_start_workspace_id")
+
+
         def _format_model_visible_binding(state):
             session_id = state.get("pith_session_id") or state.get("pre_response_ct_session_id")
-            origin_id = state.get("pre_response_ct_origin_id")
-            workspace_id = state.get("pre_response_ct_workspace_id")
+            origin_id = _binding_origin_id(state)
+            workspace_id = _binding_workspace_id(state)
             if not session_id or not origin_id:
                 return []
             payload = {
@@ -841,16 +891,40 @@ def _claude_code_hook_script_content():
             )[:500]
 
 
-        def _emit_user_prompt_context(text):
+        def _emit_hook_context(event_name, text):
             if not text:
                 return
             payload = {
                 "hookSpecificOutput": {
-                    "hookEventName": "UserPromptSubmit",
+                    "hookEventName": event_name,
                     "additionalContext": text,
                 }
             }
             print(json.dumps(payload, separators=(",", ":")))
+
+
+        def _emit_user_prompt_context(text):
+            _emit_hook_context("UserPromptSubmit", text)
+
+
+        def _format_session_start_context(state):
+            status = state.get("session_start_status") or "unknown"
+            lines = [f"Pith lifecycle: SessionStart {status}."]
+            session_id = state.get("pith_session_id")
+            if session_id:
+                lines.append(f"Session: {session_id}")
+            source = state.get("session_start_source")
+            if source:
+                lines.append(f"Source: {source}")
+            if status.startswith("degraded_"):
+                lines.append("Pith startup bootstrap degraded; first prompt hook will retry normal lifecycle.")
+            else:
+                lines.append("First prompt hook will reuse this Pith session id.")
+            return "\n".join(lines)[:800]
+
+
+        def _emit_session_start_context(state):
+            _emit_hook_context("SessionStart", _format_session_start_context(state))
 
 
         PITH_CT_TOOL_NAME = "mcp__pith__pith_conversation_turn"
@@ -887,6 +961,48 @@ def _claude_code_hook_script_content():
             return payload
 
 
+        def _handle_session_start(event, state_path, state):
+            source = event.get("source") or "unknown"
+            now = time.time()
+            state["claude_session_id"] = event.get("session_id") or ""
+            state["session_start_source"] = source
+            state["session_start_at"] = now
+            state["session_start_origin_id"] = _origin_for(event)
+            state["session_start_workspace_id"] = _workspace_id_for(event)
+            state["session_start_surface_id"] = "claude_code"
+            if state.get("pith_session_id"):
+                state["session_start_status"] = "reused_existing"
+                _emit_session_start_context(state)
+                _write_state(state_path, state)
+                return
+            payload = {
+                "context_hint": (
+                    "Claude Code SessionStart "
+                    f"source={source} "
+                    f"origin_id={_origin_for(event)} "
+                    f"workspace_id={_workspace_id_for(event)}"
+                ),
+                "agent_id": "claude_code",
+                "surface_id": "claude_code",
+                "platform_hint": "claude-code",
+            }
+            response, error = _call_pith_result("session_start", payload, timeout=3.0)
+            session = response.get("session") if isinstance(response, dict) else {}
+            session_id = session.get("session_id") if isinstance(session, dict) else None
+            if session_id:
+                state["pith_session_id"] = session_id
+                state["session_start_status"] = "ok"
+                state["session_start_pith_surface_id"] = session.get("surface_id")
+                state["session_start_pith_origin_id"] = session.get("origin_id")
+                if error:
+                    state["session_start_warning"] = error
+            else:
+                reason = error or "missing_session_id"
+                state["session_start_status"] = "degraded_" + str(reason).split(":", 1)[0].replace(" ", "_")[:80]
+            _emit_session_start_context(state)
+            _write_state(state_path, state)
+
+
         def _response_detail(response):
             if not isinstance(response, dict):
                 return {}
@@ -916,16 +1032,54 @@ def _claude_code_hook_script_content():
             )
 
 
+        def _finalize_interrupted_turn_if_needed(state):
+            if not state.get("pending_prompt"):
+                return
+            record = _current_turn_record(state)
+            if not record or record.get("completed_at"):
+                return
+            if state.get("model_visible_ct_ok"):
+                model_visible_status = "observed"
+            elif state.get("model_ct_coherence_status"):
+                model_visible_status = state.get("model_ct_coherence_status")
+            else:
+                model_visible_status = "not_observed"
+            _update_current_turn(
+                state,
+                completed_at=time.time(),
+                completion_reason="superseded_by_next_prompt_without_stop",
+                stop_observed=False,
+                model_visible_status=model_visible_status,
+                model_ct_session_id=state.get("model_ct_session_id"),
+                model_ct_coherence_status=state.get("model_ct_coherence_status") or "skipped_not_observed",
+                model_ct_coherence_reason=state.get("model_ct_coherence_reason")
+                or "hook_registered_turn_but_model_visible_conversation_turn_not_observed",
+                learning_status="not_observed",
+            )
+
+
         def _handle_user_prompt(event, state_path, state):
             prompt = event.get("prompt") or ""
+            _finalize_interrupted_turn_if_needed(state)
             _next_turn_seq(state)
             _reset_current_turn_lifecycle_flags(state)
+            _update_current_turn(
+                state,
+                started_at=time.time(),
+                model_visible_status="pending",
+                stop_observed=False,
+            )
             state["pending_prompt"] = prompt
             state["last_prompt_at"] = time.time()
             _prune_retry_queue(state)
             if os.environ.get("PITH_CLAUDE_CODE_T0_LIFECYCLE", "1").lower() in ("0", "false", "off", "no"):
                 state["hook_pre_response_ct_status"] = "skipped_disabled"
                 state["pre_response_ct_status"] = "skipped_disabled"
+                _update_current_turn(
+                    state,
+                    pre_response_ct_status=state.get("pre_response_ct_status"),
+                    hook_pre_response_ct_status=state.get("hook_pre_response_ct_status"),
+                )
                 _write_state(state_path, state)
                 return
             payload = _build_t0_payload(event, state, prompt)
@@ -957,6 +1111,13 @@ def _claude_code_hook_script_content():
                 state["pre_response_ct_status"] = degraded_status
                 state["hook_pre_response_ct_status"] = degraded_status
                 _emit_user_prompt_context(_format_degraded_context(reason))
+            _update_current_turn(
+                state,
+                pre_response_ct_status=state.get("pre_response_ct_status"),
+                pre_response_ct_session_id=state.get("pre_response_ct_session_id"),
+                pre_response_ct_request_id=state.get("pre_response_ct_request_id"),
+                hook_pre_response_ct_status=state.get("hook_pre_response_ct_status"),
+            )
             _write_state(state_path, state)
 
 
@@ -1084,6 +1245,16 @@ def _claude_code_hook_script_content():
                 state["model_visible_ct_ok"] = False
                 state["model_fired_ct"] = False
                 state["manual_ct_fired"] = False
+            _update_current_turn(
+                state,
+                model_visible_status="observed" if state.get("model_visible_ct_ok") else status,
+                model_ct_session_id=state.get("model_ct_session_id"),
+                model_ct_surface_id=state.get("model_ct_surface_id"),
+                model_ct_origin_id=state.get("model_ct_origin_id"),
+                model_ct_response_mode=state.get("model_ct_response_mode"),
+                model_ct_coherence_status=state.get("model_ct_coherence_status"),
+                model_ct_coherence_reason=state.get("model_ct_coherence_reason"),
+            )
             _write_state(state_path, state)
 
 
@@ -1369,6 +1540,25 @@ def _claude_code_hook_script_content():
             _mark_model_visible_not_observed_if_needed(state)
             if pending and response:
                 _fire_stop_learn(event, state, pending, response)
+            if state.get("model_visible_ct_ok"):
+                model_visible_status = "observed"
+            elif state.get("model_ct_coherence_status") == "skipped_not_observed":
+                model_visible_status = "not_observed"
+            else:
+                model_visible_status = state.get("model_ct_coherence_status") or "not_observed"
+            _update_current_turn(
+                state,
+                completed_at=time.time(),
+                completion_reason="stop",
+                stop_observed=True,
+                model_visible_status=model_visible_status,
+                model_ct_session_id=state.get("model_ct_session_id"),
+                model_ct_coherence_status=state.get("model_ct_coherence_status"),
+                model_ct_coherence_reason=state.get("model_ct_coherence_reason"),
+                learning_status=state.get("last_stop_learn_status") or "not_observed",
+                learning_events=state.get("last_stop_learn_learning_events"),
+                accepted_learning_events=state.get("last_stop_learn_accepted_learning_events"),
+            )
             if pending:
                 state["previous_message"] = pending
             if response:
@@ -1420,12 +1610,14 @@ def _claude_code_hook_script_content():
             name = event.get("hook_event_name")
             state_path = _state_path(event)
             state = _read_state(state_path)
-            if name in ("UserPromptSubmit", "PostToolUse"):
+            if name == "SessionStart":
+                _handle_session_start(event, state_path, state)
+            elif name in ("UserPromptSubmit", "PostToolUse"):
                 _replay_one_retry(state)
-            if name == "UserPromptSubmit":
-                _handle_user_prompt(event, state_path, state)
-            elif name == "PostToolUse":
-                _handle_post_tool_use(event, state_path, state)
+                if name == "UserPromptSubmit":
+                    _handle_user_prompt(event, state_path, state)
+                elif name == "PostToolUse":
+                    _handle_post_tool_use(event, state_path, state)
             elif name == "Stop":
                 _handle_stop(event, state_path, state)
             elif name == "PreCompact":
@@ -1462,11 +1654,14 @@ def _pith_hook_handler(python_cmd, script_path, event_name, timeout=5):
     }
 
 
-def _remove_existing_pith_hook_handlers(groups, script_path):
+def _remove_existing_pith_hook_handlers(groups, script_path, matcher=None):
     cleaned = []
     script = str(script_path)
     for group in groups if isinstance(groups, list) else []:
         if not isinstance(group, dict):
+            cleaned.append(group)
+            continue
+        if matcher is not None and group.get("matcher") != matcher:
             cleaned.append(group)
             continue
         hooks = group.get("hooks")
@@ -1479,7 +1674,8 @@ def _remove_existing_pith_hook_handlers(groups, script_path):
                 retained.append(hook)
                 continue
             args = hook.get("args") or []
-            if script in [str(arg) for arg in args]:
+            command = hook.get("command")
+            if command == script or script in [str(arg) for arg in args]:
                 continue
             retained.append(hook)
         if retained:
@@ -1491,12 +1687,27 @@ def _remove_existing_pith_hook_handlers(groups, script_path):
 
 def _merge_claude_code_hook(settings, event_name, handler, script_path, matcher=None):
     hooks = settings.setdefault("hooks", {})
-    groups = _remove_existing_pith_hook_handlers(hooks.get(event_name, []), script_path)
+    groups = _remove_existing_pith_hook_handlers(hooks.get(event_name, []), script_path, matcher=matcher)
     group = {"hooks": [handler]}
     if matcher is not None:
         group["matcher"] = matcher
     groups.append(group)
     hooks[event_name] = groups
+
+
+def _ensure_claude_code_conversation_turn_permission(settings):
+    permissions = settings.get("permissions")
+    if not isinstance(permissions, dict):
+        permissions = {}
+        settings["permissions"] = permissions
+
+    allow = permissions.get("allow")
+    if not isinstance(allow, list):
+        allow = []
+
+    if PITH_CLAUDE_CODE_CONVERSATION_TURN_TOOL not in allow:
+        allow.append(PITH_CLAUDE_CODE_CONVERSATION_TURN_TOOL)
+    permissions["allow"] = allow
 
 
 def configure_claude_code_lifecycle_hooks(python_cmd, plat, dry_run=False):
@@ -1518,6 +1729,14 @@ def configure_claude_code_lifecycle_hooks(python_cmd, plat, dry_run=False):
 
     backup = _backup_file(str(settings_path))
     settings = _read_json(str(settings_path))
+    for source in ("startup", "resume", "clear", "compact"):
+        _merge_claude_code_hook(
+            settings,
+            "SessionStart",
+            _pith_hook_handler(python_cmd, script_path, f"session_start:{source}", timeout=5),
+            script_path,
+            matcher=source,
+        )
     _merge_claude_code_hook(
         settings,
         "UserPromptSubmit",
@@ -1531,7 +1750,7 @@ def configure_claude_code_lifecycle_hooks(python_cmd, plat, dry_run=False):
         "PostToolUse",
         _pith_hook_handler(python_cmd, script_path, "post_tool_use", timeout=5),
         script_path,
-        matcher="mcp__pith__pith_conversation_turn",
+        matcher=PITH_CLAUDE_CODE_CONVERSATION_TURN_TOOL,
     )
     _merge_claude_code_hook(
         settings,
@@ -1552,6 +1771,7 @@ def configure_claude_code_lifecycle_hooks(python_cmd, plat, dry_run=False):
         _pith_hook_handler(python_cmd, script_path, "session_end", timeout=5),
         script_path,
     )
+    _ensure_claude_code_conversation_turn_permission(settings)
     _write_json(str(settings_path), settings)
     if not _validate_json(str(settings_path)):
         if backup and os.path.isfile(backup):
@@ -1579,10 +1799,10 @@ def configure_claude_code_lifecycle_hooks(python_cmd, plat, dry_run=False):
 def _validate_json(filepath):
     """Validate that a file contains valid JSON."""
     try:
-        with open(filepath, "r") as f:
+        with open(filepath) as f:
             json.load(f)
         return True
-    except (json.JSONDecodeError, IOError):
+    except (OSError, json.JSONDecodeError):
         return False
 
 
@@ -1638,9 +1858,7 @@ def _find_owned_codex_blocks(text):
         server_idx = header_index[server_header]
         env_idx = header_index.get(env_header)
         if env_idx is not None and env_idx < server_idx:
-            raise argparse.ArgumentTypeError(
-                f"Invalid Codex config: env block appears before server block for {name}."
-            )
+            raise argparse.ArgumentTypeError(f"Invalid Codex config: env block appears before server block for {name}.")
 
         block_end = len(lines)
         anchor = env_idx if env_idx is not None else server_idx
@@ -1672,7 +1890,7 @@ def _replace_or_append_codex_pith_block(existing_text, block_text):
     if len(blocks) == 1:
         lines = existing_text.splitlines()
         block = blocks[0]
-        before = lines[:block["start"]]
+        before = lines[: block["start"]]
         after = lines[block["end"] :]
         rendered = "\n".join(before)
         if rendered and not rendered.endswith("\n"):
@@ -1741,8 +1959,9 @@ def _validate_codex_config_text(text, api_url="http://localhost:8000"):
     )
 
 
-
-def configure_standard_client(client_id, info, server_path, api_key, plat, dry_run=False, python_cmd=None, api_url="http://localhost:8000"):
+def configure_standard_client(
+    client_id, info, server_path, api_key, plat, dry_run=False, python_cmd=None, api_url="http://localhost:8000"
+):
     """Configure a standard mcpServers-based client (Claude Desktop, Code, Cursor, Windsurf, Cline)."""
     config_path = _expand(info["config_file"][plat], plat)
     label = info["label"]
@@ -1795,7 +2014,7 @@ def configure_codex(server_path, api_key, plat, dry_run=False, python_cmd=None, 
     backup = _backup_file(config_path)
     existing_text = ""
     if os.path.isfile(config_path):
-        with open(config_path, "r", encoding="utf-8") as handle:
+        with open(config_path, encoding="utf-8") as handle:
             existing_text = handle.read()
 
     block_text = _build_codex_toml_block(server_path, api_key, python_cmd=python_cmd, api_url=api_url)
@@ -1838,7 +2057,7 @@ def configure_codex_agents_instructions(plat, dry_run=False):
 
     existing = ""
     if os.path.isfile(config_path):
-        with open(config_path, "r", encoding="utf-8") as handle:
+        with open(config_path, encoding="utf-8") as handle:
             existing = handle.read()
 
     if CODEX_AGENTS_START in existing and CODEX_AGENTS_END in existing:
@@ -1874,7 +2093,9 @@ def configure_codex_agents_instructions(plat, dry_run=False):
     return result
 
 
-def configure_vscode(server_path, api_key, project_dir, dry_run=False, python_cmd=None, api_url="http://localhost:8000"):
+def configure_vscode(
+    server_path, api_key, project_dir, dry_run=False, python_cmd=None, api_url="http://localhost:8000"
+):
     """Generate .vscode/mcp.json with VS Code's servers schema."""
     cmd = _resolve_python_or_exit(server_path, python_cmd)
     vscode_dir = os.path.join(project_dir, ".vscode")
@@ -1967,7 +2188,7 @@ def configure_vscode_user_instructions(plat, dry_run=False):
 
     existing = ""
     if os.path.isfile(config_path):
-        with open(config_path, "r", encoding="utf-8") as handle:
+        with open(config_path, encoding="utf-8") as handle:
             existing = handle.read()
 
     if existing == content:
@@ -2044,113 +2265,137 @@ def _build_readiness_summary(results):
         errors = _client_errors(results, label)
         configured = _configured_items(results, label)
         if errors:
-            readiness.append(_readiness_entry(
-                label,
-                "failed",
-                errors[0].get("error", "client configuration failed"),
-                path=errors[0].get("path"),
-                scope=errors[0].get("scope"),
-                client_id=client_id,
-            ))
+            readiness.append(
+                _readiness_entry(
+                    label,
+                    "failed",
+                    errors[0].get("error", "client configuration failed"),
+                    path=errors[0].get("path"),
+                    scope=errors[0].get("scope"),
+                    client_id=client_id,
+                )
+            )
         elif client_id == "claude_desktop":
-            readiness.append(_readiness_entry(
-                label,
-                "manual_action_required",
-                "MCP config is installed; Instructions for Claude must still be pasted by the user.",
-                path=_first_path(configured),
-                client_id=client_id,
-            ))
+            readiness.append(
+                _readiness_entry(
+                    label,
+                    "manual_action_required",
+                    "MCP config is installed; Instructions for Claude must still be pasted by the user.",
+                    path=_first_path(configured),
+                    client_id=client_id,
+                )
+            )
         elif client_id == "claude_code":
             hook_items = _configured_items(results, label, scope="lifecycle-hooks")
-            readiness.append(_readiness_entry(
-                label,
-                "partial_hook_capture",
-                "MCP config and lifecycle hooks are installed; model-visible binding must call pith_conversation_turn each substantive turn.",
-                path=_first_path(hook_items or configured),
-                scope="lifecycle-hooks",
-                client_id=client_id,
-            ))
+            readiness.append(
+                _readiness_entry(
+                    label,
+                    "partial_hook_capture",
+                    "MCP config and lifecycle hooks are installed; model-visible binding must call pith_conversation_turn each substantive turn.",
+                    path=_first_path(hook_items or configured),
+                    scope="lifecycle-hooks",
+                    client_id=client_id,
+                )
+            )
         elif client_id == "cursor":
-            readiness.append(_readiness_entry(
-                label,
-                "manual_action_required",
-                "MCP config is installed; Cursor Global/User Rule must still be pasted by the user.",
-                path=_first_path(configured),
-                client_id=client_id,
-            ))
+            readiness.append(
+                _readiness_entry(
+                    label,
+                    "manual_action_required",
+                    "MCP config is installed; Cursor Global/User Rule must still be pasted by the user.",
+                    path=_first_path(configured),
+                    client_id=client_id,
+                )
+            )
         else:
-            readiness.append(_readiness_entry(
-                label,
-                "unsupported",
-                "MCP template may be installed, but automatic invocation is not launch-verified for this surface.",
-                path=_first_path(configured),
-                client_id=client_id,
-            ))
+            readiness.append(
+                _readiness_entry(
+                    label,
+                    "unsupported",
+                    "MCP template may be installed, but automatic invocation is not launch-verified for this surface.",
+                    path=_first_path(configured),
+                    client_id=client_id,
+                )
+            )
 
     if "codex" in detected:
         label = CODEX_CONFIG["label"]
         errors = _client_errors(results, label)
         agents_items = _configured_items(results, label, scope="agents-instructions")
         if errors:
-            readiness.append(_readiness_entry(
-                label,
-                "failed",
-                errors[0].get("error", "Codex configuration failed"),
-                path=errors[0].get("path"),
-                scope=errors[0].get("scope"),
-                client_id="codex",
-            ))
+            readiness.append(
+                _readiness_entry(
+                    label,
+                    "failed",
+                    errors[0].get("error", "Codex configuration failed"),
+                    path=errors[0].get("path"),
+                    scope=errors[0].get("scope"),
+                    client_id="codex",
+                )
+            )
         elif agents_items:
-            readiness.append(_readiness_entry(
-                label,
-                "ready",
-                "AGENTS.md local API cognitive-loop instructions were installed.",
-                path=_first_path(agents_items),
-                scope="agents-instructions",
-                client_id="codex",
-            ))
+            readiness.append(
+                _readiness_entry(
+                    label,
+                    "ready",
+                    "AGENTS.md local API cognitive-loop instructions were installed.",
+                    path=_first_path(agents_items),
+                    scope="agents-instructions",
+                    client_id="codex",
+                )
+            )
         else:
-            readiness.append(_readiness_entry(
-                label,
-                "manual_action_required",
-                "Codex was detected, but AGENTS.md cognitive-loop instructions were not installed.",
-                client_id="codex",
-            ))
+            readiness.append(
+                _readiness_entry(
+                    label,
+                    "manual_action_required",
+                    "Codex was detected, but AGENTS.md cognitive-loop instructions were not installed.",
+                    client_id="codex",
+                )
+            )
 
     if "vscode" in detected:
         label = "VS Code"
         errors = _client_errors(results, label)
         instruction_items = _configured_items(results, label, scope="user-instructions")
         if errors:
-            readiness.append(_readiness_entry(
-                label,
-                "failed",
-                errors[0].get("error", "VS Code configuration failed"),
-                path=errors[0].get("path"),
-                scope=errors[0].get("scope"),
-                client_id="vscode",
-            ))
+            readiness.append(
+                _readiness_entry(
+                    label,
+                    "failed",
+                    errors[0].get("error", "VS Code configuration failed"),
+                    path=errors[0].get("path"),
+                    scope=errors[0].get("scope"),
+                    client_id="vscode",
+                )
+            )
         elif instruction_items:
-            readiness.append(_readiness_entry(
-                label,
-                "ready",
-                "VS Code MCP user config and Copilot instruction file were installed.",
-                path=_first_path(instruction_items),
-                scope="user-instructions",
-                client_id="vscode",
-            ))
+            readiness.append(
+                _readiness_entry(
+                    label,
+                    "ready",
+                    "VS Code MCP user config and Copilot instruction file were installed.",
+                    path=_first_path(instruction_items),
+                    scope="user-instructions",
+                    client_id="vscode",
+                )
+            )
         else:
-            readiness.append(_readiness_entry(
-                label,
-                "manual_action_required",
-                "VS Code was detected, but Copilot instructions were not installed.",
-                client_id="vscode",
-            ))
+            readiness.append(
+                _readiness_entry(
+                    label,
+                    "manual_action_required",
+                    "VS Code was detected, but Copilot instructions were not installed.",
+                    client_id="vscode",
+                )
+            )
 
     return readiness
 
 
-def generate_project_mcp_json(server_path, api_key, project_dir, dry_run=False, python_cmd=None, api_url="http://localhost:8000"):
+def generate_project_mcp_json(
+    server_path, api_key, project_dir, dry_run=False, python_cmd=None, api_url="http://localhost:8000"
+):
     """Generate .mcp.json (Claude Code project-level config) in project root."""
     cmd = _resolve_python_or_exit(server_path, python_cmd)
     config_path = os.path.join(project_dir, ".mcp.json")
@@ -2192,6 +2437,7 @@ def generate_project_mcp_json(server_path, api_key, project_dir, dry_run=False, 
 # .gitignore Helper
 # ============================================================
 
+
 def update_gitignore(project_dir, dry_run=False):
     """Safely add MCP config entries to .gitignore."""
     gitignore_path = os.path.join(project_dir, ".gitignore")
@@ -2200,7 +2446,7 @@ def update_gitignore(project_dir, dry_run=False):
 
     existing_content = ""
     if os.path.isfile(gitignore_path):
-        with open(gitignore_path, "r") as f:
+        with open(gitignore_path) as f:
             existing_content = f.read()
 
     lines = existing_content.strip().split("\n") if existing_content.strip() else []
@@ -2222,9 +2468,9 @@ def update_gitignore(project_dir, dry_run=False):
             # Check git tracking (non-fatal if git not available)
             try:
                 import subprocess
+
                 result = subprocess.run(
-                    ["git", "ls-files", "--error-unmatch", entry],
-                    cwd=project_dir, capture_output=True, text=True
+                    ["git", "ls-files", "--error-unmatch", entry], cwd=project_dir, capture_output=True, text=True
                 )
                 if result.returncode == 0:
                     warnings.append(f"{entry} is git-tracked; run 'git rm --cached {entry}' to untrack")
@@ -2249,6 +2495,7 @@ def update_gitignore(project_dir, dry_run=False):
 # Main Orchestration
 # ============================================================
 
+
 def main():
     parser = argparse.ArgumentParser(
         description="Write Pith MCP configuration templates for detected clients",
@@ -2256,33 +2503,46 @@ def main():
         epilog=(
             "Configuration templates: Claude Desktop, Claude Code, Cursor, Windsurf, "
             "Cline, Codex, VS Code. Runtime support must be verified in each client."
-        )
+        ),
     )
-    parser.add_argument("--server-path", required=True,
-                        help="Absolute path to pith_mcp.py (MCP bridge)")
-    parser.add_argument("--api-key", default=None, type=_normalize_api_key,
-                        help="Pith API key for authentication")
-    parser.add_argument("--source-key-from-file", nargs="?", const="~/.pith/.env",
-                        default="~/.pith/.env",
-                        help="Load PITH_API_KEY from file when --api-key is not passed (default: ~/.pith/.env)")
-    parser.add_argument("--python-cmd", default=None,
-                        help="Python interpreter path (default: auto-detect venv or system python3)")
-    parser.add_argument("--api-url", default=os.environ.get("PITH_API_URL", "http://localhost:8000"),
-                        help="Pith HTTP API URL to write into MCP client env (default: $PITH_API_URL or http://localhost:8000)")
-    parser.add_argument("--project-dir", default=None,
-                        help="Project directory for .mcp.json and .vscode/mcp.json (default: script parent)")
-    parser.add_argument("--platform", default=None, choices=["macos", "linux", "windows"],
-                        help="Override platform detection")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Show what would be configured without making changes")
-    parser.add_argument("--allow-noncanonical-server", action="store_true",
-                        help="Allow configuring clients against a non-~/.pith/pith-server bridge")
-    parser.add_argument("--json", action="store_true", dest="json_output",
-                        help="Output results as JSON (for install.sh consumption)")
-    parser.add_argument("--skip-gitignore", action="store_true",
-                        help="Skip .gitignore update")
-    parser.add_argument("--skip-project", action="store_true",
-                        help="Skip project-level configs (.mcp.json, .vscode/mcp.json)")
+    parser.add_argument("--server-path", required=True, help="Absolute path to pith_mcp.py (MCP bridge)")
+    parser.add_argument("--api-key", default=None, type=_normalize_api_key, help="Pith API key for authentication")
+    parser.add_argument(
+        "--source-key-from-file",
+        nargs="?",
+        const="~/.pith/.env",
+        default="~/.pith/.env",
+        help="Load PITH_API_KEY from file when --api-key is not passed (default: ~/.pith/.env)",
+    )
+    parser.add_argument(
+        "--python-cmd", default=None, help="Python interpreter path (default: auto-detect venv or system python3)"
+    )
+    parser.add_argument(
+        "--api-url",
+        default=os.environ.get("PITH_API_URL", "http://localhost:8000"),
+        help="Pith HTTP API URL to write into MCP client env (default: $PITH_API_URL or http://localhost:8000)",
+    )
+    parser.add_argument(
+        "--project-dir",
+        default=None,
+        help="Project directory for .mcp.json and .vscode/mcp.json (default: script parent)",
+    )
+    parser.add_argument(
+        "--platform", default=None, choices=["macos", "linux", "windows"], help="Override platform detection"
+    )
+    parser.add_argument("--dry-run", action="store_true", help="Show what would be configured without making changes")
+    parser.add_argument(
+        "--allow-noncanonical-server",
+        action="store_true",
+        help="Allow configuring clients against a non-~/.pith/pith-server bridge",
+    )
+    parser.add_argument(
+        "--json", action="store_true", dest="json_output", help="Output results as JSON (for install.sh consumption)"
+    )
+    parser.add_argument("--skip-gitignore", action="store_true", help="Skip .gitignore update")
+    parser.add_argument(
+        "--skip-project", action="store_true", help="Skip project-level configs (.mcp.json, .vscode/mcp.json)"
+    )
     parser.add_argument(
         "--clients",
         default="all",
@@ -2341,11 +2601,7 @@ def main():
     vscode_detected = "vscode" in detected and wants("vscode")
     detected.pop("codex", None)
     detected.pop("vscode", None)
-    detected = {
-        client_id: info
-        for client_id, info in detected.items()
-        if wants(client_id)
-    }
+    detected = {client_id: info for client_id, info in detected.items() if wants(client_id)}
 
     # --- Phase 2: Configure global clients ---
     results = {"detected": list(detected.keys()), "configured": [], "skipped": [], "errors": []}
@@ -2357,7 +2613,9 @@ def main():
 
     for client_id, info in detected.items():
         try:
-            r = configure_standard_client(client_id, info, server_path, api_key, plat, args.dry_run, python_cmd=args.python_cmd, api_url=api_url)
+            r = configure_standard_client(
+                client_id, info, server_path, api_key, plat, args.dry_run, python_cmd=args.python_cmd, api_url=api_url
+            )
             if r.get("action") == "error":
                 results["errors"].append(r)
             else:
@@ -2391,21 +2649,27 @@ def main():
     project_selected = wants("project")
     if not args.skip_project and project_selected:
         try:
-            r = generate_project_mcp_json(server_path, api_key, project_dir, args.dry_run, python_cmd=args.python_cmd, api_url=api_url)
+            r = generate_project_mcp_json(
+                server_path, api_key, project_dir, args.dry_run, python_cmd=args.python_cmd, api_url=api_url
+            )
             results["configured"].append(r)
         except Exception as e:
             results["errors"].append({"file": ".mcp.json", "action": "error", "error": str(e)})
 
     if not args.skip_project and project_selected and vscode_detected:
         try:
-            r = configure_vscode(server_path, api_key, project_dir, args.dry_run, python_cmd=args.python_cmd, api_url=api_url)
+            r = configure_vscode(
+                server_path, api_key, project_dir, args.dry_run, python_cmd=args.python_cmd, api_url=api_url
+            )
             results["configured"].append(r)
         except Exception as e:
             results["errors"].append({"file": ".vscode/mcp.json", "action": "error", "error": str(e)})
 
     if vscode_detected:
         try:
-            r = configure_vscode_user(server_path, api_key, plat, args.dry_run, python_cmd=args.python_cmd, api_url=api_url)
+            r = configure_vscode_user(
+                server_path, api_key, plat, args.dry_run, python_cmd=args.python_cmd, api_url=api_url
+            )
             results["configured"].append(r)
         except Exception as e:
             results["errors"].append({"client": "VS Code", "scope": "user", "action": "error", "error": str(e)})
@@ -2413,7 +2677,9 @@ def main():
             r = configure_vscode_user_instructions(plat, args.dry_run)
             results["configured"].append(r)
         except Exception as e:
-            results["errors"].append({"client": "VS Code", "scope": "user-instructions", "action": "error", "error": str(e)})
+            results["errors"].append(
+                {"client": "VS Code", "scope": "user-instructions", "action": "error", "error": str(e)}
+            )
 
     # --- Phase 4: .gitignore ---
     if not args.skip_gitignore and not args.skip_project and project_selected:
@@ -2430,13 +2696,13 @@ def main():
         print(json.dumps(results, indent=2))
     else:
         # Human-readable output
-        print(f"\n{'='*50}")
-        print(f"Pith Client Configuration")
-        print(f"{'='*50}")
+        print(f"\n{'=' * 50}")
+        print("Pith Client Configuration")
+        print(f"{'=' * 50}")
         print(f"Platform: {plat}")
         print(f"Server:   {server_path}")
         print(f"Detected: {', '.join(results['detected']) or 'none'}")
-        print(f"{'='*50}\n")
+        print(f"{'=' * 50}\n")
 
         if args.dry_run:
             print("[DRY RUN] No changes made.\n")
@@ -2461,12 +2727,12 @@ def main():
             if gi.get("action") == "updated":
                 print(f"\n  📝 .gitignore updated: added {', '.join(gi['added'])}")
             elif gi.get("action") == "unchanged":
-                print(f"\n  📝 .gitignore: already up to date")
+                print("\n  📝 .gitignore: already up to date")
             if gi.get("warnings"):
                 for w in gi["warnings"]:
                     print(f"     ⚠️  {w}")
 
-        print(f"\n{'='*50}")
+        print(f"\n{'=' * 50}")
         total = len(results["configured"])
         errs = len(results["errors"])
         print(f"Done: {total} configured, {errs} errors")
