@@ -266,7 +266,7 @@ persist_preview_usage_config() {
 }
 
 private_beta_pause() {
-    local prompt="${1:-Private beta setup paused. Press Return to continue...}"
+    local prompt="${1:-Setup paused. Press Return to continue...}"
     if [[ "${PITH_PRIVATE_BETA:-0}" == "1" && "${PITH_SKIP_PAUSES:-0}" != "1" && -t 0 ]]; then
         echo ""
         read -r -p "$prompt" _ || true
@@ -637,7 +637,7 @@ select_install_surfaces() {
             echo "  • $(surface_label "$surface")"
         done
     fi
-    private_beta_pause "Private beta pause: review selected surfaces, then press Return to continue..."
+    private_beta_pause "Review selected app connections, then press Return to continue..."
 }
 
 json_escape() {
@@ -2511,7 +2511,7 @@ PY
         ;;
     restart)
         if is_help_request; then print_wrapper_help restart; exit 0; fi
-        # OPS-099: Under launchd KeepAlive, stop+start races — launchd respawns within ~200ms
+        # Under launchd KeepAlive, stop+start races: launchd respawns within ~200ms
         # after stop, so start finds the configured port occupied and exits 1. Use kickstart -k instead.
         _LAUNCHD_SVC="gui/$(id -u)/dev.pith.server"
         if launchctl print "$_LAUNCHD_SVC" >/dev/null 2>&1; then
@@ -3139,7 +3139,7 @@ fi
 echo -e "  ${VERIFY_STEP}. View logs if a check fails: ${YELLOW}pith logs${NC}"
 echo ""
 if [[ "${PITH_PRIVATE_BETA:-0}" == "1" || "${PITH_LOCAL_ONLY_INSTALL:-0}" == "1" || -f "$DIST_DIR/.private-beta" ]]; then
-    echo -e "${BLUE}Private Beta:${NC}"
+    echo -e "${BLUE}Local Build:${NC}"
     echo "  Use the instructions included with this artifact."
     echo "  Do not use public repository release flows for this build."
     if [[ -n "${PITH_INSTALL_LOG:-}" ]]; then
@@ -3151,6 +3151,6 @@ else
     echo "  https://github.com/pithrun/pith-core"
 fi
 echo ""
-private_beta_pause "Private beta setup complete. Review the next steps above, then press Return to close this window..."
+private_beta_pause "Setup complete. Review the next steps above, then press Return to close this window..."
 
 exit 0
