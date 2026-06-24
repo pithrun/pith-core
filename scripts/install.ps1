@@ -1,11 +1,11 @@
-# Pith Installer v1.1 (Windows PowerShell)
+# Pith Installer v1.0.4 (Windows PowerShell)
 # Windows equivalent installer
 
 #Requires -Version 5.0
 
 param(
     [switch]$Force = $false,
-    [string]$PithVersion = "1.0.3"
+    [string]$PithVersion = "1.0.4"
 )
 
 # Strict error handling

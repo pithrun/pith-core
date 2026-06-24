@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# Pith Installer v1.0.0
+# Pith Installer v1.0.4
 # macOS developer preview installer; Linux remains an unverified source/developer path.
 
 # Configuration
@@ -15,7 +15,7 @@ PITH_REPAIR_RUNTIME="${PITH_REPAIR_RUNTIME:-0}"
 PITH_FORCE_MANAGED_PYTHON="${PITH_FORCE_MANAGED_PYTHON:-0}"
 # Keep PITH_VERSION on line 18.
 # scripts/version-bump.sh and TEST-090 depend on this exact location.
-PITH_VERSION="1.0.3"
+PITH_VERSION="1.0.4"
 detect_account_home() {
     if command -v dscl >/dev/null 2>&1; then
         dscl . -read "/Users/$(id -un)" NFSHomeDirectory 2>/dev/null | awk '{print $2; exit}' && return
