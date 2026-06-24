@@ -1,4 +1,5 @@
 """Allowlisted CLI for exec-capable hosts to reach the local Pith API directly."""
+
 from __future__ import annotations
 
 import argparse
@@ -32,12 +33,8 @@ SURFACE_ID_VALUES = frozenset(
         "windsurf_mcp",
     }
 )
-CONVERSATION_TURN_STARTUP_MAX_ATTEMPTS = int(
-    os.environ.get("PITH_CLI_CONVERSATION_TURN_STARTUP_MAX_ATTEMPTS", "4")
-)
-CONVERSATION_TURN_STARTUP_RETRY_CAP_S = float(
-    os.environ.get("PITH_CLI_CONVERSATION_TURN_STARTUP_RETRY_CAP_S", "10")
-)
+CONVERSATION_TURN_STARTUP_MAX_ATTEMPTS = int(os.environ.get("PITH_CLI_CONVERSATION_TURN_STARTUP_MAX_ATTEMPTS", "4"))
+CONVERSATION_TURN_STARTUP_RETRY_CAP_S = float(os.environ.get("PITH_CLI_CONVERSATION_TURN_STARTUP_RETRY_CAP_S", "10"))
 ALLOWED = {
     "health": ("GET", "/health"),
     "readyz": ("GET", "/readyz"),
@@ -127,17 +124,13 @@ OPERATION_SCHEMAS = {
     }
 }
 LIFECYCLE_STATUS_SCHEMA_VERSION = "surface_lifecycle_status.v1"
-LIFECYCLE_STATUS_DEFAULT_MAX_SCAN_FILES = int(
-    os.environ.get("PITH_LIFECYCLE_STATUS_MAX_SCAN_FILES", "500")
-)
+LIFECYCLE_STATUS_DEFAULT_MAX_SCAN_FILES = int(os.environ.get("PITH_LIFECYCLE_STATUS_MAX_SCAN_FILES", "500"))
 LIFECYCLE_STATUS_MAX_SCAN_FILES_LIMIT = 5000
 LIFECYCLE_STATUS_DEFAULT_MAX_AGE_SECONDS = int(
     os.environ.get("PITH_LIFECYCLE_STATUS_MAX_AGE_SECONDS", str(24 * 60 * 60))
 )
 LIFECYCLE_STATUS_MAX_AGE_SECONDS_LIMIT = 7 * 24 * 60 * 60
-CLAUDE_CODE_LIFECYCLE_STATE_DIR = (
-    Path.home() / ".pith" / "cache" / "claude-code-lifecycle"
-)
+CLAUDE_CODE_LIFECYCLE_STATE_DIR = Path.home() / ".pith" / "cache" / "claude-code-lifecycle"
 _ACTIVE_WORKSTREAM_STOPWORDS = frozenset(
     [
         "a",
@@ -294,9 +287,7 @@ def _normalize_surface_activity_payload(payload: dict | None) -> dict | None:
         return payload
 
     joined_requested_surfaces = ",".join(
-        item
-        for item in (str(surface).strip() for surface in requested_surfaces)
-        if item
+        item for item in (str(surface).strip() for surface in requested_surfaces) if item
     )
     next_payload = dict(payload)
     next_payload["requested_surfaces"] = joined_requested_surfaces
@@ -435,10 +426,14 @@ def _claude_code_state_matches_selector(
         return False
 
     workspace_id = selector.get("workspace_id")
-    return not (workspace_id and workspace_id not in _state_string_values(
-        state,
-        ("pre_response_ct_workspace_id",),
-    ))
+    return not (
+        workspace_id
+        and workspace_id
+        not in _state_string_values(
+            state,
+            ("pre_response_ct_workspace_id",),
+        )
+    )
 
 
 def _lifecycle_state_files(
@@ -637,6 +632,60 @@ def _overall_lifecycle_verdict(
     return "failed"
 
 
+_TURN_HISTORY_SAFE_KEYS = {
+    "turn_seq",
+    "started_at",
+    "completed_at",
+    "completion_reason",
+    "pre_response_ct_status",
+    "pre_response_ct_session_id",
+    "pre_response_ct_request_id",
+    "hook_pre_response_ct_status",
+    "model_visible_status",
+    "model_ct_session_id",
+    "model_ct_surface_id",
+    "model_ct_origin_id",
+    "model_ct_response_mode",
+    "model_ct_coherence_status",
+    "model_ct_coherence_reason",
+    "stop_observed",
+    "learning_status",
+    "learning_events",
+    "accepted_learning_events",
+}
+_MISSED_MODEL_VISIBLE_STATUSES = {"not_observed", "skipped_not_observed"}
+
+
+def _claude_code_turn_history(state: dict[str, Any]) -> list[dict[str, Any]]:
+    history = state.get("turn_history")
+    if not isinstance(history, list):
+        return []
+    sanitized: list[dict[str, Any]] = []
+    for item in history:
+        if not isinstance(item, dict):
+            continue
+        sanitized.append({key: item[key] for key in _TURN_HISTORY_SAFE_KEYS if key in item})
+    return sanitized
+
+
+def _claude_code_turn_summary(turn_history: list[dict[str, Any]]) -> dict[str, Any]:
+    missed = [
+        turn
+        for turn in turn_history
+        if turn.get("model_visible_status") in _MISSED_MODEL_VISIBLE_STATUSES
+        or turn.get("model_ct_coherence_status") == "skipped_not_observed"
+    ]
+    observed = [turn for turn in turn_history if turn.get("model_visible_status") == "observed"]
+    latest_seq = turn_history[-1].get("turn_seq") if turn_history else None
+    return {
+        "total_turns": len(turn_history),
+        "latest_turn_seq": latest_seq,
+        "model_visible_observed_turns": len(observed),
+        "model_visible_missed_turns": len(missed),
+        "first_missed_turn_seq": missed[0].get("turn_seq") if missed else None,
+    }
+
+
 def _claude_code_lifecycle_status(payload: dict[str, Any]) -> dict[str, Any]:
     surface_id = "claude_code"
     selector = _lifecycle_selector(payload, surface_id)
@@ -726,6 +775,18 @@ def _claude_code_lifecycle_status(payload: dict[str, Any]) -> dict[str, Any]:
     model_visible_phase = _claude_code_model_visible_phase(state)
     coherence_phase = _claude_code_coherence_phase(state)
     learning_phase = _claude_code_learning_phase(state)
+    turn_history = _claude_code_turn_history(state)
+    turn_summary = _claude_code_turn_summary(turn_history)
+    overall_verdict = _overall_lifecycle_verdict(
+        context_phase,
+        model_visible_phase,
+        coherence_phase,
+        learning_phase,
+    )
+    if overall_verdict == "enforced" and turn_summary["model_visible_missed_turns"] > 0:
+        overall_verdict = "partial"
+        limitations.append("One or more recorded turns missed model-visible conversation_turn.")
+        result["limitations"] = list(limitations)
     result.update(
         {
             "selected_state_file": selected_path.name,
@@ -734,12 +795,9 @@ def _claude_code_lifecycle_status(payload: dict[str, Any]) -> dict[str, Any]:
             "model_visible_phase": model_visible_phase,
             "coherence_phase": coherence_phase,
             "learning_phase": learning_phase,
-            "overall_verdict": _overall_lifecycle_verdict(
-                context_phase,
-                model_visible_phase,
-                coherence_phase,
-                learning_phase,
-            ),
+            "turn_history": turn_history,
+            "turn_summary": turn_summary,
+            "overall_verdict": overall_verdict,
         }
     )
     return result
@@ -806,10 +864,7 @@ def _operation_discovery_payload(operation: str, kind: str) -> dict[str, Any]:
     if payload is not None:
         return payload
     available = ", ".join(sorted(registry)) or "none"
-    raise SystemExit(
-        f"No local {kind} registered for operation {operation!r}. "
-        f"Available operations: {available}"
-    )
+    raise SystemExit(f"No local {kind} registered for operation {operation!r}. Available operations: {available}")
 
 
 def _response_detail(body: Any) -> str:
@@ -831,11 +886,7 @@ def _is_retryable_conversation_turn_startup_503(
     if operation != "conversation_turn" or status_code != 503:
         return False
     detail = _response_detail(body).lower()
-    return (
-        "retrieval initialization" in detail
-        or "retrieval recovery" in detail
-        or "server startup" in detail
-    )
+    return "retrieval initialization" in detail or "retrieval recovery" in detail or "server startup" in detail
 
 
 def _retry_after_seconds(response: requests.Response, attempt: int) -> float:
@@ -929,9 +980,7 @@ def _emit_workstream_activation_api_event(
         active_binding_related=decision_body.get("active_binding_related"),
         skip_exception_kind=decision_body.get("skip_exception_kind"),
         skip_requires_reason=decision_body.get("skip_requires_reason"),
-        recommended_count=(
-            _list_len(response_body.get("recommended")) if isinstance(response_body, dict) else 0
-        ),
+        recommended_count=(_list_len(response_body.get("recommended")) if isinstance(response_body, dict) else 0),
         advisory_candidate_count=(
             _list_len(response_body.get("advisory_candidates")) if isinstance(response_body, dict) else 0
         ),
@@ -939,13 +988,9 @@ def _emit_workstream_activation_api_event(
             _list_len(response_body.get("possible_matches")) if isinstance(response_body, dict) else 0
         ),
         proof_or_maintenance_count=(
-            _list_len(response_body.get("proof_or_maintenance"))
-            if isinstance(response_body, dict)
-            else 0
+            _list_len(response_body.get("proof_or_maintenance")) if isinstance(response_body, dict) else 0
         ),
-        needs_review_count=(
-            _list_len(response_body.get("needs_review")) if isinstance(response_body, dict) else 0
-        ),
+        needs_review_count=(_list_len(response_body.get("needs_review")) if isinstance(response_body, dict) else 0),
         error=bool(isinstance(body, dict) and body.get("error") is True),
         api_url=api_url,
     )
@@ -1148,11 +1193,7 @@ def _activation_gate_from_state(
                 required_action = str(decision.get("required_action") or "confirm_active_binding_or_create")
                 decision_kind = str(decision.get("decision_kind") or "active_binding_unknown")
         if active_binding_related is False or decision_kind == "active_binding_unknown":
-            reason = (
-                "active_workstream_unrelated"
-                if active_binding_related is False
-                else "active_binding_unknown"
-            )
+            reason = "active_workstream_unrelated" if active_binding_related is False else "active_binding_unknown"
             gate = {
                 "status": "blocked",
                 "activation_state": decision_kind,
@@ -1272,9 +1313,7 @@ def _resolve_workstream_activation_gate(
 
     if isinstance(body, dict) and isinstance(body.get("workstream_activation"), dict):
         render = (
-            body.get("active_workstream_render")
-            if isinstance(body.get("active_workstream_render"), dict)
-            else None
+            body.get("active_workstream_render") if isinstance(body.get("active_workstream_render"), dict) else None
         )
         return _activation_gate_from_state(
             body["workstream_activation"],
@@ -1528,8 +1567,7 @@ def _emit_active_workstream_render_event(
         transport_mode=transport_mode,
         active_workstream_present=isinstance(active_workstream, dict),
         active_workstream_id=(
-            active_workstream.get("thread_id")
-            or (workstream or {}).get("thread_id")
+            active_workstream.get("thread_id") or (workstream or {}).get("thread_id")
             if isinstance(active_workstream, dict)
             else None
         ),
@@ -1547,9 +1585,7 @@ def _emit_active_workstream_render_event(
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        description="Direct Pith HTTP API client for exec-capable hosts"
-    )
+    parser = argparse.ArgumentParser(description="Direct Pith HTTP API client for exec-capable hosts")
     parser.add_argument("operation")
     parser.add_argument("--stdin-json", action="store_true")
     parser.add_argument("--json-file")
@@ -1561,9 +1597,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--base-url",
-        default=os.environ.get("PITH_API_URL")
-        or os.environ.get("BRAIN_API_URL")
-        or DEFAULT_BASE_URL,
+        default=os.environ.get("PITH_API_URL") or os.environ.get("BRAIN_API_URL") or DEFAULT_BASE_URL,
     )
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
     discovery_group = parser.add_mutually_exclusive_group()
@@ -1601,11 +1635,7 @@ def main(argv: list[str] | None = None) -> int:
     headers = _build_headers(args.operation, args.transport_mode)
 
     started = time.perf_counter()
-    max_attempts = (
-        max(1, CONVERSATION_TURN_STARTUP_MAX_ATTEMPTS)
-        if args.operation == "conversation_turn"
-        else 1
-    )
+    max_attempts = max(1, CONVERSATION_TURN_STARTUP_MAX_ATTEMPTS) if args.operation == "conversation_turn" else 1
     response = None
     body: Any = None
     for attempt in range(max_attempts):
@@ -1662,13 +1692,10 @@ def main(argv: list[str] | None = None) -> int:
                 "message": response.text[:500],
             }
 
-        if (
-            attempt < max_attempts - 1
-            and _is_retryable_conversation_turn_startup_503(
-                args.operation,
-                response.status_code,
-                body,
-            )
+        if attempt < max_attempts - 1 and _is_retryable_conversation_turn_startup_503(
+            args.operation,
+            response.status_code,
+            body,
         ):
             delay_s = _retry_after_seconds(response, attempt)
             _transport_event(
