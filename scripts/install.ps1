@@ -1,4 +1,4 @@
-# Pith Brain Installer v1.1 (Windows PowerShell)
+# Pith Installer v1.1 (Windows PowerShell)
 # Windows equivalent installer
 
 #Requires -Version 5.0
@@ -28,7 +28,7 @@ function Write-Banner {
     Clear-Host
     Write-Host ""
     Write-Host "+========================================+" -ForegroundColor Cyan
-    Write-Host "|   Pith Brain Installer v$PithVersion        |" -ForegroundColor Cyan
+    Write-Host "|   Pith Installer v$PithVersion              |" -ForegroundColor Cyan
     Write-Host "|      Windows Edition                   |" -ForegroundColor Cyan
     Write-Host "+========================================+" -ForegroundColor Cyan
     Write-Host ""
@@ -620,7 +620,7 @@ if ($ProfilePath) {
     }
     $ProfileContent = Get-Content $ProfilePath -Raw -ErrorAction SilentlyContinue
     if ($ProfileContent -notlike "*$PithBinDir*") {
-        Add-Content -Path $ProfilePath -Value "`n# Pith Brain CLI"
+        Add-Content -Path $ProfilePath -Value "`n# Pith CLI"
         Add-Content -Path $ProfilePath -Value "`$env:PATH = `"$PithBinDir;`$env:PATH`""
         Write-Host "  [OK] Added Pith to PATH in $ProfilePath" -ForegroundColor Green
         $PathAdded = $true
@@ -649,7 +649,7 @@ Write-Banner
 
 Write-Host "[OK] Installation Complete!" -ForegroundColor Green
 Write-Host ""
-Write-Host "Pith Brain is installed at: " -NoNewline
+Write-Host "Pith is installed at: " -NoNewline
 Write-Host "$PithHome" -ForegroundColor Cyan
 Write-Host ""
 
@@ -665,7 +665,7 @@ if ($PathAdded) {
 }
 
 Write-Host "Available Commands:" -ForegroundColor Cyan
-Write-Host "  pith start       Start the Pith Brain server"
+Write-Host "  pith start       Start the Pith server"
 Write-Host "  pith stop        Stop the server"
 Write-Host "  pith restart     Restart the server"
 Write-Host "  pith status      Check server status"

@@ -112,7 +112,7 @@ def _reject_archive_only_workspace(server_path, allow_noncanonical_server=False)
     ):
         raise argparse.ArgumentTypeError(
             "Refusing to configure MCP clients with a non-runnable workspace target. "
-            "Use ~/.pith/pith-server or a registered active session worktree instead."
+            "Use ~/.pith/pith-server or an approved active development checkout instead."
         )
 
 
