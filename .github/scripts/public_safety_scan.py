@@ -68,12 +68,54 @@ ALLOWED_CHANGED_BINARY_PATHS = {
     "pith-server-latest.tar.gz",
 }
 
+PUBLIC_DOC_PATHS = {
+    "README.md",
+    "QUICKSTART.md",
+    "BENCHMARKS.md",
+    "CHANGELOG.md",
+    "SECURITY.md",
+    "CONTRIBUTING.md",
+}
+
+PUBLIC_INSTALLER_AND_RELEASE_PATHS = {
+    "scripts/install.sh",
+    "scripts/install.ps1",
+    "scripts/migrate_from_docker.sh",
+    "scripts/migrate_from_docker.ps1",
+    "scripts/configure_clients.py",
+    "pith-server-latest.tar.gz",
+    "pith-server-latest.sha256",
+    "install.sh",
+    ".github/workflows/release-validation.yml",
+    ".github/scripts/public_safety_scan.py",
+}
+
+PUBLIC_GITHUB_POLICY_PATHS = {
+    ".github/pull_request_template.md",
+}
+
+REQUIRED_AUDIENCE_EVIDENCE_MARKERS = (
+    "Public surfaces inventoried",
+    "Audience classification",
+    "PR title/body audience review",
+    "Residual deferrals",
+)
+
 
 @dataclass(frozen=True)
 class Finding:
     source: str
     label: str
     value: str
+
+
+@dataclass(frozen=True)
+class PullRequestMetadata:
+    title: str
+    body: str
+    event_path: str
+    error: str
+    event_name: str = "pull_request"
 
 
 def run_git(*args: str) -> str:
@@ -104,6 +146,38 @@ def changed_files() -> list[Path]:
             return [REPO_ROOT / name for name in names]
     names = run_git("diff", "--name-only", "HEAD~1..HEAD").splitlines()
     return [REPO_ROOT / name for name in names if name]
+
+
+def relative_repo_path(path: Path | str) -> str:
+    if isinstance(path, Path):
+        try:
+            return path.relative_to(REPO_ROOT).as_posix()
+        except ValueError:
+            return path.as_posix()
+    if not isinstance(path, str):
+        return ""
+    return re.sub(r"/+", "/", path.replace("\\", "/"))
+
+
+def is_public_facing_path(path: Path | str) -> bool:
+    rel = relative_repo_path(path).strip()
+    while rel.startswith("./"):
+        rel = rel[2:]
+    if rel.startswith("../") or rel.startswith("/"):
+        return False
+    if rel in PUBLIC_DOC_PATHS:
+        return True
+    if rel in PUBLIC_INSTALLER_AND_RELEASE_PATHS:
+        return True
+    if rel in PUBLIC_GITHUB_POLICY_PATHS:
+        return True
+    if rel.startswith(".github/") and rel.endswith(".md"):
+        return True
+    return False
+
+
+def is_public_facing_change(paths: list[Path] | list[str]) -> bool:
+    return any(is_public_facing_path(path) for path in paths)
 
 
 def load_allowlist() -> set[str]:
@@ -182,23 +256,107 @@ def scan_text(source: str, text: str, allowlist: set[str]) -> list[Finding]:
     return findings
 
 
-def metadata_text() -> str:
+def read_pull_request_metadata() -> PullRequestMetadata:
+    event_path = os.environ.get("GITHUB_EVENT_PATH", "")
+    event_name = os.environ.get("GITHUB_EVENT_NAME", "")
+    if not event_path:
+        return PullRequestMetadata("", "", "", "GITHUB_EVENT_PATH is unavailable", event_name)
+
+    path = Path(event_path)
+    if not path.exists():
+        return PullRequestMetadata("", "", event_path, "GITHUB_EVENT_PATH does not exist", event_name)
+
+    try:
+        event = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return PullRequestMetadata("", "", event_path, f"cannot read PR event JSON: {exc}", event_name)
+
+    pull_request = event.get("pull_request")
+    if not isinstance(pull_request, dict):
+        return PullRequestMetadata("", "", event_path, "event JSON has no pull_request object", event_name)
+
+    title = pull_request.get("title")
+    body = pull_request.get("body")
+    return PullRequestMetadata(
+        title if isinstance(title, str) else "",
+        body if isinstance(body, str) else "",
+        event_path,
+        "",
+        event_name,
+    )
+
+
+def metadata_text(pr_metadata: PullRequestMetadata | None = None) -> str:
     parts: list[str] = []
-    event_path = os.environ.get("GITHUB_EVENT_PATH")
-    if event_path and Path(event_path).exists():
-        try:
-            event = json.loads(Path(event_path).read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            event = {}
-        pull_request = event.get("pull_request") or {}
-        for key in ("title", "body"):
-            value = pull_request.get(key)
-            if isinstance(value, str):
-                parts.append(f"pull_request.{key}: {value}")
+    pr_metadata = pr_metadata or read_pull_request_metadata()
+    if pr_metadata.title:
+        parts.append(f"pull_request.title: {pr_metadata.title}")
+    if pr_metadata.body:
+        parts.append(f"pull_request.body: {pr_metadata.body}")
     log = run_git("log", "--format=%s%n%b", "-20")
     if log:
         parts.append("commit_messages:\n" + log)
     return "\n\n".join(parts)
+
+
+def _line_has_marker_evidence(line: str, marker: str) -> bool:
+    marker_index = line.lower().find(marker.lower())
+    if marker_index < 0:
+        return False
+
+    if re.search(r"\[[xX]\]", line):
+        return True
+    if re.search(r"\b(?:n/a|not applicable)\b", line, re.IGNORECASE):
+        return True
+
+    trailing = line[marker_index + len(marker) :].strip(" \t:.-")
+    return bool(trailing)
+
+
+def missing_audience_evidence_markers(body: str) -> list[str]:
+    lines = body.splitlines()
+    missing: list[str] = []
+    for marker in REQUIRED_AUDIENCE_EVIDENCE_MARKERS:
+        if not any(_line_has_marker_evidence(line, marker) for line in lines):
+            missing.append(marker)
+    return missing
+
+
+def audience_review_findings(
+    paths: list[Path] | list[str],
+    pr_metadata: PullRequestMetadata,
+) -> list[Finding]:
+    if not is_public_facing_change(paths):
+        return []
+    if pr_metadata.event_name != "pull_request":
+        return []
+
+    if pr_metadata.error:
+        return [
+            Finding(
+                "pull request body",
+                "missing audience-review evidence for public-facing change",
+                pr_metadata.error,
+            )
+        ]
+
+    if not pr_metadata.body.strip():
+        return [
+            Finding(
+                "pull request body",
+                "missing audience-review evidence for public-facing change",
+                "empty PR body",
+            )
+        ]
+
+    return [
+        Finding(
+            "pull request body",
+            "missing required audience-review evidence marker",
+            marker,
+        )
+        for marker in missing_audience_evidence_markers(pr_metadata.body)
+    ]
 
 
 def binary_findings(paths: list[Path]) -> list[Finding]:
@@ -216,6 +374,8 @@ def binary_findings(paths: list[Path]) -> list[Finding]:
 def main() -> int:
     allowlist = load_allowlist()
     findings: list[Finding] = []
+    changed = changed_files()
+    pr_metadata = read_pull_request_metadata()
 
     for path in tracked_files():
         if path == ALLOWLIST_PATH or not path.exists() or not is_text_file(path):
@@ -224,11 +384,12 @@ def main() -> int:
         text = path.read_text(encoding="utf-8", errors="replace")
         findings.extend(scan_text(rel, text, allowlist))
 
-    metadata = metadata_text()
+    metadata = metadata_text(pr_metadata)
     if metadata:
         findings.extend(scan_text("pull request / commit metadata", metadata, allowlist))
 
-    findings.extend(binary_findings(changed_files()))
+    findings.extend(audience_review_findings(changed, pr_metadata))
+    findings.extend(binary_findings(changed))
 
     if findings:
         print("Public-safety scan failed:", file=sys.stderr)

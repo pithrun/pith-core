@@ -5,6 +5,10 @@
 ## Public-Safety Checklist
 
 - [ ] Public-safe diff reviewed.
+- [ ] Public surfaces inventoried:
+- [ ] Audience classification:
+- [ ] PR title/body audience review:
+- [ ] Residual deferrals:
 - [ ] No secrets, tokens, private URLs, customer data, or private launch material.
 - [ ] No local absolute paths or session worktree references.
 - [ ] Binary or release artifact changes have expected provenance and hashes.
