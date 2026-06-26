@@ -7,7 +7,7 @@ knowledge over time with epistemic humility, self-awareness, and active learning
 
 from importlib import import_module
 
-__version__ = "1.0.4"
+__version__ = "1.0.0"
 __author__ = "Pith Contributors"
 __license__ = "MIT"
 
