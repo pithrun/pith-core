@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Read-only macOS developer-preview surface smoke.
+# Read-only macOS private beta surface smoke.
 # It summarizes installed apps, CLIs, config files, Pith health, HTTP/API,
-# Claude MCP logs, and release-surface markers without printing secrets.
+# Claude MCP logs, and known internal leak markers without printing secrets.
 
 HOME_DIR="${HOME}"
 PITH_BIN="${PITH_BIN:-$HOME_DIR/.pith/bin/pith}"

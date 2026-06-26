@@ -4,6 +4,15 @@ All notable changes to Pith are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.5] - 2026-06-26
+
+### Added
+- Added bounded install-success telemetry after the macOS installer verifies a durable local Pith service.
+- Added opt-out handling for `PITH_TELEMETRY_DISABLED=1`, `DO_NOT_TRACK=1`, and local-only install behavior.
+
+### Changed
+- Refreshed package and installer version metadata for v1.0.5.
+
 ## [1.0.4] - 2026-06-24
 
 ### Changed

@@ -4,18 +4,18 @@
     Pith Docker to Native Migration Script (Windows)
 
 .DESCRIPTION
-    Migrates legacy Docker installs to native ~/.pith/ install.
+    Migrates beta users from Docker brain-mcp container to native ~/.pith/ install.
     Implements: DOCKER_MIGRATION_SPEC.md §4B, Amendments A-E
 
 .PARAMETER ContainerName
-    Docker container name to migrate. Defaults to the legacy container name used by earlier releases.
+    Docker container name (default: brain-mcp)
 
 .PARAMETER DataDir
     Custom data directory inside container (default: auto-detect)
 
 .EXAMPLE
     PowerShell -ExecutionPolicy Bypass -File migrate_from_docker.ps1
-    PowerShell -ExecutionPolicy Bypass -File migrate_from_docker.ps1 -ContainerName "my-pith"
+    PowerShell -ExecutionPolicy Bypass -File migrate_from_docker.ps1 -ContainerName "my-brain"
 #>
 
 param(
@@ -556,10 +556,10 @@ Write-Host "  +========================================+" -ForegroundColor Green
 Write-Host "  |     Migration Complete!                |" -ForegroundColor Green
 Write-Host "  +========================================+" -ForegroundColor Green
 Write-Host ""
-Write-Host "  Your Pith data has been migrated from Docker to native installation."
+Write-Host "  Your Pith Brain has been migrated from Docker to native installation."
 Write-Host ""
 if ([int]$script:PreConceptCount -gt 0) {
-    Write-Host "  Pith data:  $($script:PreConceptCount) concepts preserved" -ForegroundColor Green
+    Write-Host "  Brain data:  $($script:PreConceptCount) concepts preserved" -ForegroundColor Green
 }
 Write-Host "  Install:     $PithHome" -ForegroundColor Cyan
 Write-Host "  API key:     $PithHome\config\api.key" -ForegroundColor Cyan
@@ -567,7 +567,7 @@ Write-Host "  Server:      $PithHome\pith-server\server.js" -ForegroundColor Cya
 Write-Host ""
 Write-Host "  Next steps:" -ForegroundColor White
 Write-Host "    1. Restart Claude Desktop (Ctrl+Q, then reopen)" -ForegroundColor Yellow
-Write-Host "    2. Verify: type 'Run pith_stats' in a new Claude conversation"
+Write-Host "    2. Verify: type 'Run brain_stats' in a new Claude conversation"
 Write-Host ""
 Write-Host "  Commands:"
 Write-Host "    pith status    - Check if server is running"

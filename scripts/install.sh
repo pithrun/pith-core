@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# Pith Installer v1.0.4
+# Pith Installer v1.0.5
 # macOS developer preview installer; Linux remains an unverified source/developer path.
 
 # Configuration
@@ -15,7 +15,13 @@ PITH_REPAIR_RUNTIME="${PITH_REPAIR_RUNTIME:-0}"
 PITH_FORCE_MANAGED_PYTHON="${PITH_FORCE_MANAGED_PYTHON:-0}"
 # Keep PITH_VERSION on line 18.
 # scripts/version-bump.sh and TEST-090 depend on this exact location.
-PITH_VERSION="1.0.4"
+PITH_VERSION="1.0.5"
+PITH_INSTALL_TELEMETRY_URL="${PITH_INSTALL_TELEMETRY_URL-https://pith.run/telemetry/install}"
+PITH_INSTALL_TELEMETRY_EVENT_VERSION="${PITH_INSTALL_TELEMETRY_EVENT_VERSION:-1}"
+PITH_RELEASE_CHANNEL="${PITH_RELEASE_CHANNEL:-unknown}"
+PITH_INSTALL_SOURCE="${PITH_INSTALL_SOURCE:-unknown}"
+PITH_TELEMETRY_DISABLED="${PITH_TELEMETRY_DISABLED:-0}"
+PITH_TELEMETRY_LOCAL_ONLY_OPT_IN="${PITH_TELEMETRY_LOCAL_ONLY_OPT_IN:-0}"
 detect_account_home() {
     if command -v dscl >/dev/null 2>&1; then
         dscl . -read "/Users/$(id -un)" NFSHomeDirectory 2>/dev/null | awk '{print $2; exit}' && return
@@ -124,6 +130,120 @@ mark_error() {
 error_exit() {
     echo -e "${RED}✗ ERROR:${NC} $1" >&2
     exit 1
+}
+
+generate_install_uuid() {
+    if command -v uuidgen >/dev/null 2>&1; then
+        uuidgen | tr '[:upper:]' '[:lower:]'
+        return 0
+    fi
+    "$PYTHON_EXECUTABLE" - <<'PY'
+import uuid
+print(uuid.uuid4())
+PY
+}
+
+sha256_text() {
+    if command -v shasum >/dev/null 2>&1; then
+        printf '%s' "$1" | shasum -a 256 | awk '{print $1}'
+    elif command -v sha256sum >/dev/null 2>&1; then
+        printf '%s' "$1" | sha256sum | awk '{print $1}'
+    else
+        return 1
+    fi
+}
+
+install_telemetry_enabled() {
+    [[ "$PITH_TELEMETRY_DISABLED" != "1" ]] || return 1
+    [[ "${DO_NOT_TRACK:-0}" != "1" ]] || return 1
+    if [[ "$PITH_LOCAL_ONLY_INSTALL" == "1" && "$PITH_TELEMETRY_LOCAL_ONLY_OPT_IN" != "1" ]]; then
+        return 1
+    fi
+    [[ -n "$PITH_INSTALL_TELEMETRY_URL" ]] || return 1
+}
+
+install_python_mode() {
+    case "${PITH_SELECTED_PYTHON_SOURCE:-unknown}" in
+        pith-managed) echo "managed" ;;
+        external) echo "system" ;;
+        *) echo "unknown" ;;
+    esac
+}
+
+emit_install_durable_success() {
+    install_telemetry_enabled || return 0
+
+    local install_id_file="$PITH_HOME/config/install_id"
+    local install_id=""
+    local install_id_hash=""
+    local attempt_id=""
+    local payload_file=""
+
+    mkdir -p "$PITH_HOME/config"
+    if [[ ! -f "$install_id_file" ]]; then
+        if ! install_id="$(generate_install_uuid)"; then
+            return 0
+        fi
+        (umask 077 && printf '%s\n' "$install_id" > "$install_id_file")
+    else
+        install_id="$(head -n 1 "$install_id_file" 2>/dev/null || true)"
+    fi
+    chmod 600 "$install_id_file" 2>/dev/null || true
+    [[ -n "$install_id" ]] || return 0
+
+    if ! install_id_hash="$(sha256_text "pith-install-v1:${install_id}")"; then
+        return 0
+    fi
+    [[ "$install_id_hash" =~ ^[a-f0-9]{64}$ ]] || return 0
+    if ! attempt_id="$(generate_install_uuid)"; then
+        return 0
+    fi
+    if ! payload_file="$(mktemp)"; then
+        return 0
+    fi
+
+    if ! EVENT_VERSION="$PITH_INSTALL_TELEMETRY_EVENT_VERSION" \
+    ATTEMPT_ID="$attempt_id" \
+    INSTALL_ID_HASH="$install_id_hash" \
+    PITH_VERSION_VALUE="$PITH_VERSION" \
+    PITH_RELEASE_CHANNEL_VALUE="$PITH_RELEASE_CHANNEL" \
+    PITH_INSTALL_SOURCE_VALUE="$PITH_INSTALL_SOURCE" \
+    PITH_PYTHON_MODE_VALUE="$(install_python_mode)" \
+    PITH_OS_VALUE="$(uname -s 2>/dev/null || echo unknown)" \
+    PITH_ARCH_VALUE="$(uname -m 2>/dev/null || echo unknown)" \
+    "$PYTHON_EXECUTABLE" - "$payload_file" <<'PY'
+import json
+import os
+import sys
+from datetime import datetime, timezone
+
+payload = {
+    "event": "install_durable_success",
+    "event_version": int(os.environ.get("EVENT_VERSION", "1")),
+    "attempt_id": os.environ["ATTEMPT_ID"],
+    "install_id_hash": os.environ["INSTALL_ID_HASH"],
+    "pith_version": os.environ["PITH_VERSION_VALUE"],
+    "channel": os.environ.get("PITH_RELEASE_CHANNEL_VALUE", "unknown"),
+    "os": os.environ.get("PITH_OS_VALUE", "unknown"),
+    "arch": os.environ.get("PITH_ARCH_VALUE", "unknown"),
+    "install_source": os.environ.get("PITH_INSTALL_SOURCE_VALUE", "unknown"),
+    "python_mode": os.environ.get("PITH_PYTHON_MODE_VALUE", "unknown"),
+    "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+}
+with open(sys.argv[1], "w", encoding="utf-8") as fh:
+    json.dump(payload, fh, separators=(",", ":"))
+PY
+    then
+        rm -f "$payload_file"
+        return 0
+    fi
+
+    curl -fsS --max-time 2 --retry 0 \
+        -X POST \
+        -H 'Content-Type: application/json' \
+        --data-binary "@$payload_file" \
+        "$PITH_INSTALL_TELEMETRY_URL" >/dev/null 2>&1 || true
+    rm -f "$payload_file"
 }
 
 print_python_runtime_recovery_hint() {
@@ -266,7 +386,7 @@ persist_preview_usage_config() {
 }
 
 private_beta_pause() {
-    local prompt="${1:-Setup paused. Press Return to continue...}"
+    local prompt="${1:-Private beta setup paused. Press Return to continue...}"
     if [[ "${PITH_PRIVATE_BETA:-0}" == "1" && "${PITH_SKIP_PAUSES:-0}" != "1" && -t 0 ]]; then
         echo ""
         read -r -p "$prompt" _ || true
@@ -637,7 +757,7 @@ select_install_surfaces() {
             echo "  • $(surface_label "$surface")"
         done
     fi
-    private_beta_pause "Review selected app connections, then press Return to continue..."
+    private_beta_pause "Private beta pause: review selected surfaces, then press Return to continue..."
 }
 
 json_escape() {
@@ -1151,6 +1271,7 @@ if [[ -L "$PITH_SERVER_PATH" ]]; then
         echo "✓ $PITH_SERVER_PATH points at runtime release worktree. Skipping file copy."
         echo "  Target: $SYMLINK_TARGET"
         DOWNLOAD_SUCCESS=true
+        [[ "$PITH_INSTALL_SOURCE" == "unknown" ]] && PITH_INSTALL_SOURCE="runtime_release_worktree"
     else
         echo "❌ $PITH_SERVER_PATH points at an unsafe symlink target."
         echo "   Target: ${SYMLINK_TARGET:-unknown}"
@@ -1166,6 +1287,7 @@ elif [[ -n "$DIST_DIR" && -f "$DIST_DIR/app/api/server.py" ]] && [[ -f "$DIST_DI
     echo "Detected distribution directory at: $DIST_DIR"
     install_server_from_dir "$DIST_DIR" "$PITH_SERVER_PATH"
     DOWNLOAD_SUCCESS=true
+    [[ "$PITH_INSTALL_SOURCE" == "unknown" ]] && PITH_INSTALL_SOURCE="distribution_directory"
     mark_success "Installed from distribution directory"
 
 # Strategy 2: Local tarball (created by build-release.sh)
@@ -1173,6 +1295,7 @@ elif [[ -n "$DIST_DIR" && -f "$DIST_DIR/pith-server-latest.tar.gz" ]]; then
     mark_success "Using local Pith server tarball"
     install_server_from_tarball "$DIST_DIR/pith-server-latest.tar.gz" "$PITH_SERVER_PATH"
     DOWNLOAD_SUCCESS=true
+    [[ "$PITH_INSTALL_SOURCE" == "unknown" ]] && PITH_INSTALL_SOURCE="local_tarball"
 
 # Strategy 3: Download from hosted URL (GitHub Releases / CDN)
 elif [[ "$PITH_LOCAL_ONLY_INSTALL" != "1" && -n "$DOWNLOAD_URL" ]]; then
@@ -1199,6 +1322,7 @@ elif [[ "$PITH_LOCAL_ONLY_INSTALL" != "1" && -n "$DOWNLOAD_URL" ]]; then
             mark_success "Download successful and checksum verified"
             install_server_from_tarball "$TEMP_DOWNLOAD_DIR/$PITH_SERVER_FILENAME" "$PITH_SERVER_PATH"
             DOWNLOAD_SUCCESS=true
+            [[ "$PITH_INSTALL_SOURCE" == "unknown" ]] && PITH_INSTALL_SOURCE="hosted_release"
         else
             mark_warning "Checksum verification failed"
         fi
@@ -2511,7 +2635,7 @@ PY
         ;;
     restart)
         if is_help_request; then print_wrapper_help restart; exit 0; fi
-        # Under launchd KeepAlive, stop+start races: launchd respawns within ~200ms
+        # Under launchd KeepAlive, stop+start races because launchd respawns quickly
         # after stop, so start finds the configured port occupied and exits 1. Use kickstart -k instead.
         _LAUNCHD_SVC="gui/$(id -u)/dev.pith.server"
         if launchctl print "$_LAUNCHD_SVC" >/dev/null 2>&1; then
@@ -3024,16 +3148,23 @@ fi
 
 echo ""
 
+INSTALL_DURABLE_SUCCESS=false
 if verify_installed_pith_durable_health >/dev/null 2>&1; then
     mark_success "Final service durability check passed"
+    INSTALL_DURABLE_SUCCESS=true
 else
     mark_warning "Final service durability check failed; retrying once..."
     "$PITH_HOME/bin/pith" start >/dev/null 2>&1 || true
     if verify_installed_pith_durable_health >/dev/null 2>&1; then
         mark_success "Final service durability check passed after retry"
+        INSTALL_DURABLE_SUCCESS=true
     else
         error_exit "Pith service is not healthy after install. Run $PITH_HOME/bin/pith logs for details."
     fi
+fi
+
+if [[ "$INSTALL_DURABLE_SUCCESS" == true ]]; then
+    emit_install_durable_success || true
 fi
 
 # ============================================================================
@@ -3139,7 +3270,7 @@ fi
 echo -e "  ${VERIFY_STEP}. View logs if a check fails: ${YELLOW}pith logs${NC}"
 echo ""
 if [[ "${PITH_PRIVATE_BETA:-0}" == "1" || "${PITH_LOCAL_ONLY_INSTALL:-0}" == "1" || -f "$DIST_DIR/.private-beta" ]]; then
-    echo -e "${BLUE}Local Build:${NC}"
+    echo -e "${BLUE}Private Beta:${NC}"
     echo "  Use the instructions included with this artifact."
     echo "  Do not use public repository release flows for this build."
     if [[ -n "${PITH_INSTALL_LOG:-}" ]]; then

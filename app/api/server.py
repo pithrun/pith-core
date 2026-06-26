@@ -949,7 +949,7 @@ def auto_associate_single(*args: Any, **kwargs: Any) -> Any:
 # MATURITY-001: Maturities blocked from external API results
 _BLOCKED_MATURITIES = {"QUARANTINED", "DISCARDED"}
 
-SERVER_VERSION = os.environ.get("PITH_VERSION", "1.0.4")
+SERVER_VERSION = os.environ.get("PITH_VERSION", "1.0.5")
 
 app = FastAPI(
     title="Pith Server",

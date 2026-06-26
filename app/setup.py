@@ -18,7 +18,7 @@ if requirements_file.exists():
 
 setup(
     name="pith",
-    version="1.0.4",
+    version="1.0.5",
     author="Pith Contributors",
     description="Personal Knowledge Server with versioned conceptual memory",
     long_description=long_description,
