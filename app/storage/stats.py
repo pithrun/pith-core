@@ -90,6 +90,165 @@ def get_pith_health_fast(conn: sqlite3.Connection | None = None) -> dict:
     }
 
 
+def _pct(part: int | float | None, total: int | float | None) -> float:
+    if not total:
+        return 0.0
+    return round((part or 0) / total * 100, 2)
+
+
+def _legacy_currency_mean_status(mean_score: float, contradicted_pct: float, total: int) -> str:
+    if total == 0:
+        return "UNKNOWN"
+    if contradicted_pct > 50.0 or mean_score < 0.5:
+        return "CRITICAL"
+    if contradicted_pct > 35.0 or mean_score < 0.7:
+        return "DEGRADED"
+    return "HEALTHY"
+
+
+def _build_currency_health(conn: sqlite3.Connection) -> dict:
+    """Build segmented currency health for full stats/integrity surfaces."""
+    system_row = conn.execute("""
+        SELECT
+            COUNT(*) AS total,
+            SUM(CASE WHEN currency_status = 'CONTRADICTED' THEN 1 ELSE 0 END) AS contradicted,
+            SUM(CASE WHEN currency_score IS NULL THEN 1 ELSE 0 END) AS missing_score,
+            AVG(currency_score) AS mean_score
+        FROM concepts
+        WHERE is_current = 1 AND status != 'archived'
+    """).fetchone()
+
+    active_row = conn.execute("""
+        SELECT
+            COUNT(*) AS active_total,
+            SUM(CASE WHEN (julianday('now') - julianday(last_currency_recompute)) * 24 > 24
+                THEN 1 ELSE 0 END) AS recompute_older_24h,
+            SUM(CASE WHEN (julianday('now') - julianday(last_currency_recompute)) > 7
+                THEN 1 ELSE 0 END) AS recompute_older_7d,
+            SUM(CASE WHEN authority_score >= 0.5 THEN 1 ELSE 0 END) AS high_authority_total,
+            SUM(CASE WHEN authority_score >= 0.5 AND currency_score < 0.5 THEN 1 ELSE 0 END) AS high_authority_below_0_50,
+            SUM(CASE WHEN currency_score < 0.30 THEN 1 ELSE 0 END) AS cko_below_0_30,
+            SUM(CASE WHEN always_activate = 1 THEN 1 ELSE 0 END) AS always_activate_total,
+            SUM(CASE WHEN always_activate = 1 AND currency_score < 0.5 THEN 1 ELSE 0 END) AS always_activate_below_0_50
+        FROM concepts
+        WHERE is_current = 1 AND status = 'active'
+    """).fetchone()
+
+    bucket_rows = conn.execute("""
+        SELECT
+            CASE
+                WHEN currency_score < 0.20 THEN 'lt_0_20'
+                WHEN currency_score < 0.30 THEN '0_20_to_0_30'
+                WHEN currency_score < 0.50 THEN '0_30_to_0_50'
+                WHEN currency_score < 0.70 THEN '0_50_to_0_70'
+                WHEN currency_score < 0.90 THEN '0_70_to_0_90'
+                ELSE 'gte_0_90'
+            END AS bucket,
+            COUNT(*) AS n
+        FROM concepts
+        WHERE is_current = 1 AND status = 'active'
+        GROUP BY bucket
+    """).fetchall()
+
+    total = system_row["total"] or 0
+    mean_score = system_row["mean_score"] if system_row["mean_score"] is not None else 0.0
+    contradicted_pct = _pct(system_row["contradicted"], total)
+    missing_score_pct = _pct(system_row["missing_score"], total)
+    active_total = active_row["active_total"] or 0
+    recompute_older_7d = active_row["recompute_older_7d"] or 0
+    recompute_older_7d_pct = _pct(recompute_older_7d, active_total)
+    high_authority_below_pct = _pct(
+        active_row["high_authority_below_0_50"],
+        active_row["high_authority_total"],
+    )
+    cko_below_pct = _pct(active_row["cko_below_0_30"], active_total)
+    always_activate_below_pct = _pct(
+        active_row["always_activate_below_0_50"],
+        active_row["always_activate_total"],
+    )
+
+    status_reasons: list[str] = []
+    if total == 0:
+        status = "UNKNOWN"
+    elif contradicted_pct > 50.0 or missing_score_pct > 1.0 or recompute_older_7d_pct > 5.0:
+        status = "CRITICAL"
+        status_reasons.append("system_integrity_critical")
+    elif always_activate_below_pct > 50.0:
+        status = "CRITICAL"
+        status_reasons.append("always_activate_currency_critical")
+    elif contradicted_pct > 35.0 or recompute_older_7d > 0:
+        status = "DEGRADED"
+        status_reasons.append("system_integrity_degraded")
+    else:
+        status = "HEALTHY"
+
+    if always_activate_below_pct > 50.0:
+        retrieval_status = "CRITICAL"
+    elif high_authority_below_pct > 50.0 or cko_below_pct > 5.0:
+        retrieval_status = "ATTENTION"
+    else:
+        retrieval_status = "OK"
+
+    buckets = {
+        "lt_0_20": 0,
+        "0_20_to_0_30": 0,
+        "0_30_to_0_50": 0,
+        "0_50_to_0_70": 0,
+        "0_70_to_0_90": 0,
+        "gte_0_90": 0,
+    }
+    for row in bucket_rows:
+        buckets[row["bucket"]] = row["n"]
+
+    system_integrity_status = "HEALTHY"
+    if "system_integrity_critical" in status_reasons:
+        system_integrity_status = "CRITICAL"
+    elif "system_integrity_degraded" in status_reasons:
+        system_integrity_status = "DEGRADED"
+
+    return {
+        "status": status,
+        "status_reasons": status_reasons,
+        "total_is_current": total,
+        "contradicted_pct": contradicted_pct,
+        "mean_currency_score": round(mean_score, 4),
+        "legacy_global_mean_status": _legacy_currency_mean_status(mean_score, contradicted_pct, total),
+        "system_integrity": {
+            "status": system_integrity_status,
+            "missing_score_pct": missing_score_pct,
+            "contradicted_pct": contradicted_pct,
+        },
+        "recompute_freshness": {
+            "status": "CRITICAL" if recompute_older_7d_pct > 5.0 else ("DEGRADED" if recompute_older_7d > 0 else "HEALTHY"),
+            "older_than_24h": active_row["recompute_older_24h"] or 0,
+            "older_than_7d": recompute_older_7d,
+        },
+        "score_distribution": {"buckets": buckets},
+        "retrieval_impact": {
+            "status": retrieval_status,
+            "high_authority_total": active_row["high_authority_total"] or 0,
+            "high_authority_below_0_50": active_row["high_authority_below_0_50"] or 0,
+            "high_authority_below_0_50_pct": high_authority_below_pct,
+            "cko_below_0_30": active_row["cko_below_0_30"] or 0,
+            "cko_below_0_30_pct": cko_below_pct,
+            "always_activate_total": active_row["always_activate_total"] or 0,
+            "always_activate_below_0_50": active_row["always_activate_below_0_50"] or 0,
+            "always_activate_below_0_50_pct": always_activate_below_pct,
+        },
+        "thresholds": {
+            "legacy_degraded_if_mean_score_below": 0.7,
+            "legacy_critical_if_mean_score_below": 0.5,
+            "degraded_if_contradicted_pct_above": 35.0,
+            "critical_if_contradicted_pct_above": 50.0,
+            "critical_if_missing_score_pct_above": 1.0,
+            "critical_if_recompute_older_7d_pct_above": 5.0,
+            "attention_if_high_authority_below_0_50_pct_above": 50.0,
+            "attention_if_cko_below_0_30_pct_above": 5.0,
+            "critical_if_always_activate_below_0_50_pct_above": 50.0,
+        },
+    }
+
+
 def compute_concept_integrity(conn: sqlite3.Connection) -> dict:
     """Compute the 8 Surface-1 concept-integrity sub-checks on the passed-in conn.
 
@@ -146,29 +305,7 @@ def compute_concept_integrity(conn: sqlite3.Connection) -> dict:
           )
     """).fetchone()
 
-    # --- currency (stats.py:384-391 query + 638-651 derive) ---
-    _curr_row = conn.execute("""
-        SELECT
-            COUNT(*) as total,
-            SUM(CASE WHEN currency_status = 'CONTRADICTED' THEN 1 ELSE 0 END) as contradicted,
-            AVG(currency_score) as mean_score
-        FROM concepts
-        WHERE is_current = 1 AND status != 'archived'
-    """).fetchone()
-    _curr_total = _curr_row["total"] or 0
-    _contradicted = _curr_row["contradicted"] or 0
-    _mean_score = _curr_row["mean_score"] or 0.0
-    if _curr_total == 0:
-        _curr_alert = "UNKNOWN"
-        _contradicted_pct = 0.0
-    else:
-        _contradicted_pct = round(_contradicted / _curr_total * 100, 2)
-        if _contradicted_pct > 50.0 or _mean_score < 0.5:
-            _curr_alert = "CRITICAL"
-        elif _contradicted_pct > 35.0 or _mean_score < 0.7:
-            _curr_alert = "DEGRADED"
-        else:
-            _curr_alert = "HEALTHY"
+    currency_health = _build_currency_health(conn)
 
     # --- factual_coverage (stats.py:394-407) ---
     factual_row = conn.execute("""
@@ -231,18 +368,7 @@ def compute_concept_integrity(conn: sqlite3.Connection) -> dict:
             "avg_evidence_per_concept": evidence_row["avg_evidence_count"],
         },
         "zombie_count": zombie_row["cnt"] if zombie_row else 0,
-        "currency_health": {
-            "status": _curr_alert,
-            "total_is_current": _curr_total,
-            "contradicted_pct": _contradicted_pct,
-            "mean_currency_score": round(_mean_score, 4),
-            "thresholds": {
-                "degraded_if_contradicted_pct_above": 35.0,
-                "critical_if_contradicted_pct_above": 50.0,
-                "degraded_if_mean_score_below": 0.7,
-                "critical_if_mean_score_below": 0.5,
-            },
-        },
+        "currency_health": currency_health,
         "factual_coverage": {
             "total_active": _factual_total,
             "factual_count": _factual_count,

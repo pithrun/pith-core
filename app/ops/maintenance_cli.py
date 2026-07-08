@@ -11,15 +11,17 @@ Usage:
 
 import argparse
 import asyncio
-import fcntl
 import json
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+from app.core.file_lock import lock_file_exclusive, unlock_file
 
 # INFRA-003: Load .env for feature flag overrides (PITH_FF_* env vars).
 # python-dotenv is in requirements.txt. If missing, falls back to launchd env vars.
@@ -33,7 +35,7 @@ except ImportError:
 
 PLIST_NAME = "com.pith.maintenance"
 PLIST_SOURCE = Path(__file__).parent.parent.parent / "scripts" / f"{PLIST_NAME}.plist"
-LOCK_FILE = "/tmp/pith_maintenance.lock"
+LOCK_FILE = str(Path(tempfile.gettempdir()) / "pith_maintenance.lock")
 REFLECTION_PRESSURE_DEFERRAL_ERROR = "ReflectionDeferredError: pressure_protected_reflection_deferred"
 
 
@@ -95,7 +97,7 @@ PLIST_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
 def _acquire_maintenance_lock():
     lock_fd = open(LOCK_FILE, "w")  # noqa: SIM115 — lock must outlive context manager
     try:
-        fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock_file_exclusive(lock_fd)
     except OSError:
         print("✗ Maintenance already running (lock file held). Use --force to override.")
         lock_fd.close()
@@ -104,7 +106,7 @@ def _acquire_maintenance_lock():
 
 
 def _release_maintenance_lock(lock_fd) -> None:
-    fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+    unlock_file(lock_fd)
     lock_fd.close()
 
 

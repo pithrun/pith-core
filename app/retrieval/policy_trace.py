@@ -10,6 +10,7 @@ EXPOSURE_DEBUG_RESPONSE_FIELD = "debug_response_field"
 
 MAX_ROUTER_SIGNALS = 12
 MAX_ACTIVATED_IDS = 20
+MAX_CANDIDATE_STAGE_IDS = 30
 MAX_DEADLINE_SKIPS = 12
 
 RETRIEVAL_SCALED_PHASES = (
@@ -164,6 +165,43 @@ def _expected_id_diagnostics(
     }
 
 
+def _candidate_stage_ids(value: Any) -> tuple[list[str], bool]:
+    if not isinstance(value, (list, tuple)):
+        return [], False
+    ids = _safe_labels(value, limit=MAX_CANDIDATE_STAGE_IDS)
+    return ids, len(value) > len(ids)
+
+
+def _candidate_stage_trace(candidate_stages: Any) -> dict[str, Any] | None:
+    if not isinstance(candidate_stages, dict):
+        return None
+    sanitized: dict[str, Any] = {}
+    for stage_name, stage_value in candidate_stages.items():
+        safe_stage_name = _safe_label(stage_name)
+        if safe_stage_name is None or not isinstance(stage_value, dict):
+            continue
+        stage_payload: dict[str, Any] = {}
+        for prefix in ("before", "after"):
+            count_key = f"{prefix}_count"
+            ids_key = f"{prefix}_ids"
+            truncated_key = f"{prefix}_ids_truncated"
+            count = _safe_int(stage_value.get(count_key))
+            if count is not None:
+                stage_payload[count_key] = count
+            ids, ids_truncated = _candidate_stage_ids(stage_value.get(ids_key))
+            if ids:
+                stage_payload[ids_key] = ids
+            explicit_truncated = _safe_bool(stage_value.get(truncated_key))
+            count_truncated = count is not None and bool(ids) and count > len(ids)
+            if explicit_truncated or ids_truncated or count_truncated:
+                stage_payload[truncated_key] = True
+            elif ids:
+                stage_payload[truncated_key] = False
+        if stage_payload:
+            sanitized[safe_stage_name] = stage_payload
+    return sanitized or None
+
+
 def _deadline_skips(deadline: Any) -> tuple[list[dict[str, Any]], int]:
     skips = getattr(deadline, "skips", None)
     if not isinstance(skips, list):
@@ -203,6 +241,7 @@ def build_retrieval_policy_trace(
     effective_max_concepts: int | None = None,
     activated_concepts: list[Any] | None = None,
     expected_concept_ids: list[str] | tuple[str, ...] | set[str] | None = None,
+    candidate_stages: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a bounded, content-free retrieval-policy trace.
 
@@ -244,6 +283,9 @@ def build_retrieval_policy_trace(
     }
     if expected_diagnostics is not None:
         candidate_flow["expected_id_diagnostics"] = expected_diagnostics
+    safe_candidate_stages = _candidate_stage_trace(candidate_stages)
+    if safe_candidate_stages is not None:
+        candidate_flow["candidate_stages"] = safe_candidate_stages
 
     return {
         "schema_version": SCHEMA_VERSION,

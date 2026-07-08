@@ -28,6 +28,7 @@ from app.storage.lifecycle_jobs import (
     retry_lifecycle_job,
     summarize_lifecycle_jobs,
     summarize_lifecycle_jobs_by_source,
+    terminalize_exhausted_stale_lifecycle_jobs,
 )
 
 _ALL_SOURCES_KEY = "__all__"
@@ -330,6 +331,24 @@ def run_lifecycle_drain_once(
     result = {"claimed": 0, "committed": 0, "retried": 0, "deferred": 0, "failed": 0, "reason": reason}
     max_jobs = max(0, int(limit or 0))
     with _DRAIN_EXECUTION_LOCK:
+        if max_jobs > 0:
+            now = datetime.now(UTC)
+            stale_before = (now - timedelta(seconds=LIFECYCLE_JOB_LEASE_SECONDS)).isoformat()
+            terminalized = terminalize_exhausted_stale_lifecycle_jobs(
+                profile=profile,
+                stale_before_iso=stale_before,
+                max_attempts=LIFECYCLE_JOB_MAX_ATTEMPTS,
+                error="LifecycleJobTerminalized: stale running job exhausted max attempts",
+                now=now.isoformat(),
+                source=source,
+            )
+            if terminalized:
+                result["terminalized_failed"] = terminalized
+                _record_metric(
+                    "lifecycle_job_terminalized_failed",
+                    float(terminalized),
+                    {"source": _source_key(source), "reason": reason},
+                )
         while int(result["claimed"]) < max_jobs:
             pressure_defer, pressure_mode, pressure_level = _pressure_backpressure_active()
             if pressure_defer:

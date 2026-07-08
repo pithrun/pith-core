@@ -937,7 +937,7 @@ class LifecycleMixin:
             # which runs separately in the heavy phase with stricter guards (save_count>=2, done non-empty).
             # We only handle active→paused here.
             if session_copy and session_copy.learning_event_count > 0:
-                cp = load_checkpoint(max_age_hours=24)
+                cp = load_checkpoint(session_id=current_sid, max_age_hours=24) if current_sid else None
                 if cp and cp["status"] in ("active", "planning"):
                     # CKPT-002: Compress before saving as paused
                     from app.storage import compress_checkpoint
@@ -952,6 +952,7 @@ class LifecycleMixin:
                         blockers=compressed.get("blockers", cp.get("blockers")),
                         context=compressed.get("context", cp.get("context")),
                         session_id=current_sid,
+                        origin_id=cp.get("origin_id"),
                     )
                     result["checkpoint_auto_saved"] = cp["task_id"]
                     logger.info(f"CKPT-001: Checkpoint {cp['task_id']} → paused")

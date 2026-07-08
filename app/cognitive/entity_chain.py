@@ -2007,6 +2007,7 @@ class EntityChainRetriever:
                             JOIN concepts c ON c.id = fts_concepts.concept_id
                             WHERE fts_concepts MATCH ?
                               AND c.status = 'active'
+                              AND COALESCE(c.is_current, 1) = 1
                             ORDER BY bm25(fts_concepts), c.confidence DESC
                             LIMIT ?
                             """,

@@ -29,15 +29,18 @@ class EmbeddingUnavailableError(RuntimeError):
 # --- Module-level availability check (runs once at import) ---
 _EMBEDDING_AVAILABLE: bool = False
 _EMBEDDING_UNAVAILABLE_LOGGED: bool = False
+_EMBEDDING_UNAVAILABLE_REASON: str | None = None
 
 
 def _check_embedding_availability() -> bool:
-    """Check if sentence_transformers can be imported. Runs once."""
+    """Check if sentence_transformers can be imported and its native deps load."""
+    global _EMBEDDING_UNAVAILABLE_REASON
     try:
         import sentence_transformers  # noqa: F401
 
         return True
-    except ImportError:
+    except Exception as exc:
+        _EMBEDDING_UNAVAILABLE_REASON = str(exc)
         return False
 
 
@@ -79,19 +82,27 @@ class EmbeddingEngine:
             if not _EMBEDDING_UNAVAILABLE_LOGGED:
                 logger.warning(
                     "sentence_transformers not available — embedding features disabled. "
-                    "TF-IDF search will be used as fallback."
+                    "TF-IDF search will be used as fallback. Reason: %s",
+                    _EMBEDDING_UNAVAILABLE_REASON or "unknown",
                 )
                 _EMBEDDING_UNAVAILABLE_LOGGED = True
             raise EmbeddingUnavailableError("sentence_transformers not installed")
-        from sentence_transformers import SentenceTransformer
+        try:
+            from sentence_transformers import SentenceTransformer
 
-        device = os.environ.get("PITH_EMBEDDING_DEVICE", "").strip() or None
-        if device:
-            logger.info(f"Loading embedding model: {MODEL_NAME} on device={device}")
-            self._model = SentenceTransformer(MODEL_NAME, device=device)
-        else:
-            logger.info(f"Loading embedding model: {MODEL_NAME}")
-            self._model = SentenceTransformer(MODEL_NAME)
+            device = os.environ.get("PITH_EMBEDDING_DEVICE", "").strip() or None
+            if device:
+                logger.info(f"Loading embedding model: {MODEL_NAME} on device={device}")
+                self._model = SentenceTransformer(MODEL_NAME, device=device)
+            else:
+                logger.info(f"Loading embedding model: {MODEL_NAME}")
+                self._model = SentenceTransformer(MODEL_NAME)
+        except Exception as exc:
+            logger.warning(
+                "Embedding model load failed — TF-IDF search will be used as fallback. Reason: %s",
+                exc,
+            )
+            raise EmbeddingUnavailableError(str(exc)) from exc
         logger.info(f"Embedding model loaded: {MODEL_NAME} ({EMBEDDING_DIM}-dim)")
 
     def embed_text(self, text: str) -> np.ndarray:

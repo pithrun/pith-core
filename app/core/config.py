@@ -89,6 +89,7 @@ FEATURE_FLAGS = {
     "QUERY_INTENT_EXPANSION_ENABLED": True,  # Retrieval-only alias/query expansion
     "QUERY_INTENT_RESCUE_ENABLED": True,  # Sparse-result re-query with expanded variants
     "QUERY_INTENT_TRACE_ENABLED": True,  # Trace matched aliases/variants in retrieval diagnostics
+    "LIVE_SEMANTIC_RECOVERY_ENABLED": False,  # RETRIEVAL-153 Phase B: default-off bounded semantic recovery
     # COVERAGE-001: 4-signal LLM coverage validator
     "COVERAGE_LLM_ENABLED": False,  # Phase 3 rollout — enable after monitoring
     # PRODUCT-002: Episodic fact granularity guard
@@ -130,6 +131,13 @@ FEATURE_FLAGS = {
     "WORKSTREAMS_TURN_CONTEXT_ENABLED": False,  # Workstreams Phase 3: explicit active Workstream injection into conversation_turn
     "WORKSTREAMS_ACTIVATION_HINT_ENABLED": False,  # Workstreams API parity: compact read-only activation state hint
     "WORKSTREAMS_NON_EXACT_RECOMMENDATIONS_ENABLED": False,  # Default-safe: lexical candidates are advisory, not bind authority
+    "CURRENT_STATE_ARBITRATION_ENABLED": True,  # RETRIEVAL-131: Diagnostic stale-context conflict surfacing
+    "AUTOMATIC_FRESHNESS_SUPERSESSION_UX_ENABLED": True,  # SUPER-018: read-time stale/superseded context annotation
+    "LIFECYCLE_AWARE_STALENESS_FILTER_ENABLED": True,  # RETRIEVAL-150: S5.5 preserves lifecycle-current/caution context
+    "CONTEXT_RESOLUTION_SUMMARY_ENABLED": True,  # SUPER-020: response-level trust/currentness summary
+    "SUPERSESSION_CHAIN_RESCUE_ENABLED": False,  # Exact superseded-ID current-head admission rescue
+    "SUPERSESSION_CHAIN_CANDIDATE_RESCUE_ENABLED": False,  # SUPER-019: bounded candidate-backed supersession arbitration
+    "SUPERSESSION_CHAIN_SUBJECT_RESCUE_ENABLED": False,  # RETRIEVAL-133: natural-language lifecycle-chain candidate discovery
     # STABILITY-048: Operation-class storage boundary Segment 1.
     # Defaults are off/shadow so the sidecar command log cannot alter live memory
     # behavior until append latency, replay, and no-migration gates pass.
@@ -1412,6 +1420,102 @@ assert 0.0 < KA_BOOST_WEIGHT <= 0.5, f"KA_BOOST_WEIGHT must be (0.0, 0.5], got {
 KEYWORD_SUPPLEMENT_ENABLED = os.environ.get("PITH_KEYWORD_SUPPLEMENT", "false").lower() in ("true", "1", "yes")
 KEYWORD_SUPPLEMENT_THRESHOLD = float(os.environ.get("PITH_KEYWORD_SUPPLEMENT_THRESHOLD", "0.30"))
 KEYWORD_SUPPLEMENT_MAX = int(os.environ.get("PITH_KEYWORD_SUPPLEMENT_MAX", "5"))
+
+# =============================================================================
+# RETRIEVAL-137: Lexical Evidence Admission
+# Admit one strong TF-IDF exact-evidence candidate into embedding-led retrieval
+# without globally enabling keyword supplement or inflating lifecycle scores.
+# =============================================================================
+LEXICAL_EVIDENCE_ADMISSION_ENABLED = os.environ.get(
+    "PITH_LEXICAL_EVIDENCE_ADMISSION",
+    "true",
+).lower() in ("true", "1", "yes", "on")
+LEXICAL_EVIDENCE_ADMISSION_MAX_RANK = int(os.environ.get("PITH_LEXICAL_EVIDENCE_ADMISSION_MAX_RANK", "1"))
+LEXICAL_EVIDENCE_ADMISSION_MIN_TFIDF = float(os.environ.get("PITH_LEXICAL_EVIDENCE_ADMISSION_MIN_TFIDF", "0.25"))
+LEXICAL_EVIDENCE_ADMISSION_MIN_OVERLAP_RATIO = float(
+    os.environ.get("PITH_LEXICAL_EVIDENCE_ADMISSION_MIN_OVERLAP_RATIO", "0.75")
+)
+LEXICAL_EVIDENCE_ADMISSION_MIN_QUERY_TOKENS = int(os.environ.get("PITH_LEXICAL_EVIDENCE_ADMISSION_MIN_QUERY_TOKENS", "5"))
+LEXICAL_EVIDENCE_ADMISSION_MAX_PER_QUERY = int(os.environ.get("PITH_LEXICAL_EVIDENCE_ADMISSION_MAX_PER_QUERY", "1"))
+LEXICAL_EVIDENCE_ADMISSION_SCORE_CAP = float(os.environ.get("PITH_LEXICAL_EVIDENCE_ADMISSION_SCORE_CAP", "0.62"))
+LEXICAL_ABSTENTION_HANDOFF_ENABLED = os.environ.get(
+    "PITH_LEXICAL_ABSTENTION_HANDOFF",
+    "true",
+).lower() in ("true", "1", "yes", "on")
+
+# =============================================================================
+# RETRIEVAL-140: Non-strategy evidence recovery before hard abstention
+# Default-off runtime recovery path for non-strategy factual/process prompts.
+# Observe-only remains the default when enabled so live proof can precede behavior.
+# =============================================================================
+NONSTRATEGY_EVIDENCE_RECOVERY_ENABLED = os.environ.get(
+    "PITH_NONSTRATEGY_EVIDENCE_RECOVERY",
+    "false",
+).lower() in ("true", "1", "yes", "on")
+NONSTRATEGY_EVIDENCE_RECOVERY_OBSERVE_ONLY = os.environ.get(
+    "PITH_NONSTRATEGY_EVIDENCE_RECOVERY_OBSERVE_ONLY",
+    "true",
+).lower() in ("true", "1", "yes", "on")
+NONSTRATEGY_EVIDENCE_RECOVERY_MAX_RESULTS = _env_int_clamped(
+    "PITH_NONSTRATEGY_EVIDENCE_RECOVERY_MAX_RESULTS",
+    default=5,
+    low=1,
+    high=10,
+)
+NONSTRATEGY_EVIDENCE_RECOVERY_ADMIT_LIMIT = _env_int_clamped(
+    "PITH_NONSTRATEGY_EVIDENCE_RECOVERY_ADMIT_LIMIT",
+    default=1,
+    low=1,
+    high=3,
+)
+NONSTRATEGY_EVIDENCE_RECOVERY_MIN_SCORE = _env_float_clamped(
+    "PITH_NONSTRATEGY_EVIDENCE_RECOVERY_MIN_SCORE",
+    default=0.55,
+    low=0.0,
+    high=1.0,
+)
+NONSTRATEGY_EVIDENCE_RECOVERY_MIN_OVERLAP_RATIO = _env_float_clamped(
+    "PITH_NONSTRATEGY_EVIDENCE_RECOVERY_MIN_OVERLAP_RATIO",
+    default=0.45,
+    low=0.0,
+    high=1.0,
+)
+NONSTRATEGY_EVIDENCE_RECOVERY_MIN_REMAINING_MS = _env_float_clamped(
+    "PITH_NONSTRATEGY_EVIDENCE_RECOVERY_MIN_REMAINING_MS",
+    default=750.0,
+    low=0.0,
+    high=5000.0,
+)
+NONSTRATEGY_EXISTING_SUPPORT_ENABLED = os.environ.get(
+    "PITH_NONSTRATEGY_EXISTING_SUPPORT",
+    "true",
+).lower() in ("true", "1", "yes", "on")
+NONSTRATEGY_EXISTING_SUPPORT_OBSERVE_ONLY = os.environ.get(
+    "PITH_NONSTRATEGY_EXISTING_SUPPORT_OBSERVE_ONLY",
+    "false",
+).lower() in ("true", "1", "yes", "on")
+NONSTRATEGY_EXISTING_SUPPORT_REQUIRE_ALLOWLIST = os.environ.get(
+    "PITH_NONSTRATEGY_EXISTING_SUPPORT_REQUIRE_ALLOWLIST",
+    "false",
+).lower() in ("true", "1", "yes", "on")
+NONSTRATEGY_EXISTING_SUPPORT_MIN_OVERLAP_RATIO = _env_float_clamped(
+    "PITH_NONSTRATEGY_EXISTING_SUPPORT_MIN_OVERLAP_RATIO",
+    default=0.75,
+    low=0.0,
+    high=1.0,
+)
+NONSTRATEGY_EXISTING_SUPPORT_MIN_REMAINING_MS = _env_float_clamped(
+    "PITH_NONSTRATEGY_EXISTING_SUPPORT_MIN_REMAINING_MS",
+    default=250.0,
+    low=0.0,
+    high=5000.0,
+)
+NONSTRATEGY_EXISTING_SUPPORT_CONCEPT_ALLOWLIST = os.environ.get(
+    "PITH_NONSTRATEGY_EXISTING_SUPPORT_CONCEPT_ALLOWLIST"
+)
+NONSTRATEGY_EXISTING_SUPPORT_ORIGIN_ALLOWLIST = os.environ.get(
+    "PITH_NONSTRATEGY_EXISTING_SUPPORT_ORIGIN_ALLOWLIST"
+)
 
 # =============================================================================
 # RETRIEVAL-101: Supersession chain expansion

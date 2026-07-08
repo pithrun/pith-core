@@ -74,6 +74,12 @@ VALID_COHERENCE_STATUSES = {
     "not_probeable",
 }
 
+VALID_SURFACE_CANONICALITY = {
+    "canonical_surface",
+    "host_variant",
+    "inventory_gap",
+}
+
 VERDICT_RANK = {
     VERDICT_UNSUPPORTED: 0,
     VERDICT_MANUAL_API_ONLY: 1,
@@ -126,6 +132,11 @@ class SurfaceAdapterManifest:
     conformance_expectation: str = ""
     supports_fresh_consumer: bool = True
     supports_cold_start: bool = False
+    display_group: str = ""
+    user_visible_hosts: tuple[str, ...] = ()
+    host_aliases: tuple[str, ...] = ()
+    canonicality: str = "canonical_surface"
+    runtime_attribution_requirement: str = ""
 
     def __post_init__(self) -> None:
         if self.context_enforcement_verdict not in VALID_VERDICTS:
@@ -148,6 +159,14 @@ class SurfaceAdapterManifest:
             raise ValueError(f"invalid coherence_verdict: {self.coherence_verdict}")
         if self.timeout_budget_ms <= 0:
             raise ValueError("timeout_budget_ms must be positive")
+        if self.canonicality not in VALID_SURFACE_CANONICALITY:
+            raise ValueError(f"invalid canonicality: {self.canonicality}")
+        for field_name, values in (
+            ("user_visible_hosts", self.user_visible_hosts),
+            ("host_aliases", self.host_aliases),
+        ):
+            if not isinstance(values, tuple) or any(not isinstance(item, str) for item in values):
+                raise ValueError(f"{field_name} must be a tuple of strings")
 
     @property
     def trigger_type(self) -> str:
@@ -209,6 +228,16 @@ def _learning_defaults_for_context_verdict(
     )
 
 
+def _tuple_of_strings(raw: Any, field_name: str) -> tuple[str, ...]:
+    if raw is None:
+        return ()
+    if not isinstance(raw, (list, tuple)):
+        raise ValueError(f"{field_name} must be a list or tuple of strings")
+    if any(not isinstance(item, str) for item in raw):
+        raise ValueError(f"{field_name} must be a list or tuple of strings")
+    return tuple(raw)
+
+
 def surface_adapter_from_dict(raw: dict[str, Any]) -> SurfaceAdapterManifest:
     """Load a v2 manifest, accepting v1 manifest JSON as input compatibility."""
     context_verdict = raw.get("context_enforcement_verdict") or raw.get("expected_verdict")
@@ -255,6 +284,11 @@ def surface_adapter_from_dict(raw: dict[str, Any]) -> SurfaceAdapterManifest:
         conformance_expectation=raw.get("conformance_expectation", ""),
         supports_fresh_consumer=bool(raw.get("supports_fresh_consumer", True)),
         supports_cold_start=bool(raw.get("supports_cold_start", False)),
+        display_group=raw.get("display_group", ""),
+        user_visible_hosts=_tuple_of_strings(raw.get("user_visible_hosts"), "user_visible_hosts"),
+        host_aliases=_tuple_of_strings(raw.get("host_aliases"), "host_aliases"),
+        canonicality=raw.get("canonicality", "canonical_surface"),
+        runtime_attribution_requirement=raw.get("runtime_attribution_requirement", ""),
     )
 
 
@@ -277,19 +311,25 @@ SURFACE_LIFECYCLE_ADAPTERS: dict[str, SurfaceAdapterManifest] = {
         learning_failure_policy="Stop hook must call session_learn or record explicit degraded learning.",
         learning_quality_mode="raw_evidence_capture",
         coherence_probe_kind="hook_model_tool_trace",
-        coherence_verdict=VERDICT_ENFORCED,
+        coherence_verdict=VERDICT_INSTRUCTION_MEDIATED,
         coherence_required=True,
-        coherence_failure_policy="PostToolUse model-visible conversation_turn must match hook session and surface.",
+        coherence_failure_policy=(
+            "PostToolUse model-visible conversation_turn must match hook session and surface for "
+            "model-visible proof; absence is instruction-mediated/not observed, not hook failure."
+        ),
         config_path_templates=(".claude/settings.json", ".claude.json"),
         config_markers=("UserPromptSubmit", "Stop", "pith", "conversation_turn"),
         conformance_expectation=(
             "A UserPromptSubmit hook runs conversation_turn before response composition; "
             "a Stop hook captures the assistant response after the turn; "
-            "the model-visible binding must also call pith_conversation_turn each substantive turn "
-            "so hook capture and model/tool coherence can be verified."
+            "the model-visible binding instructs pith_conversation_turn each substantive turn, "
+            "but compliance is model/tool mediated unless a matching PostToolUse trace is observed."
         ),
         supports_fresh_consumer=True,
         supports_cold_start=True,
+        display_group="Claude",
+        user_visible_hosts=("Claude Code",),
+        canonicality="canonical_surface",
     ),
     "codex_local_api": SurfaceAdapterManifest(
         surface_id="codex_local_api",
@@ -311,6 +351,9 @@ SURFACE_LIFECYCLE_ADAPTERS: dict[str, SurfaceAdapterManifest] = {
         config_path_templates=(".codex/AGENTS.md", ".codex/config.toml"),
         config_markers=("conversation_turn", "pith api", "origin_id"),
         conformance_expectation="AGENTS.md instructs Codex to call the local API before substantive responses.",
+        display_group="OpenAI",
+        user_visible_hosts=("Codex",),
+        canonicality="canonical_surface",
     ),
     "claude_desktop_mcp": SurfaceAdapterManifest(
         surface_id="claude_desktop_mcp",
@@ -335,6 +378,14 @@ SURFACE_LIFECYCLE_ADAPTERS: dict[str, SurfaceAdapterManifest] = {
         ),
         config_markers=("pith", "pith_conversation_turn", "mcpServers"),
         conformance_expectation="MCP config exposes pith_conversation_turn; model compliance is still required.",
+        display_group="Claude",
+        user_visible_hosts=("Claude Desktop", "Claude Chat", "Claude Cowork"),
+        host_aliases=("claude-ai", "cowork"),
+        canonicality="canonical_surface",
+        runtime_attribution_requirement=(
+            "Claude Chat and Claude Cowork are user-visible host variants under claude_desktop_mcp "
+            "until runtime attribution can stamp distinct canonical surface IDs."
+        ),
     ),
     "cursor_mcp": SurfaceAdapterManifest(
         surface_id="cursor_mcp",
@@ -356,6 +407,9 @@ SURFACE_LIFECYCLE_ADAPTERS: dict[str, SurfaceAdapterManifest] = {
         config_path_templates=(".cursor/mcp.json",),
         config_markers=("pith", "pith_conversation_turn", "mcpServers"),
         conformance_expectation="MCP config exposes Pith tools; model compliance is still required.",
+        display_group="IDE",
+        user_visible_hosts=("Cursor",),
+        canonicality="canonical_surface",
     ),
     "vscode_copilot_mcp": SurfaceAdapterManifest(
         surface_id="vscode_copilot_mcp",
@@ -383,6 +437,9 @@ SURFACE_LIFECYCLE_ADAPTERS: dict[str, SurfaceAdapterManifest] = {
         conformance_expectation=(
             "Copilot instructions and MCP config expose lifecycle path; model compliance is required."
         ),
+        display_group="IDE",
+        user_visible_hosts=("VS Code", "VS Code Copilot"),
+        canonicality="canonical_surface",
     ),
     "windsurf_mcp": SurfaceAdapterManifest(
         surface_id="windsurf_mcp",
@@ -404,6 +461,9 @@ SURFACE_LIFECYCLE_ADAPTERS: dict[str, SurfaceAdapterManifest] = {
         config_path_templates=(".codeium/windsurf/mcp_config.json",),
         config_markers=("pith", "pith_conversation_turn", "mcpServers"),
         conformance_expectation="MCP config exposes Pith tools; model compliance is still required.",
+        display_group="IDE",
+        user_visible_hosts=("Windsurf",),
+        canonicality="canonical_surface",
     ),
     "cline_mcp": SurfaceAdapterManifest(
         surface_id="cline_mcp",
@@ -428,6 +488,9 @@ SURFACE_LIFECYCLE_ADAPTERS: dict[str, SurfaceAdapterManifest] = {
         ),
         config_markers=("pith", "pith_conversation_turn", "mcpServers"),
         conformance_expectation="MCP config exposes Pith tools; model compliance is still required.",
+        display_group="IDE",
+        user_visible_hosts=("Cline",),
+        canonicality="canonical_surface",
     ),
     "local_api_cli": SurfaceAdapterManifest(
         surface_id="local_api_cli",
@@ -449,6 +512,9 @@ SURFACE_LIFECYCLE_ADAPTERS: dict[str, SurfaceAdapterManifest] = {
         config_path_templates=(),
         config_markers=(),
         conformance_expectation="Direct API call works, but no consumer turn trigger is implied.",
+        display_group="Local API",
+        user_visible_hosts=("Local API CLI",),
+        canonicality="canonical_surface",
     ),
 }
 
@@ -617,15 +683,10 @@ def evaluate_context_phase(
     if call_status == "ok":
         status = "passed"
         proof_status = "passed"
-        if (
-            manifest.context_enforcement_verdict == VERDICT_ENFORCED
-            and payload_quality.get("status") != "delivered"
-        ):
+        if manifest.context_enforcement_verdict == VERDICT_ENFORCED and payload_quality.get("status") != "delivered":
             status = "degraded"
             proof_status = "failed"
-            limitations.append(
-                "first-turn call registered the turn but did not deliver retrieved context"
-            )
+            limitations.append("first-turn call registered the turn but did not deliver retrieved context")
     elif call_status == "skipped":
         status = "skipped"
         proof_status = "skipped"
@@ -778,29 +839,41 @@ def evaluate_coherence_phase(
             "limitations": limitations,
         }
 
+    instruction_mediated_required = (
+        manifest.coherence_required and manifest.coherence_verdict == VERDICT_INSTRUCTION_MEDIATED
+    )
+
+    def _missing_or_unknown_coherence() -> tuple[str, str]:
+        if instruction_mediated_required:
+            return "degraded", manifest.coherence_verdict
+        if manifest.coherence_required:
+            return "failed", VERDICT_UNSUPPORTED
+        return "skipped", manifest.coherence_verdict
+
     if probe_status == "passed":
         status = "passed"
         proof_status = "passed"
         verdict = manifest.coherence_verdict
     elif probe_status == "skipped_not_observed":
         status = "skipped_not_observed"
-        proof_status = "failed" if manifest.coherence_required else "skipped"
-        verdict = VERDICT_UNSUPPORTED if manifest.coherence_required else manifest.coherence_verdict
+        proof_status, verdict = _missing_or_unknown_coherence()
         limitations.append(probe.get("reason") or "model-visible conversation_turn was not observed")
     elif probe_status == "not_probeable":
         status = "not_probeable"
-        proof_status = "failed" if manifest.coherence_required else "skipped"
-        verdict = VERDICT_UNSUPPORTED if manifest.coherence_required else manifest.coherence_verdict
+        proof_status, verdict = _missing_or_unknown_coherence()
         limitations.append(probe.get("reason") or "model-visible coherence is not probeable")
-    elif probe_status in {"failed", "unknown"}:
-        status = probe_status
-        proof_status = "failed" if manifest.coherence_required or probe_status == "failed" else "skipped"
-        verdict = VERDICT_UNSUPPORTED if manifest.coherence_required or probe_status == "failed" else manifest.coherence_verdict
+    elif probe_status == "unknown":
+        status = "unknown"
+        proof_status, verdict = _missing_or_unknown_coherence()
+        limitations.append(probe.get("reason") or probe.get("error") or "model-visible coherence unknown")
+    elif probe_status == "failed":
+        status = "failed"
+        proof_status = "failed"
+        verdict = VERDICT_UNSUPPORTED
         limitations.append(probe.get("reason") or probe.get("error") or "model-visible coherence failed")
     else:
         status = "unknown"
-        proof_status = "failed" if manifest.coherence_required else "skipped"
-        verdict = VERDICT_UNSUPPORTED if manifest.coherence_required else manifest.coherence_verdict
+        proof_status, verdict = _missing_or_unknown_coherence()
         limitations.append(f"invalid coherence status: {probe_status}")
 
     return {
@@ -845,9 +918,16 @@ def combine_overall_verdict(
     if context_verdict == VERDICT_ENFORCED and learning_verdict != VERDICT_ENFORCED:
         claim = f"split result: context enforced; learning {learning_phase.get('claim')}"
     elif coherence_required and coherence_phase.get("verdict") != VERDICT_ENFORCED:
-        claim = f"split result: context and learning enforced; coherence {coherence_phase.get('claim')}"
+        claim = (
+            "split result: context and learning contract enforced; "
+            f"model-visible coherence {coherence_phase.get('claim')}"
+        )
     elif verdict == VERDICT_ENFORCED:
-        claim = "fully enforced for context, learning, and coherence" if coherence_required else "fully enforced for context and learning"
+        claim = (
+            "fully enforced for context, learning, and coherence"
+            if coherence_required
+            else "fully enforced for context and learning"
+        )
     else:
         claim = _verdict_claim(verdict)
 

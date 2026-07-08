@@ -9973,6 +9973,8 @@ def _fetch_fts_support_candidate_rows(
         "FROM fts_concepts "
         f"JOIN concepts c ON c.{id_col} = fts_concepts.concept_id "
         "WHERE fts_concepts MATCH ? "
+        "AND COALESCE(c.status, 'active') = 'active' "
+        "AND COALESCE(c.is_current, 1) != 0 "
         "ORDER BY bm25(fts_concepts) "
         "LIMIT ?"
     )
@@ -10029,6 +10031,8 @@ def _fetch_verbatim_fts_support_candidate_rows(
         "FROM fts_verbatim "
         f"JOIN concepts c ON c.{id_col} = fts_verbatim.concept_id "
         "WHERE fts_verbatim MATCH ? "
+        "AND COALESCE(c.status, 'active') = 'active' "
+        "AND COALESCE(c.is_current, 1) != 0 "
         "ORDER BY bm25(fts_verbatim) "
         "LIMIT ?"
     )

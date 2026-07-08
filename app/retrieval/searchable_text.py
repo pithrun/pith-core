@@ -13,12 +13,26 @@ separate assembly that additionally folds in ``concept.hypotheses`` (a top-level
 column, NOT present in the ``data`` blob). Unifying that path is out of A3 scope
 (whole-corpus blast radius) and tracked separately.
 """
+
 from __future__ import annotations
 
+import hashlib
 import json
-from typing import Any, Mapping
+from collections.abc import Mapping
+from datetime import UTC, datetime
+from typing import Any
 
-__all__ = ["build_searchable_text", "parse_json_blob", "stringify_list"]
+EMBEDDING_TEXT_CONTRACT_VERSION = 1
+
+__all__ = [
+    "EMBEDDING_TEXT_CONTRACT_VERSION",
+    "build_searchable_text",
+    "build_searchable_text_from_concept",
+    "embedding_freshness_metadata",
+    "embedding_text_hash",
+    "parse_json_blob",
+    "stringify_list",
+]
 
 
 def parse_json_blob(value: Any) -> dict[str, Any]:
@@ -38,6 +52,19 @@ def stringify_list(values: Any) -> str:
     if not isinstance(values, list):
         return ""
     return " ".join(str(value) for value in values if value is not None)
+
+
+def embedding_text_hash(text: str) -> str:
+    """Stable provenance hash for the exact text used to build an embedding."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def embedding_freshness_metadata(text: str, *, refreshed_at: str | None = None) -> dict[str, Any]:
+    return {
+        "embedding_text_hash": embedding_text_hash(text),
+        "embedding_text_contract_version": EMBEDDING_TEXT_CONTRACT_VERSION,
+        "embedding_refreshed_at": refreshed_at or datetime.now(UTC).isoformat(),
+    }
 
 
 def _row_get(row: Mapping[str, Any] | Any, key: str) -> Any:
@@ -98,7 +125,7 @@ def build_searchable_text(row: Mapping[str, Any] | Any) -> str:
 
     fragment_keywords = data.get("fragment_keywords", "") or ""
     if not fragment_keywords:
-        fragment_keywords = (_row_get(row, "fragment_keywords") or "")
+        fragment_keywords = _row_get(row, "fragment_keywords") or ""
 
     parts = [
         summary,
@@ -110,4 +137,58 @@ def build_searchable_text(row: Mapping[str, Any] | Any) -> str:
         " ".join(event_texts),
         fragment_keywords,
     ]
+    return " ".join(part for part in parts if part).strip()
+
+
+def build_searchable_text_from_concept(concept: Any) -> str:
+    """Assemble searchable text from a full Concept-like object.
+
+    This preserves the legacy ``RetrievalEngine._concept_to_document`` field
+    contract while giving embedding freshness one shared contract owner.
+    """
+    evidence_texts = []
+    for evidence in getattr(concept, "evidence", []) or []:
+        if isinstance(evidence, str):
+            evidence_texts.append(evidence)
+        elif isinstance(evidence, dict):
+            evidence_texts.append(str(evidence.get("content", "")))
+        elif hasattr(evidence, "content"):
+            evidence_texts.append(str(evidence.content))
+
+    metadata = getattr(concept, "metadata", {}) or {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    parts = [
+        getattr(concept, "summary", ""),
+        " ".join(str(signal) for signal in (getattr(concept, "signals", []) or [])),
+        " ".join(evidence_texts),
+        metadata.get("knowledge_area", ""),
+    ]
+
+    for hypothesis in getattr(concept, "hypotheses", []) or []:
+        description = getattr(hypothesis, "description", "")
+        if description:
+            parts.append(str(description))
+
+    for implication in metadata.get("implications", []) or []:
+        if isinstance(implication, str):
+            parts.append(implication)
+
+    for event in metadata.get("events", []) or []:
+        if not isinstance(event, dict):
+            continue
+        event_parts = [str(event.get("action", ""))]
+        if event.get("cause"):
+            event_parts.append(f"because {event['cause']}")
+        if event.get("consequence"):
+            event_parts.append(f"resulting in {event['consequence']}")
+        if event.get("actors"):
+            actors = event["actors"]
+            if isinstance(actors, list):
+                event_parts.append(f"involving {', '.join(str(actor) for actor in actors)}")
+            else:
+                event_parts.append(f"involving {actors}")
+        parts.append(" ".join(event_parts))
+
     return " ".join(part for part in parts if part).strip()

@@ -174,6 +174,13 @@ def _install_faulthandler_hooks() -> None:
         )
         _faulthandler_installed = True
         return
+    if not hasattr(faulthandler, "register") or not hasattr(_signal, "SIGUSR1"):
+        logger.debug(
+            "deadlock SIGUSR1 observer unavailable on this platform; "
+            "skipping faulthandler signal hook"
+        )
+        _faulthandler_installed = True
+        return
     try:
         from app.core.profile import resolve_data_dir
 
@@ -327,6 +334,9 @@ class SQLiteBackend:
         # P0.3: embedding columns for concepts
         ("concepts", "embedding", "BLOB"),
         ("concepts", "embedding_version", "INTEGER DEFAULT 0"),
+        ("concepts", "embedding_text_hash", "TEXT DEFAULT NULL"),
+        ("concepts", "embedding_text_contract_version", "INTEGER DEFAULT 0"),
+        ("concepts", "embedding_refreshed_at", "TEXT DEFAULT NULL"),
         # P1-1: always-activate flag for pre-flight injection
         ("concepts", "always_activate", "INTEGER DEFAULT 0"),
         # AGENT-001: multi-agent scoping

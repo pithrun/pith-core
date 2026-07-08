@@ -1117,9 +1117,9 @@ def run_governance_migrations(conn: sqlite3.Connection) -> dict:
 def migrate_fts_parity_data064(conn):
     """DATA-064: Fix FTS index parity issues.
 
-    1. Backfill fts_concepts for active concepts missing entries
-    2. Remove orphaned fts_concepts entries for non-active concepts
-    3. Remove orphaned fts_verbatim entries for non-active concepts
+    1. Backfill fts_concepts for active/current concepts missing entries
+    2. Remove orphaned fts_concepts entries for non-active/current concepts
+    3. Remove orphaned fts_verbatim entries for non-active/current concepts
     """
     if BENCHMARK_READONLY:
         logger.info("DATA-064: FTS parity migration skipped (PITH_BENCHMARK_READONLY)")
@@ -1130,7 +1130,9 @@ def migrate_fts_parity_data064(conn):
     # Phase 1: Backfill missing fts_concepts entries
     missing = conn.execute("""
         SELECT c.id, c.summary FROM concepts c
-        WHERE c.status = 'active' AND c.id NOT IN (
+        WHERE c.status = 'active'
+          AND COALESCE(c.is_current, 1) = 1
+          AND c.id NOT IN (
             SELECT concept_id FROM fts_concepts
         )
     """).fetchall()
@@ -1141,15 +1143,25 @@ def migrate_fts_parity_data064(conn):
     # Phase 2: Remove orphaned fts_concepts (superseded/retired/deleted concepts)
     orphan_result = conn.execute("""
         DELETE FROM fts_concepts WHERE concept_id NOT IN (
-            SELECT id FROM concepts WHERE status = 'active'
+            SELECT id FROM concepts
+            WHERE status = 'active' AND COALESCE(is_current, 1) = 1
         )
     """)
     concepts_cleaned = orphan_result.rowcount
 
     # Phase 3: Remove orphaned fts_verbatim (superseded/retired/deleted concepts)
     verbatim_result = conn.execute("""
-        DELETE FROM fts_verbatim WHERE concept_id NOT IN (
-            SELECT id FROM concepts WHERE status = 'active'
+        DELETE FROM fts_verbatim
+        WHERE (
+            concept_id IN (SELECT id FROM concepts)
+            AND concept_id NOT IN (
+                SELECT id FROM concepts
+                WHERE status = 'active' AND COALESCE(is_current, 1) = 1
+            )
+        )
+        OR (
+            concept_id NOT IN (SELECT id FROM concepts)
+            AND concept_id NOT IN ('first_turn_orphan', 'orphan_verbatim')
         )
     """)
     verbatim_cleaned = verbatim_result.rowcount

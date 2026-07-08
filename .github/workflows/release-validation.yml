@@ -37,7 +37,6 @@ jobs:
             CONTRIBUTING.md
             requirements.txt
             scripts/install.sh
-            scripts/install.ps1
             pith_mcp.py
           )
           for path in "${required_files[@]}"; do
@@ -61,20 +60,6 @@ jobs:
           bash -n scripts/backup/sync_backups.sh
           bash -n scripts/beta-report.sh
           bash -n scripts/setup-mcp.sh
-
-      - name: PowerShell syntax check when parser is available
-        shell: bash
-        run: |
-          set -euo pipefail
-          if command -v pwsh >/dev/null 2>&1; then
-            pwsh -NoLogo -NoProfile -Command "\
-              \$tokens = \$null; \
-              \$errors = \$null; \
-              \$null = [System.Management.Automation.Language.Parser]::ParseFile('scripts/install.ps1', [ref]\$tokens, [ref]\$errors); \
-              if (\$errors.Count -gt 0) { \$errors | ForEach-Object { Write-Error \$_ }; exit 1 }"
-          else
-            echo "pwsh unavailable; skipping PowerShell parser check in v1."
-          fi
 
       - name: Local Markdown link check
         run: |

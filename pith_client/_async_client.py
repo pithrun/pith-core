@@ -214,6 +214,7 @@ class AsyncPithClient:
         origin_id: str | None = None,
         current_task_id: str | None = None,
         context_authority_mode: str = "balanced",
+        current_state_evidence: list[dict] | None = None,
     ) -> ConversationTurnResponse:
         """POST /conversation_turn — the main learning+retrieval call."""
         body: dict[str, Any] = {
@@ -233,6 +234,8 @@ class AsyncPithClient:
             body["current_task_id"] = current_task_id
         if context_authority_mode != "balanced":
             body["context_authority_mode"] = context_authority_mode
+        if current_state_evidence is not None:
+            body["current_state_evidence"] = current_state_evidence
         return ConversationTurnResponse(**await self._post(
             "/conversation_turn", body))
 

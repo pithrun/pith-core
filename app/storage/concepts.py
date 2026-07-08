@@ -295,6 +295,78 @@ def apply_lifecycle_transition_conn(
     return cursor.rowcount
 
 
+def resolve_contested_current_head_conn(
+    conn: sqlite3.Connection,
+    concept_id: str,
+    *,
+    reason: str,
+    actor: str = "retrieval_154",
+    now: str | None = None,
+) -> int:
+    """Resolve a validated current head from CONTESTED to ACTIVE.
+
+    Callers must validate that the current assertion is correct before invoking
+    this gateway. The function records prior lifecycle markers as provenance and
+    only updates active/current, unsuperseded CONTESTED concepts.
+    """
+    if not reason:
+        raise LifecycleTransitionError("resolve_contested_current_head requires reason")
+
+    resolved_at = now or _utc_now_iso()
+    row = conn.execute(
+        """SELECT data
+           FROM concepts
+           WHERE id = ?
+             AND status = 'active'
+             AND is_current = 1
+             AND superseded_by IS NULL
+             AND currency_status = 'CONTESTED'""",
+        (concept_id,),
+    ).fetchone()
+    if not row:
+        return 0
+
+    data = _safe_json_loads(row["data"], context=f"resolve_contested_current_head({concept_id})") or {}
+    prior = {
+        "currency_status": data.get("currency_status"),
+        "change_type": data.get("change_type"),
+        "change_reason": data.get("change_reason"),
+        "has_active_contradiction": data.get("has_active_contradiction"),
+    }
+    history = data.get("lifecycle_remediation_history")
+    if not isinstance(history, list):
+        history = []
+    history.append(
+        {
+            "actor": actor,
+            "reason": reason,
+            "resolved_at": resolved_at,
+            "prior": prior,
+        }
+    )
+    data["lifecycle_remediation_history"] = history[-10:]
+    data["currency_status"] = "ACTIVE"
+    if data.get("change_type") == "contradiction_flag":
+        data["change_type"] = "lifecycle_remediation"
+        data["change_reason"] = reason
+    if data.get("has_active_contradiction") is True:
+        data["has_active_contradiction"] = False
+
+    cursor = conn.execute(
+        """UPDATE concepts
+           SET currency_status = 'ACTIVE',
+               updated_at = ?,
+               data = ?
+           WHERE id = ?
+             AND status = 'active'
+             AND is_current = 1
+             AND superseded_by IS NULL
+             AND currency_status = 'CONTESTED'""",
+        (resolved_at, json.dumps(data), concept_id),
+    )
+    return cursor.rowcount
+
+
 def clear_stale_risk_metadata(data: dict) -> dict:
     """Reset stale-risk lifecycle metadata for content-changing writes."""
     if not isinstance(data, dict):
@@ -357,6 +429,19 @@ def _resolve_knowledge_area(concept, meta: dict) -> str:
     else:
         # Fallback: preserve existing non-sentinel or default
         resolved = concept_ka if concept_ka else "general"
+
+    # DATA-075/DATA-076: Preserve explicit client/proposal dynamic KAs that already passed
+    # the cognitive boundary normalizer. Bypass writes without boundary metadata
+    # still flow through storage-safe seed normalization below.
+    if (
+        isinstance(meta, dict)
+        and meta.get("knowledge_area_label_kind") in {"dynamic_domain", "dynamic_topic"}
+        and isinstance(resolved, str)
+        and re.fullmatch(r"^[a-z0-9][a-z0-9_]{2,79}$", resolved)
+        and "__" not in resolved
+        and not resolved.endswith("_")
+    ):
+        return resolved
 
     # KA-004: Enforce taxonomy normalization at storage layer (single chokepoint)
     try:

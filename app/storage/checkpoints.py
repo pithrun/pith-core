@@ -259,6 +259,8 @@ def load_checkpoint(
     cutoff = (_utc_now() - timedelta(hours=max_age_hours)).isoformat()
     selection_source = None
     selection_authority = None
+    candidate_count = None
+    ambiguity_reason = None
 
     with read_snapshot_db("load_checkpoint") as conn:
         if task_id:
@@ -277,8 +279,21 @@ def load_checkpoint(
             """,
                 (_utc_now_iso(), cutoff, origin_id),
             ).fetchone()
+            candidate_count = conn.execute(
+                """
+                SELECT COUNT(*) FROM checkpoints
+                WHERE status NOT IN ('complete', 'archived') AND expires_at > ? AND updated_at > ?
+                AND origin_id = ?
+            """,
+                (_utc_now_iso(), cutoff, origin_id),
+            ).fetchone()[0]
             selection_source = "origin_id"
-            selection_authority = "authoritative"
+            selection_authority = "candidate"
+            ambiguity_reason = (
+                "origin_scope_multiple_active_checkpoints"
+                if candidate_count and candidate_count > 1
+                else "origin_scope_candidate_only"
+            )
         elif session_id:
             # CONTEXT-001 Fix 9: Session-scoped checkpoint — find checkpoint created by this session
             # SESSION-004 Fix 1: Added AND session_id = ? (was returning any recent checkpoint)
@@ -308,7 +323,7 @@ def load_checkpoint(
     if not row:
         return None
 
-    return {
+    result = {
         "task_id": row["task_id"],
         "session_id": row["session_id"],
         "origin_id": row["origin_id"] if "origin_id" in row.keys() else None,
@@ -327,6 +342,11 @@ def load_checkpoint(
         "expires_at": row["expires_at"],
         "save_count": row["save_count"],
     }
+    if candidate_count is not None:
+        result["candidate_count"] = candidate_count
+    if ambiguity_reason:
+        result["ambiguity_reason"] = ambiguity_reason
+    return result
 
 
 def list_checkpoints() -> list:

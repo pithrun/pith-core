@@ -10,12 +10,13 @@ acquires the lock. Sibling workers (same parent PID) are allowed through.
 See the internal BRAIN_LOCK design notes.
 """
 
-import fcntl
 import json
 import logging
 import os
 import signal
 import time
+
+from app.core.file_lock import lock_file_exclusive, unlock_file
 
 logger = logging.getLogger(__name__)
 
@@ -140,7 +141,7 @@ def acquire_brain_lock(
     _lock_fd = os.fdopen(fd, "r+")
 
     try:
-        fcntl.flock(_lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock_file_exclusive(_lock_fd)
     except BlockingIOError:
         # Lock held — read metadata from the file (written by lock holder)
         _lock_fd.seek(0)
@@ -198,11 +199,11 @@ def acquire_brain_lock(
             fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
             _lock_fd = os.fdopen(fd, "r+")
             try:
-                fcntl.flock(_lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                lock_file_exclusive(_lock_fd)
             except BlockingIOError:
                 # Another process beat us to the steal — retry with brief wait
                 try:
-                    fcntl.flock(_lock_fd.fileno(), fcntl.LOCK_EX)
+                    lock_file_exclusive(_lock_fd, blocking=True)
                 except Exception as steal_err:
                     _lock_fd.close()
                     _lock_fd = None
@@ -251,7 +252,7 @@ def acquire_brain_lock(
                 fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
                 _lock_fd = os.fdopen(fd, "r+")
                 try:
-                    fcntl.flock(_lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    lock_file_exclusive(_lock_fd)
                 except BlockingIOError:
                     _lock_fd.close()
                     _lock_fd = None
@@ -377,7 +378,7 @@ def release_brain_lock() -> None:
     global _lock_fd
     if _lock_fd is not None:
         try:
-            fcntl.flock(_lock_fd.fileno(), fcntl.LOCK_UN)
+            unlock_file(_lock_fd)
             _lock_fd.close()
         except Exception:
             pass

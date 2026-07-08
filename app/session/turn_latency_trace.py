@@ -31,6 +31,18 @@ PHASE_PRIORITY_KEYS = (
     "ct_phase_constraint_assembly_ms",
     "ct_phase_assembly_ms",
 )
+SUBPHASE_PRIORITY_KEYS = (
+    "ct_subphase_injection_recency_baseline_ms",
+    "ct_subphase_injection_serial_order_map_ms",
+    "ct_subphase_injection_verbatim_ms",
+    "ct_subphase_injection_required_context_ms",
+    "ct_phase_injection_unattributed_ms",
+    "ct_subphase_contradiction_detect_ms",
+    "ct_subphase_injection_concept_cache_ms",
+    "ct_subphase_injection_maturity_promotion_ms",
+    "ct_subphase_injection_prediction_logging_ms",
+    "ct_subphase_activation_assembly_ms",
+)
 FORBIDDEN_DETAIL_KEYS = {
     "activated_concept_ids",
     "activated_summaries",
@@ -163,7 +175,11 @@ def build_turn_latency_trace(
             limit=MAX_PHASE_KEYS,
             priority_keys=PHASE_PRIORITY_KEYS,
         ),
-        "subphase_ms": _bounded_numeric_map(subphase_ms, limit=MAX_SUBPHASE_KEYS),
+        "subphase_ms": _bounded_numeric_map(
+            subphase_ms,
+            limit=MAX_SUBPHASE_KEYS,
+            priority_keys=SUBPHASE_PRIORITY_KEYS,
+        ),
         "counts": _bounded_numeric_map(counts, limit=MAX_COUNT_KEYS),
         "deadline_skips": _bounded_deadline_records(deadline_skips),
         "deadline_overruns": _bounded_deadline_records(deadline_overruns),

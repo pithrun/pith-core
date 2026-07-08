@@ -51,6 +51,16 @@ CONTEXT_DELIVERY_MODE_VALUES = {
     "instruction_only",
     "unknown",
 }
+CURRENT_STATE_SOURCE_VALUES = {"backlog.db", "git", "github_pr", "ci", "operator", "test_fixture"}
+CURRENT_STATE_AUTHORITY_VALUES = {"live", "operator_confirmed", "snapshot", "memory"}
+CURRENT_STATE_VERIFICATION_METHODS = {
+    "backlog_cli",
+    "git_status",
+    "github_api",
+    "ci_api",
+    "manual_operator_confirmation",
+    "test_fixture",
+}
 
 
 # --- CKPT-003: Checkpoint Field TTL Classification ---
@@ -184,6 +194,75 @@ class WorkspaceContext(BaseModel):
     branch_owner: str = ""
     active_worktree_count: int = 0
     findings: list[WorkspaceFinding] = []
+
+
+class CurrentStateEvidence(BaseModel):
+    """Client-supplied, bounded evidence about current external state.
+
+    The server treats this as diagnostic input. It does not independently verify
+    git, backlog, CI, or PR state in the request path.
+    """
+
+    subject: str
+    attribute: str = "status"
+    value: str
+    source: str
+    observed_at: str | None = None
+    authority: str = "live"
+    verified: bool = False
+    verification_method: str | None = None
+    evidence_ref: str | None = None
+
+    @field_validator(
+        "subject",
+        "attribute",
+        "value",
+        "source",
+        "observed_at",
+        "authority",
+        "verification_method",
+        "evidence_ref",
+        mode="before",
+    )
+    @classmethod
+    def validate_current_state_text(cls, v):
+        if v is None:
+            return None
+        if not isinstance(v, str):
+            raise ValueError("current_state_evidence fields must be strings")
+        value = v.strip()
+        if CONTROL_CHARS_RE.search(value):
+            raise ValueError("current_state_evidence fields must not contain control characters")
+        if len(value) > 128:
+            raise ValueError("current_state_evidence fields must be 128 characters or fewer")
+        return value
+
+    @field_validator("source")
+    @classmethod
+    def validate_current_state_source(cls, v: str):
+        if v not in CURRENT_STATE_SOURCE_VALUES:
+            raise ValueError("current_state_evidence source is not allowed")
+        return v
+
+    @field_validator("authority")
+    @classmethod
+    def validate_current_state_authority(cls, v: str):
+        if v not in CURRENT_STATE_AUTHORITY_VALUES:
+            raise ValueError("current_state_evidence authority is not allowed")
+        return v
+
+    @field_validator("verification_method")
+    @classmethod
+    def validate_current_state_verification_method(cls, v: str | None):
+        if v is not None and v not in CURRENT_STATE_VERIFICATION_METHODS:
+            raise ValueError("current_state_evidence verification_method is not allowed")
+        return v
+
+    @model_validator(mode="after")
+    def validate_verified_requires_method(self):
+        if self.verified and not self.verification_method:
+            raise ValueError("verified current_state_evidence requires verification_method")
+        return self
 
 
 # --- Competing Hypothesis Structure ---
@@ -599,7 +678,7 @@ class ReflectionSummary(BaseModel):
     abort_reason: str | None = None
     last_completed_step: str | None = None
     abort_stage: str | None = None
-    budget_status: str = "completed"  # completed|deferred|aborted
+    budget_status: str = "completed"  # completed|deferred|paused_cap|aborted
     deferred_phases: list[str] = []
     phase_budget_decisions: dict[str, dict[str, Any]] = {}
     merge_progress: dict[str, Any] = {}
@@ -1149,6 +1228,9 @@ class ConversationTurnRequest(BaseModel):
     # VERBATIM-SURFACE Fix 2: Surface verbatim fragments by default.
     # Concept relevance scoring acts as the quality gate (validated by LongMemEval).
     include_verbatim: bool = True
+    # RETRIEVAL-149: diagnostic-only, bounded candidate-flow stage trace.
+    # Default off; must not change retrieval, admission, abstention, or answer behavior.
+    trace_candidate_flow: bool = False
     # FEDERATION L1.5: Model provenance tracking
     model_id: str = "unknown"
     platform_hint: str = "unknown"  # SESSION-012 v0.3: client platform (cowork, claude-code, etc.)
@@ -1162,6 +1244,7 @@ class ConversationTurnRequest(BaseModel):
     origin_id: str | None = None
     current_task_id: str | None = None
     context_authority_mode: str = "balanced"
+    current_state_evidence: list[CurrentStateEvidence] | None = Field(default=None, max_length=10)
     # RUNG0 Component C (A8): authorship trust-tier. Set by the MCP bridge from the
     # PITH_PROVENANCE env var (per-origin), NOT an LLM-supplied argument. Default 'human'.
     provenance: str = "human"
@@ -1403,6 +1486,7 @@ class ConversationTurnResponse(BaseModel):
     governance_summary: dict | None = None  # GOV: Governance pipeline telemetry (phases, latency, events)
     source_set_trace: dict | None = None  # RETRIEVAL-112: trace-only source-set completeness telemetry
     canary_retrieval_trace: dict | None = None  # RETRIEVAL-113: MH262 canary diagnostic-only retrieval trace
+    budget_decision_trace: dict | None = None  # BENCH: diagnostic-only effective budget and hard-cap trace
     retrieval_policy_trace: dict | None = None  # Agentic retrieval policy Slice 0 observe-only trace
     latency_components_ms: dict | None = None  # Retrieval Policy: replay-safe latency decomposition
     locomo_candidate_boundary_trace: dict | None = None  # LoCoMo benchmark-only candidate-boundary diagnostics
@@ -1452,6 +1536,14 @@ class ConversationTurnResponse(BaseModel):
     active_workstream: dict | None = None
     # Workstreams API parity: compact read-only activation state hint, no context block.
     workstream_activation: dict | None = None
+    # RETRIEVAL-131: Diagnostic current-state arbitration over stale context surfaces.
+    context_trust_conflicts: list[dict] | None = None
+    context_trust_decision: dict | None = None
+    # SUPER-018: Product-facing lifecycle freshness/supersession annotations.
+    context_freshness_conflicts: list[dict] | None = None
+    context_freshness_decision: dict | None = None
+    # SUPER-020: Bounded product-facing aggregate over trust/freshness/coverage signals.
+    context_resolution_summary: dict | None = None
     # INGEST-060 remediation: visible debt when prior-turn learning was skipped.
     turn_ingestion_warning: dict | None = None
     # SAL V0: Structured activation summary (None when SAL disabled or fallback)

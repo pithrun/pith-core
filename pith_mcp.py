@@ -27,6 +27,7 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode
 
 
 def _bootstrap_mcp_imports():
@@ -147,6 +148,7 @@ EXEC_FALLBACK_COMMAND = os.getenv(
     "PITH_EXEC_FALLBACK_COMMAND",
     f"{Path.home() / '.pith' / 'bin' / 'pith'} api-fallback",
 )
+EXEC_FALLBACK_CAPABILITY_VALUES = {"exec", "unavailable", "unknown"}
 
 # --- Deprecation warnings for legacy env vars ---
 if os.getenv("BRAIN_API_URL") and not os.getenv("PITH_API_URL"):
@@ -187,6 +189,26 @@ BRIDGE_SURFACE_ID = _normalize_bridge_surface_id(os.getenv("PITH_SURFACE_ID"))
 BRIDGE_PLATFORM_HINT = os.getenv("PITH_PLATFORM_HINT", "").strip()
 MCP_CONVERSATION_TURN_COMPACT_MAX_CHARS = 12000
 MCP_CONVERSATION_TURN_FULL_MAX_CHARS = 50000
+
+
+def _default_exec_fallback_capability(surface_id: str) -> str:
+    if surface_id == "claude_desktop_mcp":
+        return "unavailable"
+    if surface_id in {"cursor_mcp", "cline_mcp", "vscode_copilot_mcp", "windsurf_mcp"}:
+        return "exec"
+    return "unknown"
+
+
+def _resolve_exec_fallback_capability(surface_id: str) -> tuple[str, str | None]:
+    raw = os.getenv("PITH_EXEC_FALLBACK_CAPABILITY", "").strip().lower()
+    if raw in EXEC_FALLBACK_CAPABILITY_VALUES:
+        return raw, None
+    if raw:
+        return _default_exec_fallback_capability(surface_id), raw
+    return _default_exec_fallback_capability(surface_id), None
+
+
+EXEC_FALLBACK_CAPABILITY, EXEC_FALLBACK_CAPABILITY_INVALID = _resolve_exec_fallback_capability(BRIDGE_SURFACE_ID)
 
 # RUNG0 Component C (A8): per-origin authorship trust-tier. The Rung-0 loop's launchd
 # unit sets PITH_PROVENANCE=agent_loop on ITS bridge process only; the human's bridge
@@ -386,9 +408,7 @@ def _load_transport_state(*, default_started_at: str | None = None) -> dict[str,
     if not isinstance(existing_bridge_health, dict):
         existing_bridge_health = {}
     merged["bridge_health"] = {
-        **_default_bridge_health(
-            updated_at=existing_bridge_health.get("updated_at", now_iso)
-        ),
+        **_default_bridge_health(updated_at=existing_bridge_health.get("updated_at", now_iso)),
         **existing_bridge_health,
     }
     merged["bridge_health"]["schema_version"] = 2
@@ -462,7 +482,14 @@ def _transport_event(event: str, **kwargs) -> None:
         state = _load_transport_state(default_started_at=entry["ts"])
         state["last_event"] = entry
         state["event_count"] = state.get("event_count", 0) + 1
-        if event == "tool_call" and kwargs.get("phase") == "start":
+        if event == "bridge_start":
+            state["bridge_started_at"] = entry["ts"]
+            state["bridge_pid"] = entry["pid"]
+            state["bridge_surface_id"] = kwargs.get("surface_id")
+            state["exec_fallback_capability"] = kwargs.get("exec_fallback_capability")
+            for key in ("last_tool_name", "last_tool_started_at", "last_tool_completed_at"):
+                state.pop(key, None)
+        elif event == "tool_call" and kwargs.get("phase") == "start":
             state["last_tool_name"] = kwargs.get("tool_name")
             state["last_tool_started_at"] = entry["ts"]
         elif event == "tool_call" and kwargs.get("phase") in ("success", "error"):
@@ -472,6 +499,42 @@ def _transport_event(event: str, **kwargs) -> None:
         _persist_transport_state(state)
     except OSError:
         pass
+
+
+def _emit_lifecycle_api_call_event(
+    operation: str,
+    args: dict[str, Any] | None,
+    result: Any,
+    *,
+    surface_id: str | None = None,
+) -> None:
+    if operation not in {"conversation_turn", "checkpoint", "session_end", "session_learn"}:
+        return
+    request_args = args or {}
+    body = result if isinstance(result, dict) else {}
+    auto_learned = body.get("auto_learned")
+    auto_learned_events = auto_learned.get("events") if isinstance(auto_learned, dict) else None
+    _transport_event(
+        "lifecycle_api_call",
+        operation=operation,
+        transport_mode="mcp_stdio",
+        surface_id=_normalize_bridge_surface_id(surface_id) or BRIDGE_SURFACE_ID,
+        session_id=request_args.get("session_id"),
+        resolved_session_id=body.get("resolved_session_id") or body.get("session_id"),
+        origin_id=request_args.get("origin_id") or body.get("origin_id"),
+        workspace_id=request_args.get("workspace_id") or body.get("workspace_id"),
+        request_id=request_args.get("request_id") or body.get("request_id"),
+        status=body.get("status") or ("error" if body.get("error") is True else "ok"),
+        api_status=body.get("status_code") or body.get("code") or ("error" if body.get("error") is True else "ok"),
+        error=bool(body.get("error") is True),
+        previous_response_present=bool(request_args.get("previous_response")),
+        previous_message_present=bool(request_args.get("previous_message")),
+        extracted_concepts_present=bool(request_args.get("extracted_concepts_json")),
+        auto_learned=bool(auto_learned),
+        learning_events=body.get("learning_events") if body.get("learning_events") is not None else auto_learned_events,
+        accepted_learning_events=body.get("accepted_learning_events"),
+        checkpoint_task_id=request_args.get("task_id") or body.get("task_id"),
+    )
 
 
 def _workstream_render_failure_reason(result: dict[str, Any]) -> str:
@@ -583,17 +646,30 @@ def _validate_startup_auth() -> None:
 
 
 # --- C4: Static fallback instructions ---
-EXEC_FALLBACK_INSTRUCTIONS = ""
-if EXEC_FALLBACK_ENABLED:
-    EXEC_FALLBACK_INSTRUCTIONS = (
-        "\nDEGRADED-MODE EXEC FALLBACK:\n"
-        "If pith MCP returns Transport closed or repeated timeouts, and non-Pith tools still work, stop using Pith MCP tools for this turn.\n"
-        f"1. Verify backend readiness: {EXEC_FALLBACK_COMMAND} readyz\n"
-        f"2. Continue the cognitive loop with stdin JSON, for example: {EXEC_FALLBACK_COMMAND} conversation_turn --stdin-json\n"
-        "3. Use the same fallback surface for checkpoint, session_learn, and session_end until MCP succeeds again.\n"
-        "4. Switch back only after a real Pith MCP call succeeds.\n"
-        "5. Never send the same closeout or checkpoint through both MCP and exec fallback.\n"
+def _render_exec_fallback_instructions() -> str:
+    if not EXEC_FALLBACK_ENABLED:
+        return ""
+    if EXEC_FALLBACK_CAPABILITY == "exec":
+        return (
+            "\nDEGRADED-MODE EXEC FALLBACK:\n"
+            "If pith MCP returns Transport closed or repeated timeouts, and non-Pith tools still work, stop using Pith MCP tools for this turn.\n"
+            f"1. Verify backend readiness: {EXEC_FALLBACK_COMMAND} readyz\n"
+            f"2. Continue the cognitive loop with stdin JSON, for example: {EXEC_FALLBACK_COMMAND} conversation_turn --stdin-json\n"
+            "3. Use the same fallback surface for checkpoint, session_learn, and session_end until MCP succeeds again.\n"
+            "4. Switch back only after a real Pith MCP call succeeds.\n"
+            "5. Never send the same closeout or checkpoint through both MCP and exec fallback.\n"
+        )
+    label = "unavailable" if EXEC_FALLBACK_CAPABILITY == "unavailable" else "unknown"
+    return (
+        f"\nDEGRADED-MODE MCP FAILURE REPORTING (exec fallback {label}):\n"
+        "If pith MCP returns Transport closed or repeated timeouts, do not claim Pith context for this turn.\n"
+        "Report the observed MCP failure and whether pith_bridge_status is still callable.\n"
+        "Do not attempt host-local shell fallback unless this environment explicitly provides one.\n"
+        "Never invent a successful Pith lifecycle call from config or prior memory.\n"
     )
+
+
+EXEC_FALLBACK_INSTRUCTIONS = _render_exec_fallback_instructions()
 
 
 STATIC_FALLBACK_INSTRUCTIONS = f"""⚠️ MANDATORY FIRST ACTION — NON-NEGOTIABLE:
@@ -683,6 +759,7 @@ def _lifecycle_bool_env(name: str, default: bool) -> bool:
     if raw is None or raw.strip() == "":
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
 
 # --- Process lifecycle (separate from session lifecycle) ---
 # Session timeout controls the Pith logical session; process timeout controls the OS process.
@@ -1225,7 +1302,11 @@ def _active_workstream_render_decision(result: dict[str, Any], args: dict[str, A
     else:
         message = str(args.get("message") or "")
         has_overlap = _active_workstream_has_topic_overlap(message, active_workstream)
-        if _active_workstream_explicit_inspection(message):
+        broad_implicit_binding = binding_source in {"origin_id", "session_id"}
+        task_identity_missing = not bool(str(args.get("current_task_id") or "").strip())
+        if broad_implicit_binding and task_identity_missing:
+            reason = "task_identity_required"
+        elif _active_workstream_explicit_inspection(message):
             reason = "explicit_workstream_inspection"
             rendered_block = _format_active_workstream_block(active_workstream)
         elif _active_workstream_exact_continuation(message):
@@ -1474,6 +1555,19 @@ async def call_pith_api(
             }
     # Unreachable, but defensive
     return {"error": True, "code": "RETRY_EXHAUSTED", "message": "All retries failed", "tool": endpoint}
+
+
+def _diagnostic_query(args: dict[str, Any] | None) -> str:
+    args = args or {}
+    params: dict[str, Any] = {
+        "detail": args.get("detail", "fast"),
+        "freshness": args.get("freshness", "fast"),
+    }
+    if "force_refresh" in args:
+        params["force_refresh"] = str(bool(args["force_refresh"])).lower()
+    if "capture_budget_ms" in args:
+        params["capture_budget_ms"] = int(args["capture_budget_ms"])
+    return urlencode(params)
 
 
 async def _perform_durable_write(
@@ -1909,12 +2003,60 @@ TOOL_DEFINITIONS: list[dict] = [
     {
         "name": "pith_stats",
         "description": "Get overall pith statistics and health metrics",
-        "inputSchema": {"type": "object", "properties": {}},
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "detail": {
+                    "type": "string",
+                    "enum": ["fast", "full"],
+                    "description": "Diagnostic detail mode",
+                },
+                "freshness": {
+                    "type": "string",
+                    "enum": ["fast", "authoritative"],
+                    "description": "Capture freshness mode",
+                },
+                "force_refresh": {
+                    "type": "boolean",
+                    "description": "Force bounded refresh for authoritative capture",
+                },
+                "capture_budget_ms": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 5000,
+                    "description": "Bounded capture budget in milliseconds",
+                },
+            },
+        },
     },
     {
         "name": "pith_health",
         "description": "Get detailed health analysis of the Pith system",
-        "inputSchema": {"type": "object", "properties": {}},
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "detail": {
+                    "type": "string",
+                    "enum": ["fast", "full"],
+                    "description": "Diagnostic detail mode",
+                },
+                "freshness": {
+                    "type": "string",
+                    "enum": ["fast", "authoritative"],
+                    "description": "Capture freshness mode",
+                },
+                "force_refresh": {
+                    "type": "boolean",
+                    "description": "Force bounded refresh for authoritative capture",
+                },
+                "capture_budget_ms": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 5000,
+                    "description": "Bounded capture budget in milliseconds",
+                },
+            },
+        },
     },
     {
         "name": "pith_bridge_status",
@@ -2517,23 +2659,59 @@ TOOL_DEFINITIONS: list[dict] = [
                 "description": {"type": "string", "description": "Thread description (optional)"},
                 "urgency": {"type": "string", "enum": ["low", "normal", "high"], "description": "Thread urgency tier"},
                 "goal_ids": {"type": "array", "items": {"type": "string"}, "description": "Goal IDs to associate"},
-                "knowledge_areas": {"type": "array", "items": {"type": "string"}, "description": "Knowledge areas to associate"},
+                "knowledge_areas": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Knowledge areas to associate",
+                },
                 "current_objective": {"type": "string", "description": "Current Workstream objective"},
                 "current_summary": {"type": "string", "description": "Current Workstream summary"},
                 "next_action": {"type": "string", "description": "Next Workstream action"},
-                "blockers": {"type": "array", "items": {"type": "string"}, "description": "Current Workstream blockers"},
-                "quality_state": {"type": "string", "enum": ["ok", "needs_review", "blocked"], "description": "Workstream quality state"},
+                "blockers": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Current Workstream blockers",
+                },
+                "quality_state": {
+                    "type": "string",
+                    "enum": ["ok", "needs_review", "blocked"],
+                    "description": "Workstream quality state",
+                },
                 "origin_id": {"type": "string", "description": "Stable origin ID for raw binding repair"},
                 "session_id": {"type": "string", "description": "Session ID fallback for raw binding repair"},
                 "current_task_id": {"type": "string", "description": "Current task ID for exact binding repair"},
-                "operator_confirmed": {"type": "boolean", "description": "Strict operator confirmation for admin/hygiene writes"},
-                "evaluated_at": {"type": "string", "description": "Dry-run evaluated_at timestamp required for workstream_hygiene_apply"},
-                "fingerprints": {"type": "object", "description": "Dry-run fingerprints required for workstream_hygiene_apply"},
-                "proposed_states": {"type": "object", "description": "Dry-run proposed discovery states required for workstream_hygiene_apply"},
-                "promotion_reason": {"type": "string", "description": "Required reason for workstream_promote_discovery_candidate"},
-                "reason": {"type": "string", "description": "Required reason for workstream_demote_discovery_candidate"},
-                "op_id": {"type": "number", "description": "Optional monotonic operation ID for idempotent raw binding writes"},
-                "payload_hash": {"type": "string", "description": "Optional payload hash for idempotent raw binding writes"},
+                "operator_confirmed": {
+                    "type": "boolean",
+                    "description": "Strict operator confirmation for admin/hygiene writes",
+                },
+                "evaluated_at": {
+                    "type": "string",
+                    "description": "Dry-run evaluated_at timestamp required for workstream_hygiene_apply",
+                },
+                "fingerprints": {
+                    "type": "object",
+                    "description": "Dry-run fingerprints required for workstream_hygiene_apply",
+                },
+                "proposed_states": {
+                    "type": "object",
+                    "description": "Dry-run proposed discovery states required for workstream_hygiene_apply",
+                },
+                "promotion_reason": {
+                    "type": "string",
+                    "description": "Required reason for workstream_promote_discovery_candidate",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Required reason for workstream_demote_discovery_candidate",
+                },
+                "op_id": {
+                    "type": "number",
+                    "description": "Optional monotonic operation ID for idempotent raw binding writes",
+                },
+                "payload_hash": {
+                    "type": "string",
+                    "description": "Optional payload hash for idempotent raw binding writes",
+                },
                 "created_by": {"type": "string", "description": "Workstream creator marker"},
                 "updated_by": {"type": "string", "description": "Workstream updater marker"},
             },
@@ -2762,10 +2940,10 @@ async def _handle_tool(name: str, args: dict) -> dict:
         )
 
     if name == "pith_stats":
-        return await call_pith_api("/pith_stats?detail=fast")
+        return await call_pith_api(f"/pith_stats?{_diagnostic_query(args)}")
 
     if name == "pith_health":
-        return await call_pith_api("/pith_health?detail=fast")
+        return await call_pith_api(f"/pith_health?{_diagnostic_query(args)}")
 
     if name == "pith_bridge_status":
         return _bridge_status()
@@ -2805,8 +2983,12 @@ async def _handle_tool(name: str, args: dict) -> dict:
         }
         if payload["action"] in {"save", "touch", "complete"}:
             payload["request_id"] = args.get("request_id")
-            return await _perform_durable_write("/checkpoint", payload, request_id_prefix="ckpt")
-        return await call_pith_api("/checkpoint", "POST", payload)
+            result = await _perform_durable_write("/checkpoint", payload, request_id_prefix="ckpt")
+            _emit_lifecycle_api_call_event("checkpoint", payload, result, surface_id=BRIDGE_SURFACE_ID)
+            return result
+        result = await call_pith_api("/checkpoint", "POST", payload)
+        _emit_lifecycle_api_call_event("checkpoint", payload, result, surface_id=BRIDGE_SURFACE_ID)
+        return result
 
     if name == "pith_questions":
         limit = args.get("limit", 10)
@@ -2902,6 +3084,7 @@ async def _handle_tool(name: str, args: dict) -> dict:
             if args.get("extracted_concepts_json"):
                 end_payload["extracted_concepts_json"] = args["extracted_concepts_json"]
         result = await _perform_durable_write("/session_end", end_payload, request_id_prefix="se")
+        _emit_lifecycle_api_call_event("session_end", end_payload, result, surface_id=BRIDGE_SURFACE_ID)
         _state["last_session_activity"] = None
         _state["cached_session_id"] = None
         _state["learning_debt"] = 0
@@ -3008,6 +3191,7 @@ async def _handle_tool(name: str, args: dict) -> dict:
 
         _state["last_conv_turn_args"] = args
         result = await call_pith_api("/conversation_turn", "POST", ct_payload)
+        _emit_lifecycle_api_call_event("conversation_turn", ct_payload, result, surface_id=surface_id)
         _apply_active_workstream_render_decision(result, args)
         if result and not result.get("error"):
             resolved_session_id = result.get("resolved_session_id")
@@ -3057,6 +3241,7 @@ async def _handle_tool(name: str, args: dict) -> dict:
             logger.info(f"[session_learn] No extracted concepts. Args keys: {list(args.keys())}")
 
         result = await _perform_durable_write("/session_learn", learn_payload, request_id_prefix="sl")
+        _emit_lifecycle_api_call_event("session_learn", learn_payload, result, surface_id=BRIDGE_SURFACE_ID)
         if result and not result.get("error"):
             _state["last_session_activity"] = time.time()
         return result
@@ -3337,6 +3522,7 @@ def _compact_conversation_turn_result(
         "activation_count": result.get("activation_count"),
         "activated_concepts": _compact_concepts(result.get("activated_concepts")),
         "auto_learned": result.get("auto_learned"),
+        "context_resolution_summary": result.get("context_resolution_summary"),
         "checkpoint_suggested": result.get("checkpoint_suggested"),
         "active_workstream_render": result.get("active_workstream_render"),
         "workstream_activation_gate": result.get("workstream_activation_gate"),
@@ -3498,6 +3684,46 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 # Prevents zombie bridge accumulation. See BRIDGE_LIFECYCLE_IMPL_SPEC.md.
 
 
+def _parse_transport_iso_ts(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.timestamp()
+
+
+def _transport_route_diagnostic_from_state(state: dict[str, Any]) -> dict[str, Any]:
+    bridge_started_at = state.get("bridge_started_at")
+    last_tool_started_at = state.get("last_tool_started_at")
+    bridge_ts = _parse_transport_iso_ts(bridge_started_at)
+    tool_ts = _parse_transport_iso_ts(last_tool_started_at)
+    tool_observed = bool(bridge_ts is not None and tool_ts is not None and tool_ts >= bridge_ts)
+    if tool_observed:
+        route_status = "tool_call_observed"
+        operator_action = "use_lifecycle_status_for_proof"
+    elif bridge_started_at:
+        route_status = "bridge_started_no_tool_call_observed"
+        operator_action = "inspect_host_mcp_routing_or_restart_client"
+    else:
+        route_status = "unknown"
+        operator_action = "inspect_transport_log"
+    return {
+        "schema_version": "transport_route_diagnostic.v1",
+        "status": route_status,
+        "surface_id": state.get("bridge_surface_id"),
+        "bridge_pid": state.get("bridge_pid"),
+        "bridge_started_at": bridge_started_at,
+        "last_tool_started_at": last_tool_started_at,
+        "tool_call_observed_since_start": tool_observed,
+        "proof_effect": "diagnostic_only_not_lifecycle_proof",
+        "operator_action": operator_action,
+    }
+
+
 def _bridge_status() -> dict[str, Any]:
     """Return local bridge diagnostics without calling the backend."""
     runtime_path = Path(__file__).resolve().parent
@@ -3515,6 +3741,12 @@ def _bridge_status() -> dict[str, Any]:
         "transport_state_path": TRANSPORT_STATE_PATH,
         "heartbeat_dir": HEARTBEAT_DIR,
         "last_transport_event": None,
+        "exec_fallback": {
+            "enabled": EXEC_FALLBACK_ENABLED,
+            "capability": EXEC_FALLBACK_CAPABILITY,
+            "invalid_value": EXEC_FALLBACK_CAPABILITY_INVALID,
+            "command": EXEC_FALLBACK_COMMAND if EXEC_FALLBACK_CAPABILITY == "exec" else None,
+        },
         "heartbeats": [],
         "runtime_git_commit": None,
         "runtime_git_status_short": None,
@@ -3549,6 +3781,7 @@ def _bridge_status() -> dict[str, Any]:
             state = json.load(f)
         status["last_transport_event"] = state.get("last_event")
         status["transport_state"] = state
+        status["transport_route_diagnostic"] = _transport_route_diagnostic_from_state(state)
     except (FileNotFoundError, json.JSONDecodeError, OSError) as exc:
         status["transport_state_error"] = str(exc)
 
@@ -4007,7 +4240,12 @@ async def main():
             overlap_detected=True,
             last_overlap=overlap_metadata,
         )
-    _transport_event("bridge_start", prior_session_id=prior_session_id)
+    _transport_event(
+        "bridge_start",
+        prior_session_id=prior_session_id,
+        surface_id=BRIDGE_SURFACE_ID or None,
+        exec_fallback_capability=EXEC_FALLBACK_CAPABILITY,
+    )
 
     # Phase 3: Validate auth
     try:

@@ -211,7 +211,10 @@ def search_verbatim_fts5(
                 SELECT fv.fragment_id, fv.concept_id, fv.{column}, fv.full_content,
                        bm25(fts_verbatim) as bm25_score
                 FROM fts_verbatim fv
+                JOIN concepts c ON c.id = fv.concept_id
                 WHERE fts_verbatim MATCH ?
+                  AND COALESCE(c.status, 'active') = 'active'
+                  AND COALESCE(c.is_current, 1) != 0
                 ORDER BY bm25(fts_verbatim)
                 LIMIT ?
             """, (fts_query, limit)).fetchall()
@@ -297,7 +300,10 @@ def search_verbatim_fts5_dual(
                 SELECT fv.fragment_id, fv.concept_id, fv.user_content, fv.full_content,
                        bm25(fts_verbatim) as bm25_score
                 FROM fts_verbatim fv
+                JOIN concepts c ON c.id = fv.concept_id
                 WHERE fts_verbatim MATCH ?
+                  AND COALESCE(c.status, 'active') = 'active'
+                  AND COALESCE(c.is_current, 1) != 0
                 ORDER BY bm25(fts_verbatim)
                 LIMIT ?
             """, (f"user_content:{fts_query}", limit)).fetchall()
@@ -307,7 +313,10 @@ def search_verbatim_fts5_dual(
                 SELECT fv.fragment_id, fv.concept_id, fv.user_content, fv.full_content,
                        bm25(fts_verbatim) as bm25_score
                 FROM fts_verbatim fv
+                JOIN concepts c ON c.id = fv.concept_id
                 WHERE fts_verbatim MATCH ?
+                  AND COALESCE(c.status, 'active') = 'active'
+                  AND COALESCE(c.is_current, 1) != 0
                 ORDER BY bm25(fts_verbatim)
                 LIMIT ?
             """, (f"full_content:{fts_query}", limit)).fetchall()

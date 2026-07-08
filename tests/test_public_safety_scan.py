@@ -158,7 +158,7 @@ def test_public_facing_classification_true_paths() -> None:
     assert public_safety_scan.is_public_facing_change(
         [
             "README.md",
-            "scripts/install.ps1",
+            "scripts/install.sh",
             "pith-server-latest.tar.gz",
             ".github/pull_request_template.md",
             ".github/scripts/public_safety_scan.py",

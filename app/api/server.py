@@ -169,7 +169,11 @@ def _read_git_head_ref(repo_root: Path = _REPO_ROOT) -> str:
 def _git_commits_match(startup_commit: str, current_head: str) -> bool | None:
     if startup_commit == "unknown" or current_head == "unknown":
         return None
-    return startup_commit == current_head or startup_commit.startswith(current_head) or current_head.startswith(startup_commit)
+    return (
+        startup_commit == current_head
+        or startup_commit.startswith(current_head)
+        or current_head.startswith(startup_commit)
+    )
 
 
 _GIT_COMMIT = _get_git_commit()
@@ -207,6 +211,10 @@ def _env_int(name: str, default: int) -> int:
 _FAST_STATS_CACHE_TTL_S = float(os.environ.get("PITH_FAST_STATS_CACHE_TTL_S", "5"))
 _FAST_STATS_COLD_BUDGET_S = float(os.environ.get("PITH_FAST_STATS_COLD_BUDGET_S", "0.5"))
 _FAST_STATS_MAX_STALE_S = float(os.environ.get("PITH_FAST_STATS_MAX_STALE_S", "60"))
+DIAGNOSTIC_AUTHORITATIVE_CAPTURE_BUDGET_DEFAULT_MS = _env_int(
+    "PITH_DIAGNOSTIC_AUTHORITATIVE_CAPTURE_BUDGET_DEFAULT_MS", 2500
+)
+DIAGNOSTIC_CAPTURE_BUDGET_MAX_MS = _env_int("PITH_DIAGNOSTIC_CAPTURE_BUDGET_MAX_MS", 5000)
 _FAST_STATS_CACHE_LOCK = threading.Lock()
 _FAST_STATS_CACHE: tuple[float, dict] | None = None
 _FAST_STATS_REFRESH_LOCK = threading.Lock()
@@ -297,11 +305,48 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
+_DIAGNOSTIC_WARMER_ALLOWED_MODES = ("all_lanes", "safe_sequential")
+_DIAGNOSTIC_WARMER_ALLOWED_LANES = ("fast_stats", "fast_health", "knowledge_areas")
+
+
+def _parse_diagnostic_warmer_config() -> tuple[str, tuple[str, ...], str | None]:
+    mode = (os.environ.get("PITH_DIAGNOSTIC_WARMER_MODE") or "all_lanes").strip().lower()
+    invalid: str | None = None
+    if mode not in _DIAGNOSTIC_WARMER_ALLOWED_MODES:
+        invalid = f"invalid_mode:{mode or '<empty>'}"
+
+    lanes_raw = os.environ.get("PITH_DIAGNOSTIC_WARMER_LANES")
+    if lanes_raw is None or lanes_raw.strip() == "":
+        lanes = _DIAGNOSTIC_WARMER_ALLOWED_LANES
+    else:
+        lane_parts = tuple(part.strip() for part in lanes_raw.split(",") if part.strip())
+        unknown = tuple(lane for lane in lane_parts if lane not in _DIAGNOSTIC_WARMER_ALLOWED_LANES)
+        duplicates = tuple(lane for lane in lane_parts if lane_parts.count(lane) > 1)
+        if not lane_parts:
+            invalid = invalid or "empty_lanes"
+            lanes = ()
+        elif unknown:
+            invalid = invalid or f"invalid_lanes:{','.join(unknown)}"
+            lanes = ()
+        elif duplicates:
+            invalid = invalid or f"duplicate_lanes:{','.join(dict.fromkeys(duplicates))}"
+            lanes = ()
+        else:
+            lanes = lane_parts
+
+    return mode, lanes, invalid
+
+
 # EUNOMIA-126: timer-driven warmer + starvation watchdog. One daemon thread keeps the
 # diagnostic caches within TTL so a single cold pith_health/pith_stats call after idle
 # reads fresh (partial=false). Reuses the EUNOMIA-125 single-slot refresh path — slot
 # count stays 1 (raising it is EUNOMIA-128). Kill switch defaults OFF.
 _DIAGNOSTIC_WARMER_ENABLED = _env_bool("PITH_DIAGNOSTIC_WARMER_ENABLED", False)
+(
+    _DIAGNOSTIC_WARMER_MODE,
+    _DIAGNOSTIC_WARMER_CONFIGURED_LANES,
+    _DIAGNOSTIC_WARMER_INVALID_CONFIG,
+) = _parse_diagnostic_warmer_config()
 # Interval (s). 0/unset => auto = 0.8 * min(TTL) so raising TTL auto-widens the interval.
 _DIAGNOSTIC_WARMER_INTERVAL_S_RAW = float(os.environ.get("PITH_DIAGNOSTIC_WARMER_INTERVAL_S", "0") or 0)
 # Watchdog: alert when a lane's last_success_age_ms exceeds N * max_stale_ms.
@@ -312,15 +357,19 @@ _DIAGNOSTIC_WATCHDOG_ENQUEUE_REFRESH = _env_bool("PITH_DIAGNOSTIC_WATCHDOG_ENQUE
 _diagnostic_warmer_stop_event = threading.Event()
 _diagnostic_warmer_thread: threading.Thread | None = None
 _DIAGNOSTIC_WARMER_LOCK = threading.Lock()
+_DIAGNOSTIC_WARMER_NEXT_INDEX = 0
 _DIAGNOSTIC_WARMER_OBSERVABILITY: dict[str, int | float | str | bool | None] = {
     "enabled": _DIAGNOSTIC_WARMER_ENABLED,
+    "mode": _DIAGNOSTIC_WARMER_MODE,
     "alive": False,
     "tick_count": 0,
     "warm_submitted_count": 0,
     "watchdog_breach_count": 0,
     "last_tick_monotonic": None,  # internal; surfaced as last_tick_age_ms
     "last_breach_lane": None,
+    "last_submitted_lane": None,
     "interval_s": None,
+    "invalid_config": _DIAGNOSTIC_WARMER_INVALID_CONFIG,
 }
 
 # EUNOMIA-127: contention-immune read-only concept-integrity probe.
@@ -543,13 +592,9 @@ def _diagnostic_warmer_interval_s() -> float:
     return max(0.5, min(interval, ceiling))
 
 
-def _warm_one_tick() -> None:
-    """One warm pass: for each lane, if the cache is older than the just-in-time
-    threshold (TTL - interval), trigger the EXISTING background refresh (dedupes on
-    in-flight). Then run the starvation watchdog. All exceptions are contained."""
-    interval_ms = _diagnostic_warmer_interval_s() * 1000
-    lanes = (
-        (
+def _diagnostic_warmer_lanes() -> tuple[tuple[str, threading.Lock, object, float, object, object], ...]:
+    all_lanes = {
+        "fast_stats": (
             "fast_stats",
             _FAST_STATS_CACHE_LOCK,
             lambda: _FAST_STATS_CACHE,
@@ -557,7 +602,7 @@ def _warm_one_tick() -> None:
             _ensure_fast_stats_refresh_started,
             _fast_stats_observability_snapshot,
         ),
-        (
+        "fast_health": (
             "fast_health",
             _FAST_HEALTH_CACHE_LOCK,
             lambda: _FAST_HEALTH_CACHE,
@@ -565,7 +610,7 @@ def _warm_one_tick() -> None:
             _ensure_fast_health_refresh_started,
             _fast_health_observability_snapshot,
         ),
-        (
+        "knowledge_areas": (
             "knowledge_areas",
             _KNOWLEDGE_AREAS_CACHE_LOCK,
             lambda: _KNOWLEDGE_AREAS_CACHE,
@@ -573,22 +618,57 @@ def _warm_one_tick() -> None:
             _ensure_knowledge_areas_refresh_started,
             _knowledge_areas_observability_snapshot,
         ),
-    )
-    now = time.monotonic()
-    for name, lock, get_cache, ttl_s, ensure_refresh, obs_snapshot in lanes:
+    }
+    if _DIAGNOSTIC_WARMER_INVALID_CONFIG:
+        return ()
+    return tuple(all_lanes[name] for name in _DIAGNOSTIC_WARMER_CONFIGURED_LANES)
+
+
+def _diagnostic_lane_future(name: str) -> concurrent.futures.Future | None:
+    if name == "fast_stats":
+        with _FAST_STATS_REFRESH_LOCK:
+            return _FAST_STATS_REFRESH_FUTURE
+    if name == "fast_health":
+        with _FAST_HEALTH_REFRESH_LOCK:
+            return _FAST_HEALTH_REFRESH_FUTURE
+    if name == "knowledge_areas":
+        with _KNOWLEDGE_AREAS_REFRESH_LOCK:
+            return _KNOWLEDGE_AREAS_REFRESH_FUTURE
+    return None
+
+
+def _diagnostic_refresh_in_flight() -> bool:
+    for lane in _DIAGNOSTIC_WARMER_ALLOWED_LANES:
+        future = _diagnostic_lane_future(lane)
+        if future is not None and not future.done():
+            return True
+    return False
+
+
+def _diagnostic_warmer_lane_due(lane: tuple, now: float, interval_ms: float) -> bool:
+    _name, lock, get_cache, ttl_s, _ensure_refresh, _obs_snapshot = lane
+    ttl_ms = ttl_s * 1000
+    jit_threshold_ms = max(0.0, ttl_ms - interval_ms)
+    with lock:
+        cache = get_cache()
+        age_ms = None if cache is None else int((now - cache[0]) * 1000)
+    return age_ms is None or age_ms >= jit_threshold_ms
+
+
+def _submit_diagnostic_warmer_lane(name: str, ensure_refresh) -> None:
+    previous_future = _diagnostic_lane_future(name)
+    ensure_refresh()
+    if previous_future is None or previous_future.done():
+        with _DIAGNOSTIC_WARMER_LOCK:
+            _DIAGNOSTIC_WARMER_OBSERVABILITY["warm_submitted_count"] = (
+                int(_DIAGNOSTIC_WARMER_OBSERVABILITY["warm_submitted_count"] or 0) + 1
+            )
+            _DIAGNOSTIC_WARMER_OBSERVABILITY["last_submitted_lane"] = name
+
+
+def _diagnostic_warmer_watchdog(lanes: tuple[tuple, ...], *, enqueue_refresh: bool) -> None:
+    for name, _lock, _get_cache, _ttl_s, ensure_refresh, obs_snapshot in lanes:
         try:
-            ttl_ms = ttl_s * 1000
-            jit_threshold_ms = max(0.0, ttl_ms - interval_ms)  # refresh just before the window closes
-            with lock:
-                cache = get_cache()
-                age_ms = None if cache is None else int((now - cache[0]) * 1000)
-            if age_ms is None or age_ms >= jit_threshold_ms:
-                ensure_refresh()  # de-dupes against in-flight; single slot preserved
-                with _DIAGNOSTIC_WARMER_LOCK:
-                    _DIAGNOSTIC_WARMER_OBSERVABILITY["warm_submitted_count"] = (
-                        int(_DIAGNOSTIC_WARMER_OBSERVABILITY["warm_submitted_count"] or 0) + 1
-                    )
-            # Watchdog: starvation = last_success_age_ms > N * max_stale_ms
             snap = obs_snapshot()
             age_success = snap.get("last_success_age_ms")
             max_stale_ms = _fast_stats_max_stale_ms()  # shared 60s SLO bound
@@ -607,10 +687,64 @@ def _warm_one_tick() -> None:
                         int(_DIAGNOSTIC_WARMER_OBSERVABILITY["watchdog_breach_count"] or 0) + 1
                     )
                     _DIAGNOSTIC_WARMER_OBSERVABILITY["last_breach_lane"] = name
-                if _DIAGNOSTIC_WATCHDOG_ENQUEUE_REFRESH:
+                if enqueue_refresh:
                     ensure_refresh()  # normal refresh only — NEVER a semaphore reset (gauntlet1 A4)
         except Exception:
+            logger.debug("diagnostic_warmer watchdog error lane=%s", name, exc_info=True)
+
+
+def _warm_one_tick_all_lanes(lanes: tuple[tuple, ...]) -> None:
+    interval_ms = _diagnostic_warmer_interval_s() * 1000
+    now = time.monotonic()
+    for name, lock, get_cache, ttl_s, ensure_refresh, obs_snapshot in lanes:
+        try:
+            if _diagnostic_warmer_lane_due((name, lock, get_cache, ttl_s, ensure_refresh, obs_snapshot), now, interval_ms):
+                _submit_diagnostic_warmer_lane(name, ensure_refresh)
+        except Exception:
             logger.debug("diagnostic_warmer tick error lane=%s", name, exc_info=True)
+    _diagnostic_warmer_watchdog(lanes, enqueue_refresh=_DIAGNOSTIC_WATCHDOG_ENQUEUE_REFRESH)
+
+
+def _warm_one_tick_safe_sequential(lanes: tuple[tuple, ...]) -> None:
+    global _DIAGNOSTIC_WARMER_NEXT_INDEX
+    if _diagnostic_refresh_in_flight():
+        return
+    interval_ms = _diagnostic_warmer_interval_s() * 1000
+    now = time.monotonic()
+    lane_count = len(lanes)
+    if lane_count == 0:
+        return
+    with _DIAGNOSTIC_WARMER_LOCK:
+        start_index = _DIAGNOSTIC_WARMER_NEXT_INDEX % lane_count
+    for offset in range(lane_count):
+        lane_index = (start_index + offset) % lane_count
+        name, lock, get_cache, ttl_s, ensure_refresh, obs_snapshot = lanes[lane_index]
+        try:
+            if _diagnostic_warmer_lane_due((name, lock, get_cache, ttl_s, ensure_refresh, obs_snapshot), now, interval_ms):
+                _submit_diagnostic_warmer_lane(name, ensure_refresh)
+                with _DIAGNOSTIC_WARMER_LOCK:
+                    _DIAGNOSTIC_WARMER_NEXT_INDEX = (lane_index + 1) % lane_count
+                break
+        except Exception:
+            logger.debug("diagnostic_warmer tick error lane=%s", name, exc_info=True)
+    _diagnostic_warmer_watchdog(lanes, enqueue_refresh=False)
+
+
+def _warm_one_tick() -> None:
+    """Warm diagnostic caches according to the configured mode.
+
+    ``all_lanes`` preserves legacy behavior for explicit rollback testing.
+    ``safe_sequential`` submits at most one eligible lane per tick and skips
+    submission while any diagnostic refresh future is still in flight.
+    """
+    lanes = _diagnostic_warmer_lanes()
+    if _DIAGNOSTIC_WARMER_INVALID_CONFIG:
+        logger.error("diagnostic_warmer invalid config: %s", _DIAGNOSTIC_WARMER_INVALID_CONFIG)
+        return
+    if _DIAGNOSTIC_WARMER_MODE == "safe_sequential":
+        _warm_one_tick_safe_sequential(lanes)
+        return
+    _warm_one_tick_all_lanes(lanes)
 
 
 def _diagnostic_warmer_loop() -> None:
@@ -638,6 +772,9 @@ def start_diagnostic_warmer() -> None:
     if not _DIAGNOSTIC_WARMER_ENABLED:
         logger.info("diagnostic_warmer disabled (PITH_DIAGNOSTIC_WARMER_ENABLED off)")
         return
+    if _DIAGNOSTIC_WARMER_INVALID_CONFIG:
+        logger.error("diagnostic_warmer disabled by invalid config: %s", _DIAGNOSTIC_WARMER_INVALID_CONFIG)
+        return
     with _DIAGNOSTIC_WARMER_LOCK:
         if _diagnostic_warmer_thread is not None and _diagnostic_warmer_thread.is_alive():
             return
@@ -647,7 +784,9 @@ def start_diagnostic_warmer() -> None:
         )
         _diagnostic_warmer_thread.start()
     logger.info(
-        "diagnostic_warmer started interval_s=%.2f breach_mult=%d",
+        "diagnostic_warmer started mode=%s lanes=%s interval_s=%.2f breach_mult=%d",
+        _DIAGNOSTIC_WARMER_MODE,
+        ",".join(_DIAGNOSTIC_WARMER_CONFIGURED_LANES),
         _diagnostic_warmer_interval_s(),
         _DIAGNOSTIC_WATCHDOG_BREACH_MULT,
     )
@@ -675,6 +814,9 @@ def _diagnostic_warmer_snapshot() -> dict:
         snap = dict(_DIAGNOSTIC_WARMER_OBSERVABILITY)
     last_tick = snap.pop("last_tick_monotonic", None)
     snap["last_tick_age_ms"] = None if last_tick is None else round((time.monotonic() - last_tick) * 1000)
+    snap["mode"] = _DIAGNOSTIC_WARMER_MODE
+    snap["configured_lanes"] = list(_DIAGNOSTIC_WARMER_CONFIGURED_LANES)
+    snap["invalid_config"] = _DIAGNOSTIC_WARMER_INVALID_CONFIG
     fast_stats_obs = _fast_stats_observability_snapshot()
     fast_health_obs = _fast_health_observability_snapshot()
     knowledge_areas_obs = _knowledge_areas_observability_snapshot()
@@ -736,6 +878,7 @@ def _read_canonical_head(runtime_head: str) -> str:
         return _read_git_head_commit(_CANONICAL_REPO_ROOT)
     except Exception:
         return runtime_head
+
 
 from app.api.write_durability import (
     abandon_write_request,
@@ -949,7 +1092,7 @@ def auto_associate_single(*args: Any, **kwargs: Any) -> Any:
 # MATURITY-001: Maturities blocked from external API results
 _BLOCKED_MATURITIES = {"QUARANTINED", "DISCARDED"}
 
-SERVER_VERSION = os.environ.get("PITH_VERSION", "1.0.5")
+SERVER_VERSION = os.environ.get("PITH_VERSION", "1.0.6")
 
 app = FastAPI(
     title="Pith Server",
@@ -1030,6 +1173,7 @@ def _pith_orient_payload_with_workstreams(
     )
     payload["orientation_hash"] = _pith_orient_payload_hash(payload)
     return payload
+
 
 app.state.process_state = "starting"
 app.state.write_state = "queued"
@@ -1305,9 +1449,7 @@ def _build_auth_status(request: Request | None = None) -> dict:
 
     caller_key = request.headers.get("X-API-Key", "") if request else ""
     key_configured = bool(API_KEY)
-    caller_authenticated = (
-        key_configured and bool(caller_key) and hmac.compare_digest(caller_key, API_KEY)
-    )
+    caller_authenticated = key_configured and bool(caller_key) and hmac.compare_digest(caller_key, API_KEY)
     if caller_authenticated:
         write_path = "ok"
     elif not key_configured:
@@ -1368,6 +1510,12 @@ def _build_ready_state() -> dict:
         retrieval_index["state"] = retrieval_state
     except Exception as exc:
         retrieval_index = {"state": "unknown", "error": _safe_error(exc)}
+    try:
+        semantic_full_search_state = retrieval_engine.semantic_full_search_state()
+        semantic_warm_readiness = retrieval_engine.semantic_warm_readiness_snapshot()
+    except Exception as exc:
+        semantic_full_search_state = "unknown"
+        semantic_warm_readiness = {"state": "unknown", "error": _safe_error(exc)}
     return {
         "status": "healthy" if process_state in {"starting", "running"} else "stopping",
         "service": "pith",
@@ -1378,6 +1526,8 @@ def _build_ready_state() -> dict:
         "process_state": process_state,
         "write_state": write_state,
         "retrieval_state": retrieval_state,
+        "semantic_full_search_state": semantic_full_search_state,
+        "semantic_warm_readiness": semantic_warm_readiness,
         "retrieval_index": retrieval_index,
         "maintenance_state": maintenance_state,
         "degraded_reason": degraded_reason,
@@ -1533,7 +1683,9 @@ def _build_maintenance_health() -> dict[str, Any]:
     )
     if external_absence_only:
         external_health["alert"] = False
-        external_health["message"] = "External launchd scheduler is not installed (optional; built-in maintenance is running)."
+        external_health["message"] = (
+            "External launchd scheduler is not installed (optional; built-in maintenance is running)."
+        )
 
     heartbeat = external_health.get("heartbeat", {})
     external_scheduler = external_health.get("external_launchd_scheduler", {})
@@ -1572,6 +1724,8 @@ def _effective_maintenance_state(
     if external_state == "never_run":
         return "scheduled", "external"
     return "disabled", "none"
+
+
 def _require_thread_reorg_ready(*, require_write: bool = False, require_retrieval_ready: bool = False) -> None:
     """Reject THREAD-004 requests when startup/recovery state makes them unsafe."""
     ready = _build_ready_state()
@@ -1769,11 +1923,7 @@ async def _maybe_prewarm_required_context() -> None:
             {"result": "error", "state": type(e).__name__},
         )
         _metrics.flush()
-        severity = (
-            "critical"
-            if _env_flag("PITH_STAGE3B_REQUIRED_CONTEXT_PREWARM_REQUIRED", False)
-            else "degraded"
-        )
+        severity = "critical" if _env_flag("PITH_STAGE3B_REQUIRED_CONTEXT_PREWARM_REQUIRED", False) else "degraded"
         app.state.startup_warnings.append(
             {
                 "component": "required_context_prewarm",
@@ -1787,14 +1937,68 @@ async def _maybe_prewarm_required_context() -> None:
         logger.warning("Startup: Required context prewarm failed (degraded): %s", e, exc_info=True)
 
 
+def _installer_disables_embeddings() -> bool:
+    """Return true when the installer explicitly selected TF-IDF fallback."""
+    candidate_homes: list[Path] = []
+    if os.environ.get("PITH_HOME"):
+        candidate_homes.append(Path(os.environ["PITH_HOME"]))
+    candidate_homes.extend([_REPO_ROOT.parent, Path(os.path.expanduser("~/.pith"))])
+
+    seen: set[Path] = set()
+    capability_files: list[Path] = []
+    for home in candidate_homes:
+        try:
+            resolved_home = home.expanduser().resolve()
+        except Exception:
+            resolved_home = home.expanduser()
+        if resolved_home in seen:
+            continue
+        seen.add(resolved_home)
+        capability_files.append(resolved_home / ".install_capabilities")
+
+    try:
+        for capabilities_path in capability_files:
+            if not capabilities_path.exists():
+                continue
+            capabilities = capabilities_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+            for line in capabilities:
+                key, _, value = line.partition("=")
+                if key.strip().lower() == "embeddings":
+                    return value.strip().lower() == "false"
+    except Exception:
+        return False
+    return False
+
+
 async def _warm_embeddings_for_startup() -> None:
     """Warm semantic embeddings without blocking retrieval readiness."""
     try:
         from app.storage.embedding import embedding_engine
 
+        retrieval_engine.record_semantic_warm_readiness(
+            state="running",
+            source="startup",
+            result="startup_warmup_started",
+            query_path_warmed=False,
+        )
+        if not embedding_engine.is_available and _installer_disables_embeddings():
+            logger.info("Startup: embedding warmup skipped; installer selected TF-IDF fallback")
+            retrieval_engine.record_semantic_warm_readiness(
+                state="skipped",
+                source="startup",
+                result="installer_tfidf_fallback",
+                query_path_warmed=False,
+            )
+            return
+
         await asyncio.to_thread(embedding_engine.load_model)
         logger.info("Startup: embedding model pre-loaded (PERF-035)")
         await asyncio.to_thread(retrieval_engine._init_embeddings)
+        retrieval_engine.record_semantic_warm_readiness(
+            state="running",
+            source="startup",
+            result="index_initialized",
+        )
         logger.info(
             "Startup: semantic embedding index warmed: %s concepts (PERF-076)",
             embedding_engine.index_size,
@@ -1805,15 +2009,39 @@ async def _warm_embeddings_for_startup() -> None:
                 "startup semantic retrieval warmup",
                 1,
             )
+            retrieval_engine.record_semantic_warm_readiness(
+                state="ready",
+                source="startup",
+                result="success",
+                query_path_warmed=True,
+            )
             logger.info("Startup: semantic retrieval query path warmed (PERF-076)")
+        else:
+            retrieval_engine.record_semantic_warm_readiness(
+                state="skipped",
+                source="startup",
+                result="empty_index",
+                query_path_warmed=False,
+            )
     except asyncio.CancelledError:
         logger.info("Startup: semantic embedding warmup cancelled")
+        retrieval_engine.record_semantic_warm_readiness(
+            state="cancelled",
+            source="startup",
+            result="cancelled",
+            query_path_warmed=False,
+        )
         raise
     except Exception as e:
-        logger.warning(f"Startup: embedding warmup failed (non-fatal): {e}")
-        app.state.startup_warnings.append(
-            {"component": "embedding_warmup", "severity": "degraded", "message": str(e)}
+        retrieval_engine.record_semantic_warm_readiness(
+            state="failed",
+            source="startup",
+            result="error",
+            error=type(e).__name__,
+            query_path_warmed=False,
         )
+        logger.warning(f"Startup: embedding warmup failed (non-fatal): {e}")
+        app.state.startup_warnings.append({"component": "embedding_warmup", "severity": "degraded", "message": str(e)})
 
 
 async def _warm_reranker_for_startup() -> None:
@@ -1839,9 +2067,7 @@ async def _warm_reranker_for_startup() -> None:
         raise
     except Exception as e:
         logger.warning(f"Startup: reranker warmup failed (non-fatal): {e}")
-        app.state.startup_warnings.append(
-            {"component": "reranker_warmup", "severity": "degraded", "message": str(e)}
-        )
+        app.state.startup_warnings.append({"component": "reranker_warmup", "severity": "degraded", "message": str(e)})
 
 
 async def _run_deferred_startup_warmups(
@@ -2284,8 +2510,7 @@ async def startup_event():
         except OSError:
             pass
         logger.warning(
-            "STABILITY-044: server.disabled flag present (%s). "
-            "Exiting early. Remove flag and restart to recover.",
+            "STABILITY-044: server.disabled flag present (%s). Exiting early. Remove flag and restart to recover.",
             _reason,
         )
         raise RuntimeError(f"server.disabled: {_reason}")
@@ -2424,7 +2649,9 @@ def _register_signal_handlers():
                 _source = f"pid={_ppid}"
             else:
                 try:
-                    _pname = subprocess.check_output(["ps", "-p", str(_ppid), "-o", "comm="], timeout=1).decode().strip()
+                    _pname = (
+                        subprocess.check_output(["ps", "-p", str(_ppid), "-o", "comm="], timeout=1).decode().strip()
+                    )
                     _source = f"parent:{_pname}(pid={_ppid})"
                 except Exception:
                     _source = f"pid={_ppid}"
@@ -2621,11 +2848,7 @@ def update_answer_path_policy(
     _require_local_operator(request)
     ready = _build_ready_state()
     if ready["process_state"] != "running" or ready["retrieval_state"] == "recovering":
-        reason = (
-            "process_not_running"
-            if ready["process_state"] != "running"
-            else "retrieval_recovering"
-        )
+        reason = "process_not_running" if ready["process_state"] != "running" else "retrieval_recovering"
         _record_answer_path_policy_metric(
             "answer_path_policy_reject_total",
             {"reason": reason, "source": "runtime_api"},
@@ -2695,7 +2918,11 @@ def _resolve_health_detail(request: Request, detail: str | None = None) -> str:
         values = list(query_params.getlist("detail"))
     if len(values) > 1:
         raise HTTPException(status_code=400, detail="detail must be one of: summary, full, auto")
-    raw_detail = detail if detail is not None else (values[0] if values else os.environ.get("PITH_HEALTH_DEFAULT_DETAIL", "summary"))
+    raw_detail = (
+        detail
+        if detail is not None
+        else (values[0] if values else os.environ.get("PITH_HEALTH_DEFAULT_DETAIL", "summary"))
+    )
     resolved = str(raw_detail or "summary").strip().lower()
     if resolved not in {"summary", "full", "auto"}:
         raise HTTPException(status_code=400, detail="detail must be one of: summary, full, auto")
@@ -2703,8 +2930,10 @@ def _resolve_health_detail(request: Request, detail: str | None = None) -> str:
 
 
 def _pressure_state_active_contention(pressure_state: Any | None) -> bool:
-    payload = pressure_state.to_dict() if hasattr(pressure_state, "to_dict") else (
-        pressure_state if isinstance(pressure_state, dict) else {}
+    payload = (
+        pressure_state.to_dict()
+        if hasattr(pressure_state, "to_dict")
+        else (pressure_state if isinstance(pressure_state, dict) else {})
     )
     return bool(payload.get("active_contention"))
 
@@ -2717,8 +2946,10 @@ def _env_float(name: str, default: float) -> float:
 
 
 def _pressure_state_level(pressure_state: Any | None) -> str:
-    payload = pressure_state.to_dict() if hasattr(pressure_state, "to_dict") else (
-        pressure_state if isinstance(pressure_state, dict) else {}
+    payload = (
+        pressure_state.to_dict()
+        if hasattr(pressure_state, "to_dict")
+        else (pressure_state if isinstance(pressure_state, dict) else {})
     )
     return str(payload.get("pressure_level") or "none")
 
@@ -2877,7 +3108,11 @@ def health_check(request: Request, detail: str | None = None):
                 if health_detail == "full":
                     defer_reason = "pressure_protected_health"
                 else:
-                    defer_reason = "active_contention" if _pressure_state_active_contention(pressure_state) else "pressure_protected_health"
+                    defer_reason = (
+                        "active_contention"
+                        if _pressure_state_active_contention(pressure_state)
+                        else "pressure_protected_health"
+                    )
             elif budget_defer:
                 defer_reason = "health_detail_budget_exhausted"
             else:
@@ -2918,6 +3153,7 @@ def health_check(request: Request, detail: str | None = None):
             ready["components"] = {
                 "storage": "ok",
                 "retrieval_index": ready["retrieval_state"],
+                "semantic_full_search": ready.get("semantic_full_search_state", "unknown"),
                 "activation_engine": "ok",
                 "goal_engine": "ok",
                 "curiosity_engine": "ok",
@@ -3024,13 +3260,75 @@ def health_check(request: Request, detail: str | None = None):
             }
 
 
+def _bounded_capture_budget_ms(raw: int | None, *, default_ms: int) -> int:
+    if raw is None:
+        return max(1, min(int(default_ms), DIAGNOSTIC_CAPTURE_BUDGET_MAX_MS))
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="capture_budget_ms must be an integer")
+    return max(1, min(value, DIAGNOSTIC_CAPTURE_BUDGET_MAX_MS))
+
+
+def _fast_capture_budget_ms(section: str) -> int:
+    if section == "fast_health":
+        return max(1, int(_FAST_HEALTH_COLD_BUDGET_S * 1000))
+    return max(1, int(_FAST_STATS_COLD_BUDGET_S * 1000))
+
+
+def _validate_diagnostic_freshness(freshness: str) -> None:
+    if freshness not in {"fast", "authoritative"}:
+        raise HTTPException(status_code=400, detail="freshness must be 'fast' or 'authoritative'")
+
+
+def _annotate_capture_contract(
+    payload: dict,
+    *,
+    requested_freshness: str,
+    authoritative: bool,
+    value_semantics: str,
+    degraded_reason: str | None,
+    capture_budget_ms: int,
+    capture_started: float | None = None,
+) -> dict:
+    if value_semantics not in {"real", "stale", "placeholder", "unavailable"}:
+        raise ValueError(f"invalid diagnostic value semantics: {value_semantics}")
+    annotated = dict(payload)
+    annotated["capture_degraded"] = bool(degraded_reason or value_semantics in {"stale", "placeholder", "unavailable"})
+    annotated["capture_degraded_reason"] = degraded_reason
+    annotated["capture_value_semantics"] = value_semantics
+    annotated["authoritative"] = authoritative
+    annotated["requested_freshness"] = requested_freshness
+    annotated["capture_budget_ms"] = capture_budget_ms
+    if capture_started is not None:
+        annotated["capture_elapsed_ms"] = round((time.monotonic() - capture_started) * 1000, 2)
+    return annotated
+
+
 @app.get("/pith_stats")
-def pith_stats(detail: str = "fast"):
+def pith_stats(
+    detail: str = "fast",
+    freshness: str = "fast",
+    force_refresh: bool = False,
+    capture_budget_ms: str | None = None,
+):
     """Get overall pith statistics via aggregate SQL (no N+1 loop)."""
     with request_db_scope("pith_stats"):
         if detail not in {"fast", "full"}:
             raise HTTPException(status_code=400, detail="detail must be 'fast' or 'full'")
+        _validate_diagnostic_freshness(freshness)
+        if capture_budget_ms is not None:
+            _bounded_capture_budget_ms(
+                capture_budget_ms,
+                default_ms=DIAGNOSTIC_AUTHORITATIVE_CAPTURE_BUDGET_DEFAULT_MS,
+            )
         if detail == "fast":
+            if freshness == "authoritative":
+                budget_ms = _bounded_capture_budget_ms(
+                    capture_budget_ms,
+                    default_ms=DIAGNOSTIC_AUTHORITATIVE_CAPTURE_BUDGET_DEFAULT_MS,
+                )
+                return _build_pith_stats_authoritative_cached(budget_ms, force_refresh=force_refresh)
             return _build_pith_stats_fast_cached()
 
         from app.storage import get_pith_stats_aggregates
@@ -3075,7 +3373,17 @@ def pith_stats(detail: str = "fast"):
         agg.setdefault("partial", False)
         agg.setdefault("section_errors", {})
         agg.setdefault("section_timings_ms", {})
-        return agg
+        return _annotate_capture_contract(
+            agg,
+            requested_freshness=freshness,
+            authoritative=freshness == "authoritative",
+            value_semantics="real",
+            degraded_reason=None,
+            capture_budget_ms=_bounded_capture_budget_ms(
+                capture_budget_ms,
+                default_ms=DIAGNOSTIC_AUTHORITATIVE_CAPTURE_BUDGET_DEFAULT_MS,
+            ),
+        )
 
 
 def _build_pith_stats_fast_payload() -> dict:
@@ -3099,7 +3407,15 @@ def _build_pith_stats_fast_payload() -> dict:
             "section_errors": section_errors,
         }
     )
-    return _annotate_fast_stats_freshness(payload, "fresh", "ok", "cache_fresh", cache_age_ms=0)
+    payload = _annotate_fast_stats_freshness(payload, "fresh", "ok", "cache_fresh", cache_age_ms=0)
+    return _annotate_capture_contract(
+        payload,
+        requested_freshness="fast",
+        authoritative=False,
+        value_semantics="real",
+        degraded_reason=None,
+        capture_budget_ms=_fast_capture_budget_ms("fast_stats"),
+    )
 
 
 def _fast_stats_max_stale_ms() -> int:
@@ -3191,9 +3507,7 @@ def _record_fast_stats_refresh_observation(success: bool, duration_ms: float, er
 
 def _record_fast_stats_stale_served() -> None:
     with _FAST_STATS_REFRESH_LOCK:
-        _FAST_STATS_OBSERVABILITY["stale_served_count"] = (
-            int(_FAST_STATS_OBSERVABILITY["stale_served_count"] or 0) + 1
-        )
+        _FAST_STATS_OBSERVABILITY["stale_served_count"] = int(_FAST_STATS_OBSERVABILITY["stale_served_count"] or 0) + 1
 
 
 def _record_fast_health_refresh_observation(success: bool, duration_ms: float, error: str | None = None) -> None:
@@ -3340,7 +3654,76 @@ def _build_pith_stats_fast_cached() -> dict:
         return _build_empty_fast_stats_payload(_safe_error(err))
 
 
-def _build_stale_diagnostic_payload(cache_entry: tuple[float, dict], section: str, error: str) -> dict:
+def _build_pith_stats_authoritative_cached(capture_budget_ms: int, *, force_refresh: bool = False) -> dict:
+    """Run an opt-in bounded stats refresh for governance captures."""
+    capture_started = time.monotonic()
+    refresh_future = (
+        _DIAGNOSTIC_REFRESH_EXECUTOR.submit(_refresh_fast_stats_cache)
+        if force_refresh
+        else _ensure_fast_stats_refresh_started()
+    )
+    try:
+        payload = refresh_future.result(timeout=max(0.001, capture_budget_ms / 1000))
+        return _annotate_capture_contract(
+            payload,
+            requested_freshness="authoritative",
+            authoritative=True,
+            value_semantics="real",
+            degraded_reason=None,
+            capture_budget_ms=capture_budget_ms,
+            capture_started=capture_started,
+        )
+    except concurrent.futures.TimeoutError:
+        with _FAST_STATS_CACHE_LOCK:
+            stale_cache = _FAST_STATS_CACHE
+        if stale_cache is not None:
+            return _build_stale_diagnostic_payload(
+                stale_cache,
+                "fast_stats",
+                "authoritative_budget_exceeded",
+                requested_freshness="authoritative",
+                authoritative=False,
+                capture_budget_ms=capture_budget_ms,
+                capture_started=capture_started,
+            )
+        return _build_empty_fast_stats_payload(
+            "budget_exceeded",
+            requested_freshness="authoritative",
+            capture_budget_ms=capture_budget_ms,
+            capture_started=capture_started,
+        )
+    except Exception as err:
+        error = _safe_error(err)
+        with _FAST_STATS_CACHE_LOCK:
+            stale_cache = _FAST_STATS_CACHE
+        if stale_cache is not None:
+            return _build_stale_diagnostic_payload(
+                stale_cache,
+                "fast_stats",
+                error,
+                requested_freshness="authoritative",
+                authoritative=False,
+                capture_budget_ms=capture_budget_ms,
+                capture_started=capture_started,
+            )
+        return _build_empty_fast_stats_payload(
+            error,
+            requested_freshness="authoritative",
+            capture_budget_ms=capture_budget_ms,
+            capture_started=capture_started,
+        )
+
+
+def _build_stale_diagnostic_payload(
+    cache_entry: tuple[float, dict],
+    section: str,
+    error: str,
+    *,
+    requested_freshness: str = "fast",
+    authoritative: bool = False,
+    capture_budget_ms: int | None = None,
+    capture_started: float | None = None,
+) -> dict:
     cached_at, cached_payload = cache_entry
     payload = dict(cached_payload)
     errors = dict(payload.get("section_errors") or {})
@@ -3364,12 +3747,27 @@ def _build_stale_diagnostic_payload(cache_entry: tuple[float, dict], section: st
             "section_errors": errors,
         }
     )
-    return _annotate_fast_stats_freshness(
+    payload = _annotate_fast_stats_freshness(
         payload, state, status, reason, cache_age_ms=cache_age_ms, observability=observability
+    )
+    return _annotate_capture_contract(
+        payload,
+        requested_freshness=requested_freshness,
+        authoritative=authoritative,
+        value_semantics="stale",
+        degraded_reason=error,
+        capture_budget_ms=capture_budget_ms or _fast_capture_budget_ms(section),
+        capture_started=capture_started,
     )
 
 
-def _build_empty_fast_stats_payload(error: str) -> dict:
+def _build_empty_fast_stats_payload(
+    error: str,
+    *,
+    requested_freshness: str = "fast",
+    capture_budget_ms: int | None = None,
+    capture_started: float | None = None,
+) -> dict:
     if error == "budget_exceeded":
         state, status, reason = "cold_budget_exceeded", "warning", "budget_exceeded"
     else:
@@ -3389,11 +3787,30 @@ def _build_empty_fast_stats_payload(error: str) -> dict:
         "data_quality": {"null_timestamps": 0, "bad_json": 0},
         "pending_questions": 0,
     }
-    return _annotate_fast_stats_freshness(payload, state, status, reason, cache_age_ms=0)
+    payload = _annotate_fast_stats_freshness(payload, state, status, reason, cache_age_ms=0)
+    return _annotate_capture_contract(
+        payload,
+        requested_freshness=requested_freshness,
+        authoritative=False,
+        value_semantics="placeholder",
+        degraded_reason=error,
+        capture_budget_ms=capture_budget_ms or _fast_capture_budget_ms("fast_stats"),
+        capture_started=capture_started,
+    )
 
 
-def _build_empty_fast_health_payload(error: str) -> dict:
-    return {
+def _build_empty_fast_health_payload(
+    error: str,
+    *,
+    requested_freshness: str = "fast",
+    capture_budget_ms: int | None = None,
+    capture_started: float | None = None,
+) -> dict:
+    if error == "budget_exceeded":
+        state, status, reason = "cold_budget_exceeded", "warning", "budget_exceeded"
+    else:
+        state, status, reason = "cold_failed", "degraded", error
+    payload = {
         "mode": "fast",
         "generated_at": _utc_now_iso(),
         "cache_age_ms": 0,
@@ -3406,6 +3823,23 @@ def _build_empty_fast_health_payload(error: str) -> dict:
         "avg_confidence": 0.0,
         "avg_stability": 0.0,
     }
+    payload = _annotate_fast_stats_freshness(
+        payload,
+        state,
+        status,
+        reason,
+        cache_age_ms=0,
+        observability=_fast_health_observability_snapshot(),
+    )
+    return _annotate_capture_contract(
+        payload,
+        requested_freshness=requested_freshness,
+        authoritative=False,
+        value_semantics="placeholder",
+        degraded_reason=error,
+        capture_budget_ms=capture_budget_ms or _fast_capture_budget_ms("fast_health"),
+        capture_started=capture_started,
+    )
 
 
 def _refresh_fast_health_cache() -> dict:
@@ -3440,8 +3874,20 @@ def _refresh_fast_health_cache() -> dict:
         duration_ms = (time.perf_counter() - started) * 1000
         _record_fast_health_refresh_observation(True, duration_ms)
         health = _annotate_fast_stats_freshness(
-            health, "fresh", "ok", "cache_fresh", cache_age_ms=0,
+            health,
+            "fresh",
+            "ok",
+            "cache_fresh",
+            cache_age_ms=0,
             observability=_fast_health_observability_snapshot(),
+        )
+        health = _annotate_capture_contract(
+            health,
+            requested_freshness="fast",
+            authoritative=False,
+            value_semantics="real",
+            degraded_reason=None,
+            capture_budget_ms=_fast_capture_budget_ms("fast_health"),
         )
         with _FAST_HEALTH_CACHE_LOCK:
             _FAST_HEALTH_CACHE = (time.monotonic(), dict(health))
@@ -3493,7 +3939,14 @@ def _build_pith_health_fast_cached() -> dict:
             if cache_age_ms <= int(_FAST_HEALTH_CACHE_TTL_S * 1000):
                 payload = dict(cached_payload)
                 payload["cache_age_ms"] = cache_age_ms
-                return payload
+                return _annotate_capture_contract(
+                    payload,
+                    requested_freshness="fast",
+                    authoritative=False,
+                    value_semantics="real",
+                    degraded_reason=None,
+                    capture_budget_ms=_fast_capture_budget_ms("fast_health"),
+                )
             stale_cache = (cached_at, dict(cached_payload))
         else:
             stale_cache = None
@@ -3502,9 +3955,7 @@ def _build_pith_health_fast_cached() -> dict:
     if stale_cache is not None:
         with _FAST_HEALTH_REFRESH_LOCK:
             refresh_error = _FAST_HEALTH_REFRESH_ERROR
-        return _build_stale_diagnostic_payload(
-            stale_cache, "fast_health", refresh_error or "refresh_in_progress"
-        )
+        return _build_stale_diagnostic_payload(stale_cache, "fast_health", refresh_error or "refresh_in_progress")
 
     try:
         return refresh_future.result(timeout=max(0.001, _FAST_HEALTH_COLD_BUDGET_S))
@@ -3512,6 +3963,66 @@ def _build_pith_health_fast_cached() -> dict:
         return _build_empty_fast_health_payload("budget_exceeded")
     except Exception as err:
         return _build_empty_fast_health_payload(_safe_error(err))
+
+
+def _build_pith_health_authoritative_cached(capture_budget_ms: int, *, force_refresh: bool = False) -> dict:
+    """Run an opt-in bounded health refresh for governance captures."""
+    capture_started = time.monotonic()
+    refresh_future = (
+        _DIAGNOSTIC_REFRESH_EXECUTOR.submit(_refresh_fast_health_cache)
+        if force_refresh
+        else _ensure_fast_health_refresh_started()
+    )
+    try:
+        payload = refresh_future.result(timeout=max(0.001, capture_budget_ms / 1000))
+        return _annotate_capture_contract(
+            payload,
+            requested_freshness="authoritative",
+            authoritative=True,
+            value_semantics="real",
+            degraded_reason=None,
+            capture_budget_ms=capture_budget_ms,
+            capture_started=capture_started,
+        )
+    except concurrent.futures.TimeoutError:
+        with _FAST_HEALTH_CACHE_LOCK:
+            stale_cache = _FAST_HEALTH_CACHE
+        if stale_cache is not None:
+            return _build_stale_diagnostic_payload(
+                stale_cache,
+                "fast_health",
+                "authoritative_budget_exceeded",
+                requested_freshness="authoritative",
+                authoritative=False,
+                capture_budget_ms=capture_budget_ms,
+                capture_started=capture_started,
+            )
+        return _build_empty_fast_health_payload(
+            "budget_exceeded",
+            requested_freshness="authoritative",
+            capture_budget_ms=capture_budget_ms,
+            capture_started=capture_started,
+        )
+    except Exception as err:
+        error = _safe_error(err)
+        with _FAST_HEALTH_CACHE_LOCK:
+            stale_cache = _FAST_HEALTH_CACHE
+        if stale_cache is not None:
+            return _build_stale_diagnostic_payload(
+                stale_cache,
+                "fast_health",
+                error,
+                requested_freshness="authoritative",
+                authoritative=False,
+                capture_budget_ms=capture_budget_ms,
+                capture_started=capture_started,
+            )
+        return _build_empty_fast_health_payload(
+            error,
+            requested_freshness="authoritative",
+            capture_budget_ms=capture_budget_ms,
+            capture_started=capture_started,
+        )
 
 
 def _build_empty_knowledge_areas_payload(error: str) -> dict:
@@ -3618,9 +4129,7 @@ def _build_knowledge_areas_cached() -> dict:
     if stale_cache is not None:
         with _KNOWLEDGE_AREAS_REFRESH_LOCK:
             refresh_error = _KNOWLEDGE_AREAS_REFRESH_ERROR
-        return _build_stale_diagnostic_payload(
-            stale_cache, "knowledge_areas", refresh_error or "refresh_in_progress"
-        )
+        return _build_stale_diagnostic_payload(stale_cache, "knowledge_areas", refresh_error or "refresh_in_progress")
 
     try:
         return refresh_future.result(timeout=max(0.001, _KNOWLEDGE_AREAS_COLD_BUDGET_S))
@@ -3631,7 +4140,13 @@ def _build_knowledge_areas_cached() -> dict:
 
 
 def _reset_fast_stats_cache_for_tests() -> None:
-    global _FAST_HEALTH_CACHE, _FAST_STATS_CACHE, _FAST_STATS_REFRESH_ERROR, _FAST_STATS_REFRESH_FUTURE, _KNOWLEDGE_AREAS_CACHE
+    global _DIAGNOSTIC_WARMER_NEXT_INDEX
+    global \
+        _FAST_HEALTH_CACHE, \
+        _FAST_STATS_CACHE, \
+        _FAST_STATS_REFRESH_ERROR, \
+        _FAST_STATS_REFRESH_FUTURE, \
+        _KNOWLEDGE_AREAS_CACHE
     global _FAST_HEALTH_REFRESH_FUTURE, _FAST_HEALTH_REFRESH_ERROR
     global _KNOWLEDGE_AREAS_REFRESH_FUTURE, _KNOWLEDGE_AREAS_REFRESH_ERROR
     with _FAST_STATS_CACHE_LOCK:
@@ -3686,6 +4201,23 @@ def _reset_fast_stats_cache_for_tests() -> None:
                 "last_refresh_duration_ms": None,
                 "last_refresh_error": None,
                 "last_success_monotonic": None,
+            }
+        )
+    with _DIAGNOSTIC_WARMER_LOCK:
+        _DIAGNOSTIC_WARMER_NEXT_INDEX = 0
+        _DIAGNOSTIC_WARMER_OBSERVABILITY.update(
+            {
+                "enabled": _DIAGNOSTIC_WARMER_ENABLED,
+                "mode": _DIAGNOSTIC_WARMER_MODE,
+                "alive": False,
+                "tick_count": 0,
+                "warm_submitted_count": 0,
+                "watchdog_breach_count": 0,
+                "last_tick_monotonic": None,
+                "last_breach_lane": None,
+                "last_submitted_lane": None,
+                "interval_s": None,
+                "invalid_config": _DIAGNOSTIC_WARMER_INVALID_CONFIG,
             }
         )
 
@@ -3896,7 +4428,9 @@ def _result_payload_with_temporal(result: SearchResult, concept=None) -> dict:
     return payload
 
 
-def _apply_search_temporal_filters(results: list[SearchResult], query: SearchQuery) -> tuple[list[SearchResult], list[dict], dict]:
+def _apply_search_temporal_filters(
+    results: list[SearchResult], query: SearchQuery
+) -> tuple[list[SearchResult], list[dict], dict]:
     has_filter = bool(query.since or query.until)
     metadata = {
         "applied": has_filter,
@@ -3910,7 +4444,10 @@ def _apply_search_temporal_filters(results: list[SearchResult], query: SearchQue
         "invalid_temporal_count": 0,
     }
     if not has_filter:
-        payloads = [_result_payload_with_temporal(result, load_concept(result.concept_id, track_access=False)) for result in results]
+        payloads = [
+            _result_payload_with_temporal(result, load_concept(result.concept_id, track_access=False))
+            for result in results
+        ]
         return results, payloads, metadata
 
     since_dt = _parse_search_filter_time(query.since)
@@ -5068,7 +5605,9 @@ def _ambiguous_second_pass_candidates(
         """SELECT id, summary
            FROM concepts
            WHERE is_current = 1
-             AND """ + _ambiguous_review_predicate() + """
+             AND """
+        + _ambiguous_review_predicate()
+        + """
            ORDER BY created_at DESC
            LIMIT ?""",
         (scan_limit,),
@@ -5095,7 +5634,9 @@ def _safe_general_ka_candidates(conn, *, batch_limit: int) -> tuple[list[tuple[s
         """SELECT id, summary
            FROM concepts
            WHERE is_current = 1
-             AND """ + _unreviewed_general_predicate() + """
+             AND """
+        + _unreviewed_general_predicate()
+        + """
            ORDER BY created_at DESC
            LIMIT ?""",
         (batch_limit,),
@@ -5104,8 +5645,10 @@ def _safe_general_ka_candidates(conn, *, batch_limit: int) -> tuple[list[tuple[s
     ambiguous_ids: list[str] = []
     for row in rows:
         classified, source, score = classify_knowledge_area(row["summary"] or "", "general", strict=True)
-        if classified and classified not in ("general", "unclassified") and (
-            source == "inferred" or (source == "embedding" and score is not None and score >= 0.80)
+        if (
+            classified
+            and classified not in ("general", "unclassified")
+            and (source == "inferred" or (source == "embedding" and score is not None and score >= 0.80))
         ):
             planned_updates.append((row["id"], classified, source))
         else:
@@ -5136,8 +5679,10 @@ def _safe_unclassified_ka_candidates(conn, *, batch_limit: int) -> list[tuple[st
     planned_updates: list[tuple[str, str, str]] = []
     for row in rows:
         classified, source, score = classify_knowledge_area(row["summary"] or "", "general", strict=True)
-        if classified and classified not in ("general", "unclassified") and (
-            source == "inferred" or (source == "embedding" and score is not None and score >= 0.80)
+        if (
+            classified
+            and classified not in ("general", "unclassified")
+            and (source == "inferred" or (source == "embedding" and score is not None and score >= 0.80))
         ):
             planned_updates.append((row["id"], classified, source))
     return planned_updates
@@ -5175,9 +5720,13 @@ def _resolve_ka_review_internal_root(*, require_git: bool = True) -> Path:
         )
     root = Path(raw_root).expanduser().resolve()
     if not root.exists() or not root.is_dir():
-        raise _ka_review_error(409, "review_artifact_root_invalid", "Configured review artifact root is not a directory.")
+        raise _ka_review_error(
+            409, "review_artifact_root_invalid", "Configured review artifact root is not a directory."
+        )
     if require_git and not (root / ".git").exists():
-        raise _ka_review_error(409, "review_artifact_root_not_git", "Configured review artifact root is not a git worktree.")
+        raise _ka_review_error(
+            409, "review_artifact_root_not_git", "Configured review artifact root is not a git worktree."
+        )
     return root
 
 
@@ -5234,10 +5783,14 @@ def _verify_ka_review_artifact_blob(repo_root: Path, commit: str, path: Path, re
     commit_obj = _git_output(repo_root, ["rev-parse", "--verify", f"{commit}^{{commit}}"])
     tree_line = _git_output(repo_root, ["ls-tree", "-r", commit_obj, "--", rel_path])
     if not tree_line:
-        raise _ka_review_error(409, "artifact_not_in_commit", "Review artifact is not present in expected commit.", path=rel_path)
+        raise _ka_review_error(
+            409, "artifact_not_in_commit", "Review artifact is not present in expected commit.", path=rel_path
+        )
     parts = tree_line.split()
     if len(parts) < 4 or parts[1] != "blob":
-        raise _ka_review_error(409, "artifact_not_blob", "Review artifact in expected commit is not a blob.", path=rel_path)
+        raise _ka_review_error(
+            409, "artifact_not_blob", "Review artifact in expected commit is not a blob.", path=rel_path
+        )
     expected_blob = parts[2]
     working_blob = _git_output(repo_root, ["hash-object", str(path)])
     if working_blob != expected_blob:
@@ -5294,7 +5847,9 @@ def _verify_ka_review_artifacts(request: KAReviewApplyRequest) -> dict[str, Any]
     proof_rows = _load_ka_review_csv(resolved["proof"][0])
 
     if summary.get("apply_design_allowed") != "accepted_ids_only":
-        raise _ka_review_error(409, "review_not_accepted_id_only", "Review summary does not allow accepted-ID-only apply.")
+        raise _ka_review_error(
+            409, "review_not_accepted_id_only", "Review summary does not allow accepted-ID-only apply."
+        )
 
     summary_accepted = {str(cid).strip() for cid in (summary.get("accepted_ids") or []) if str(cid).strip()}
     summary_rejected = {str(cid).strip() for cid in (summary.get("rejected_ids") or []) if str(cid).strip()}
@@ -5308,7 +5863,9 @@ def _verify_ka_review_artifacts(request: KAReviewApplyRequest) -> dict[str, Any]
     if summary_rejected != ledger_rejected:
         raise _ka_review_error(409, "rejected_id_disagreement", "Review summary and ledger disagree on rejected IDs.")
     if summary_needs_human != ledger_needs_human:
-        raise _ka_review_error(409, "needs_human_id_disagreement", "Review summary and ledger disagree on needs-human IDs.")
+        raise _ka_review_error(
+            409, "needs_human_id_disagreement", "Review summary and ledger disagree on needs-human IDs."
+        )
     if (summary_accepted & summary_rejected) or (summary_accepted & summary_needs_human):
         raise _ka_review_error(409, "blocked_id_overlap", "Accepted IDs overlap rejected or needs-human IDs.")
     if not summary_accepted:
@@ -5327,12 +5884,16 @@ def _verify_ka_review_artifacts(request: KAReviewApplyRequest) -> dict[str, Any]
                 )
             target = (row.get("recommended_knowledge_area") or "").strip()
             if not target:
-                raise _ka_review_error(409, "accepted_id_missing_target", "Accepted ID has no target KA.", concept_id=concept_id)
+                raise _ka_review_error(
+                    409, "accepted_id_missing_target", "Accepted ID has no target KA.", concept_id=concept_id
+                )
             proof_targets[concept_id] = target
 
     missing = sorted(summary_accepted - set(proof_targets))
     if missing:
-        raise _ka_review_error(409, "accepted_ids_missing_from_proof", "Accepted IDs are missing from final proof.", missing=missing)
+        raise _ka_review_error(
+            409, "accepted_ids_missing_from_proof", "Accepted IDs are missing from final proof.", missing=missing
+        )
 
     return {
         "root": root,
@@ -5556,9 +6117,7 @@ def _ka_integrity_snapshot(conn, *, batch_limit: int, review_ambiguous: bool = F
     }
     if review_ambiguous:
         ambiguous_review, ambiguous_conflicts, ambiguous_unresolved, ambiguous_reclassifiable_total = (
-            _ambiguous_second_pass_candidates(
-                conn, batch_limit=batch_limit, scan_limit=_AMBIGUOUS_SECOND_PASS_MAX_SCAN
-            )
+            _ambiguous_second_pass_candidates(conn, batch_limit=batch_limit, scan_limit=_AMBIGUOUS_SECOND_PASS_MAX_SCAN)
         )
         snapshot.update(
             {
@@ -5584,7 +6143,10 @@ def pith_ka_integrity(
     try:
         with _db() as conn:
             pre = _ka_integrity_snapshot(conn, batch_limit=batch_limit, review_ambiguous=review_ambiguous)
-        result = {**pre, "repair": {"dry_run": dry_run, "attempted": False, "updated": 0, "ambiguous": pre["batch_ambiguous"]}}
+        result = {
+            **pre,
+            "repair": {"dry_run": dry_run, "attempted": False, "updated": 0, "ambiguous": pre["batch_ambiguous"]},
+        }
         if not repair:
             return result
 
@@ -6045,10 +6607,21 @@ def pith_reflect(mode: str = "incremental", verbose: bool = False, response: Res
 
 
 @app.get("/pith_health")
-def pith_health(detail: str = "fast"):
+def pith_health(
+    detail: str = "fast",
+    freshness: str = "fast",
+    force_refresh: bool = False,
+    capture_budget_ms: str | None = None,
+):
     """Get pith health analysis."""
     if detail not in {"fast", "full"}:
         raise HTTPException(status_code=400, detail="detail must be 'fast' or 'full'")
+    _validate_diagnostic_freshness(freshness)
+    if capture_budget_ms is not None:
+        _bounded_capture_budget_ms(
+            capture_budget_ms,
+            default_ms=DIAGNOSTIC_AUTHORITATIVE_CAPTURE_BUDGET_DEFAULT_MS,
+        )
     ready = _build_ready_state()
     try:
         from app.ops.reflection_runner import reflection_runner
@@ -6058,7 +6631,7 @@ def pith_health(detail: str = "fast"):
         active_reflection = None
     if _should_defer_health_db_metrics(ready):
         reason = _health_metrics_defer_reason(ready)
-        return {
+        payload = {
             "mode": detail,
             "generated_at": _utc_now_iso(),
             "cache_age_ms": 0,
@@ -6077,7 +6650,24 @@ def pith_health(detail: str = "fast"):
             },
             "active_reflection": active_reflection,
         }
+        return _annotate_capture_contract(
+            payload,
+            requested_freshness=freshness,
+            authoritative=False,
+            value_semantics="unavailable",
+            degraded_reason=reason,
+            capture_budget_ms=_bounded_capture_budget_ms(
+                capture_budget_ms,
+                default_ms=DIAGNOSTIC_AUTHORITATIVE_CAPTURE_BUDGET_DEFAULT_MS,
+            ),
+        )
     if detail == "fast":
+        if freshness == "authoritative":
+            budget_ms = _bounded_capture_budget_ms(
+                capture_budget_ms,
+                default_ms=DIAGNOSTIC_AUTHORITATIVE_CAPTURE_BUDGET_DEFAULT_MS,
+            )
+            return _build_pith_health_authoritative_cached(budget_ms, force_refresh=force_refresh)
         return _build_pith_health_fast_cached()
 
     try:
@@ -6180,7 +6770,17 @@ def pith_health(detail: str = "fast"):
         health.setdefault("partial", False)
         health.setdefault("section_errors", {})
         health.setdefault("section_timings_ms", {})
-        return health
+        return _annotate_capture_contract(
+            health,
+            requested_freshness=freshness,
+            authoritative=freshness == "authoritative",
+            value_semantics="real",
+            degraded_reason=None,
+            capture_budget_ms=_bounded_capture_budget_ms(
+                capture_budget_ms,
+                default_ms=DIAGNOSTIC_AUTHORITATIVE_CAPTURE_BUDGET_DEFAULT_MS,
+            ),
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=_safe_error(e))
 
@@ -6397,13 +6997,9 @@ async def maintenance_endpoint(request: Request, body: dict = {}):
         from app.ops.pressure_state import clear_maintenance_lease, write_maintenance_lease
 
         async with maintenance_lock:
-            lease = write_maintenance_lease(
-                source="tfidf_repair", phase="repair", expected_timeout_seconds=180
-            )
+            lease = write_maintenance_lease(source="tfidf_repair", phase="repair", expected_timeout_seconds=180)
             try:
-                report = await asyncio.to_thread(
-                    retrieval_engine.rebuild_and_swap_repair, dry_run=dry_run
-                )
+                report = await asyncio.to_thread(retrieval_engine.rebuild_and_swap_repair, dry_run=dry_run)
             finally:
                 clear_maintenance_lease(run_id=lease.run_id)
         return report
@@ -7295,9 +7891,7 @@ def conversation_turn_endpoint(
     the most relevant existing knowledge. Read-only. Target: <50ms."""
     if getattr(app.state, "startup_task", None) is not None:
         _require_retrieval_ready("conversation_turn")
-    is_hook_additional_context = (
-        getattr(request, "context_delivery_mode", "") == "hook_additional_context"
-    )
+    is_hook_additional_context = getattr(request, "context_delivery_mode", "") == "hook_additional_context"
     # PERF-FORT-1: Semaphore prevents threadpool starvation under concurrent load
     acquired = False
     if not is_hook_additional_context:
@@ -7434,9 +8028,7 @@ def _session_learn_processing_payload(request_id: str, *, processing_time_ms: fl
         processing_time_ms=round(processing_time_ms, 2),
         learning_events=0,
         extraction_source_breakdown={},
-        budget_warnings=[
-            "session_learn_processing: learning is still running; retry with the same request_id"
-        ],
+        budget_warnings=["session_learn_processing: learning is still running; retry with the same request_id"],
         persistence_state="processing",
         processing_state="processing",
         request_id=request_id,
@@ -7496,9 +8088,7 @@ def _session_end_processing_payload(request_id: str, *, processing_time_ms: floa
         "retry_after_seconds": _SESSION_LEARN_PROCESSING_RETRY_AFTER_SECONDS,
         "final_learning_state": "processing",
         "processing_time_ms": round(processing_time_ms, 2),
-        "budget_warnings": [
-            "session_end_processing: closeout is still running; retry with the same request_id"
-        ],
+        "budget_warnings": ["session_end_processing: closeout is still running; retry with the same request_id"],
     }
 
 
@@ -7691,16 +8281,10 @@ def _build_lifecycle_jobs_health() -> dict:
                     "committed_count": int(reflection_summary["committed_count"]),
                     "skipped_count": int(reflection_summary["skipped_count"]),
                     "stale_running_count": int(reflection_summary["stale_running_count"]),
-                    "oldest_queued_age_seconds": _iso_age_seconds(
-                        reflection_summary.get("oldest_queued_updated_at")
-                    ),
-                    "oldest_running_age_seconds": _iso_age_seconds(
-                        reflection_summary.get("oldest_running_updated_at")
-                    ),
-                    "last_committed_age_seconds": _iso_age_seconds(
-                        reflection_summary.get("last_committed_updated_at")
-                    ),
-                }
+                    "oldest_queued_age_seconds": _iso_age_seconds(reflection_summary.get("oldest_queued_updated_at")),
+                    "oldest_running_age_seconds": _iso_age_seconds(reflection_summary.get("oldest_running_updated_at")),
+                    "last_committed_age_seconds": _iso_age_seconds(reflection_summary.get("last_committed_updated_at")),
+                },
             },
         }
     except Exception as exc:
@@ -7795,9 +8379,8 @@ def _build_required_context_cache_health() -> dict[str, Any]:
             "serving_max_stale_ms": status.serving_max_stale_ms,
             "refresh_after_ms": status.refresh_after_ms,
             "refresh_in_flight": status.refresh_in_flight,
-            "stale_first_enabled": os.environ.get(
-                "PITH_STAGE3B_REQUIRED_CONTEXT_STALE_FIRST", "true"
-            ).lower() in ("true", "1"),
+            "stale_first_enabled": os.environ.get("PITH_STAGE3B_REQUIRED_CONTEXT_STALE_FIRST", "true").lower()
+            in ("true", "1"),
         }
     except Exception as exc:
         return {
@@ -7839,8 +8422,10 @@ def _build_conversation_turn_latency_health(pressure_state: Any | None = None) -
                 "threshold_critical_max_ms": 15000.0,
             }
 
-        pressure_payload = pressure_state.to_dict() if hasattr(pressure_state, "to_dict") else (
-            pressure_state if isinstance(pressure_state, dict) else {}
+        pressure_payload = (
+            pressure_state.to_dict()
+            if hasattr(pressure_state, "to_dict")
+            else (pressure_state if isinstance(pressure_state, dict) else {})
         )
         active_contention = bool(pressure_payload.get("active_contention"))
         reason_codes = list(pressure_payload.get("reason_codes") or [])
@@ -7878,8 +8463,8 @@ def _build_conversation_turn_latency_health(pressure_state: Any | None = None) -
         else:
             status = "ok"
         aged_outlier_diagnostic_only = recent_outlier_status == "aged_critical_outlier" and status == "ok"
-        recovery_state = "recovered" if aged_outlier_diagnostic_only else (
-            "active" if status in {"critical", "degraded"} else "ok"
+        recovery_state = (
+            "recovered" if aged_outlier_diagnostic_only else ("active" if status in {"critical", "degraded"} else "ok")
         )
 
         deduped_reasons = list(dict.fromkeys(str(code) for code in reason_codes))
@@ -8031,8 +8616,12 @@ def _commit_checkpoint_result(request_id: str, result) -> dict:
 
 def _write_replay_recovery_specs() -> dict[str, WriteReplayRecoverySpec]:
     return {
-        "session_learn": WriteReplayRecoverySpec("session_learn", _run_session_learn_replay_payload, _commit_session_learn_result),
-        "session_end": WriteReplayRecoverySpec("session_end", _run_session_end_replay_payload, _commit_session_end_result),
+        "session_learn": WriteReplayRecoverySpec(
+            "session_learn", _run_session_learn_replay_payload, _commit_session_learn_result
+        ),
+        "session_end": WriteReplayRecoverySpec(
+            "session_end", _run_session_end_replay_payload, _commit_session_end_result
+        ),
         "checkpoint": WriteReplayRecoverySpec("checkpoint", _run_checkpoint_replay_payload, _commit_checkpoint_result),
     }
 
@@ -8059,10 +8648,7 @@ def _schedule_write_replay_reclaimer(endpoint: str, reason: str) -> bool:
 
 
 def _schedule_all_write_replay_reclaimers(reason: str) -> dict[str, bool]:
-    return {
-        endpoint: _schedule_write_replay_reclaimer(endpoint, reason)
-        for endpoint in _write_replay_recovery_specs()
-    }
+    return {endpoint: _schedule_write_replay_reclaimer(endpoint, reason) for endpoint in _write_replay_recovery_specs()}
 
 
 def _schedule_session_learn_reclaimer(reason: str) -> bool:
@@ -8085,7 +8671,15 @@ def _run_write_replay_reclaimer(endpoint: str, reason: str, batch_size: int | No
 
     specs = _write_replay_recovery_specs()
     if endpoint not in specs:
-        return {"endpoint": endpoint, "reason": reason, "claimed": 0, "committed": 0, "failed": 0, "retry_scheduled": 0, "unrecoverable_failed": 0}
+        return {
+            "endpoint": endpoint,
+            "reason": reason,
+            "claimed": 0,
+            "committed": 0,
+            "failed": 0,
+            "retry_scheduled": 0,
+            "unrecoverable_failed": 0,
+        }
     spec = specs[endpoint]
     profile = get_active_profile()
     now_dt = _utc_now()
@@ -8181,7 +8775,9 @@ def _run_write_replay_reclaimer(endpoint: str, reason: str, batch_size: int | No
                 retry_at,
                 _utc_now_iso(),
             )
-            _record_write_replay_metric("write_request_reclaimer_retry_scheduled", endpoint, {"error_class": type(exc).__name__})
+            _record_write_replay_metric(
+                "write_request_reclaimer_retry_scheduled", endpoint, {"error_class": type(exc).__name__}
+            )
             if endpoint == "session_learn":
                 _record_session_learn_contract_metric("session_learn_reclaimer_failed")
             logger.warning("%s reclaimer failed for request_id=%s: %s", endpoint, request_id, exc, exc_info=True)
@@ -8533,11 +9129,7 @@ _WORKSTREAM_LIFECYCLE_TOP_LEVEL_METADATA_FIELDS = (
 
 
 def _workstream_lifecycle_metadata_from_body(body: dict) -> object:
-    top_level = {
-        key: body[key]
-        for key in _WORKSTREAM_LIFECYCLE_TOP_LEVEL_METADATA_FIELDS
-        if key in body
-    }
+    top_level = {key: body[key] for key in _WORKSTREAM_LIFECYCLE_TOP_LEVEL_METADATA_FIELDS if key in body}
     metadata = body.get("metadata")
     if metadata is None:
         return top_level or None
