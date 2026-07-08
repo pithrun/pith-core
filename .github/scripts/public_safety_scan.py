@@ -79,9 +79,7 @@ PUBLIC_DOC_PATHS = {
 
 PUBLIC_INSTALLER_AND_RELEASE_PATHS = {
     "scripts/install.sh",
-    "scripts/install.ps1",
     "scripts/migrate_from_docker.sh",
-    "scripts/migrate_from_docker.ps1",
     "scripts/configure_clients.py",
     "pith-server-latest.tar.gz",
     "pith-server-latest.sha256",

@@ -739,6 +739,9 @@ class ReflectionEngine:
         phase_timings = dict(self._current_phase_timings or {})
         reason = abort_reason or self._abort_reason()
         merge_progress = dict(self._current_merge_progress or {})
+        budget_status = "aborted"
+        deferred_phases: list[str] = []
+        phase_budget_decisions: dict[str, dict[str, Any]] = {}
         if abort_stage == "merge" and merge_progress:
             if reason == "deadline_exceeded":
                 merge_progress["status"] = "deferred_deadline"
@@ -748,6 +751,27 @@ class ReflectionEngine:
                     logger.debug("REFLECT-MERGE: Failed to persist deadline merge progress", exc_info=True)
             elif reason == "merge_cap_reached":
                 merge_progress["status"] = "paused_cap"
+        if reason == "deadline_exceeded":
+            budget_status = "deferred"
+            if abort_stage:
+                deferred_phases = [abort_stage]
+                phase_budget_decisions = {
+                    abort_stage: {
+                        "decision": "deferred",
+                        "reason": reason,
+                        "last_completed_step": self._last_completed_step,
+                    }
+                }
+        elif reason == "merge_cap_reached":
+            budget_status = "paused_cap"
+            if abort_stage:
+                phase_budget_decisions = {
+                    abort_stage: {
+                        "decision": "paused_cap",
+                        "reason": reason,
+                        "last_completed_step": self._last_completed_step,
+                    }
+                }
         return ReflectionSummary(
             concepts_consolidated=counts.get("concepts_consolidated", 0),
             concepts_decayed=counts.get("concepts_decayed", 0),
@@ -771,17 +795,9 @@ class ReflectionEngine:
             abort_reason=reason,
             last_completed_step=self._last_completed_step,
             abort_stage=abort_stage,
-            budget_status="deferred" if reason == "deadline_exceeded" else "aborted",
-            deferred_phases=[abort_stage] if abort_stage and reason == "deadline_exceeded" else [],
-            phase_budget_decisions={
-                abort_stage: {
-                    "decision": "deferred",
-                    "reason": reason,
-                    "last_completed_step": self._last_completed_step,
-                }
-            }
-            if abort_stage and reason == "deadline_exceeded"
-            else {},
+            budget_status=budget_status,
+            deferred_phases=deferred_phases,
+            phase_budget_decisions=phase_budget_decisions,
             merge_progress=merge_progress,
         )
 
@@ -813,11 +829,18 @@ class ReflectionEngine:
             else:
                 result = self._incremental_reflection()
         except ReflectionAborted as exc:
-            logger.warning(
-                "MAINT-040: Reflection aborted (%s) after %s",
-                exc.reason,
-                exc.stage,
-            )
+            if exc.reason == "merge_cap_reached":
+                logger.info(
+                    "Reflection paused at merge cap (%s) after %s",
+                    exc.reason,
+                    exc.stage,
+                )
+            else:
+                logger.warning(
+                    "MAINT-040: Reflection aborted (%s) after %s",
+                    exc.reason,
+                    exc.stage,
+                )
             result = self._build_abort_summary(abort_reason=exc.reason, abort_stage=exc.stage)
             metrics.record("reflect_budget_abort", 1, {"mode": mode, "reason": exc.reason, "stage": exc.stage})
         finally:

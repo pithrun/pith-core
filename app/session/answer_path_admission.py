@@ -44,8 +44,18 @@ class AnswerPathAdmission:
             "observe_only": str(self.observe_only).lower(),
         }
 
-    def allows_optional_phase(self, phase: str, *, enforce_standard_optional: bool = False) -> bool:
+    def allows_optional_phase(
+        self,
+        phase: str,
+        *,
+        enforce_standard_optional: bool = False,
+        enforce_first_call_resumption_optional: bool = False,
+    ) -> bool:
         """Return whether an optional phase may run for this answer path."""
+        if self.mode == FIRST_CALL_RESUMPTION and enforce_first_call_resumption_optional:
+            if phase in {"multihop.retrieve", "entity_chain.retrieve", "S4_graph_walk"}:
+                return False
+            return True
         if self.mode == STANDARD and enforce_standard_optional:
             if phase in {"multihop.retrieve", "entity_chain.retrieve", "S4_graph_walk"}:
                 return False

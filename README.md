@@ -49,7 +49,7 @@ For methodology, score terms, caveats, and evidence files, see the [Pith benchma
 
 ### Prerequisites
 
-- **macOS developer preview** — Pith's initial public preview is macOS-first.
+- **macOS developer preview** — Pith's current public preview is macOS-first.
 - **Python 3.10+** — on macOS arm64, the installer can provision a Pith-managed Python 3.12 runtime inside `~/.pith` if no compatible Python is present. It does not replace or modify system Python.
 - **A supported AI app** — verified launch workflows are Claude Cowork, Claude Desktop, Claude Code, Cursor, VS Code, and Codex.
 
@@ -70,7 +70,7 @@ The fully automated Pith lifecycle clients today are **Claude Cowork** and **Cod
 
 ### Install (5 minutes)
 
-Pith is launching as a macOS-first developer preview.
+Pith currently ships a macOS developer preview.
 
 ```bash
 curl -fsSL https://pith.run/install | bash
@@ -82,9 +82,9 @@ Older macOS machines may only have Apple's Python 3.9. In a normal interactive i
 curl -fsSL https://pith.run/install | PITH_AUTO_PYTHON=1 bash
 ```
 
-Windows support is not part of the initial developer preview.
+Windows support is not part of the current public preview.
 
-The installer handles everything: Python venv, dependencies, API key generation, AI app surface selection, MCP client configuration, auto-start setup, and health verification.
+The installer handles everything: Python venv, dependencies, semantic embeddings, API key generation, AI app surface selection, MCP client configuration, auto-start setup, scheduled backups, and health verification. On macOS, auto-start uses launchd.
 
 ### After Install
 

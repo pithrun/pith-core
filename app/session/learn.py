@@ -12,7 +12,7 @@ import time
 import uuid
 import re as _re
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from app.core.constants import (
     FRESHNESS_EARLIER_TODAY_UPPER,
@@ -104,6 +104,22 @@ logger = logging.getLogger(__name__)
 # Module-level counter for precision guard observability (used via `global` in methods)
 _PRECISION_GUARD_BLOCKS: int = 0
 
+_SESSION_LEARN_SUBPHASE_ALLOWLIST = {
+    "batch_dedup_precompute",
+    "insight_create",
+    "insight_evolve",
+    "insight_skip",
+    "insight_error",
+    "trace_linkage",
+    "prediction_resolution",
+    "thread_autolink",
+    "subject_key_supersession",
+    "maintenance_enqueue",
+    "auto_association",
+    "index_update",
+    "prospective_indexing_enqueue",
+}
+
 def _missing_learning_event_delta(
     *,
     learning_events: int,
@@ -117,6 +133,42 @@ def _missing_learning_event_delta(
     current = max(0, int(current_count or 0))
     already_counted = max(0, current - baseline)
     return max(0, learning_events - already_counted)
+
+_LIFECYCLE_PROBE_KIND = "lifecycle_conformance_dogfood"
+_LIFECYCLE_PROBE_RETENTION_POLICY = "archive_after_learning_proof"
+_LIFECYCLE_PROBE_METADATA_KEYS = ("lifecycle_probe", "probe_kind", "retention_policy")
+
+
+def _normalise_lifecycle_probe_metadata(insight: dict) -> dict[str, Any]:
+    client_metadata = insight.get("metadata") if isinstance(insight.get("metadata"), dict) else {}
+    if (
+        client_metadata.get("lifecycle_probe") is not True
+        or client_metadata.get("probe_kind") != _LIFECYCLE_PROBE_KIND
+        or client_metadata.get("retention_policy") != _LIFECYCLE_PROBE_RETENTION_POLICY
+    ):
+        return {}
+    return {key: client_metadata[key] for key in _LIFECYCLE_PROBE_METADATA_KEYS}
+
+
+def _should_archive_lifecycle_probe_insight(insight: dict) -> bool:
+    return bool(_normalise_lifecycle_probe_metadata(insight))
+
+
+def _archive_lifecycle_probe_concept(concept_id: str, insight: dict) -> bool:
+    concept = load_concept(concept_id, track_access=False)
+    if concept is None:
+        logger.warning("session_learn: lifecycle probe archive skipped; concept not found: %s", concept_id)
+        return False
+    metadata = dict(concept.metadata or {})
+    metadata.update(_normalise_lifecycle_probe_metadata(insight))
+    metadata["archived_by_policy"] = _LIFECYCLE_PROBE_RETENTION_POLICY
+    metadata["archived_at"] = _utc_now_iso()
+    metadata["archive_reason"] = "lifecycle_conformance_dogfood_probe"
+    concept.metadata = metadata
+    concept.status = "archived"
+    save_concept(concept)
+    logger.info("session_learn: archived lifecycle dogfood probe concept %s after learning proof", concept_id)
+    return True
 
 _TOOL_PARAMETER_BLOCK_RE = _re.compile(
     r"<parameter\s+name=(['\"])[A-Za-z0-9_.:-]+\1\s*>.*?</parameter>",
@@ -951,6 +1003,10 @@ class SessionLearnMixin:
 
         _wall_budget_ms = int(getattr(_learn_config, "AUTOLEARN_WALL_BUDGET_MS", getattr(_learn_config, "AUTOLEARN_MAX_BUDGET_MS", 15000)))
         _wall_budget_exhausted = False
+        _learning_subphase_durations: dict[str, float] = {}
+        _deferred_enrichment_count = 0
+        _slowest_insight_ms = 0.0
+        _slowest_insight_action = "unknown"
 
         def _wall_elapsed_ms() -> float:
             return (time.perf_counter() - t0) * 1000
@@ -973,6 +1029,51 @@ class SessionLearnMixin:
                     _wall_metrics.record("autolearn_wall_budget_exhausted", 1.0, {"stage": stage})
                 except Exception:
                     pass
+            return True
+
+        def _record_learning_subphase(subphase: str, duration_ms: float) -> None:
+            if subphase not in _SESSION_LEARN_SUBPHASE_ALLOWLIST:
+                return
+            safe_duration = max(0.0, float(duration_ms))
+            _learning_subphase_durations[subphase] = round(
+                _learning_subphase_durations.get(subphase, 0.0) + safe_duration,
+                2,
+            )
+
+        def _dominant_learning_subphase() -> str:
+            if not _learning_subphase_durations:
+                return "unknown"
+            return max(_learning_subphase_durations.items(), key=lambda item: item[1])[0]
+
+        def _dominant_learning_action() -> str:
+            if _slowest_insight_action != "unknown":
+                return _slowest_insight_action
+            return _dominant_learning_subphase()
+
+        def _record_deferred_optional_enrichment(stage: str) -> None:
+            nonlocal _deferred_enrichment_count
+            _deferred_enrichment_count += 1
+            budget_warnings.append(f"deferred_optional_enrichment: stage={stage}")
+            try:
+                from app.ops.metrics import metrics as _defer_metrics
+
+                _defer_metrics.record("session_learn_optional_enrichment_deferred", 1.0, {"stage": stage})
+            except Exception:
+                pass
+
+        def _should_defer_optional_enrichment(stage: str) -> bool:
+            if _benchmark_mode:
+                return False
+            try:
+                from app.core.config import get_feature_flag
+
+                if not get_feature_flag("SESSION_LEARN_OPTIONAL_ENRICHMENT_DEFERRAL_ENABLED", True):
+                    return False
+            except Exception:
+                return False
+            if not _wall_budget_exhausted_at(stage):
+                return False
+            _record_deferred_optional_enrichment(stage)
             return True
 
         def _mark_phase(name: str) -> None:
@@ -1021,6 +1122,9 @@ class SessionLearnMixin:
                 "budget_exhausted": str(bool(_budget_exhausted or _wall_budget_exhausted)).lower(),
                 "maintenance_source": maintenance_source,
                 "dominant_phase": dominant_phase,
+                "dominant_subphase": _dominant_learning_subphase(),
+                "dominant_action": _dominant_learning_action(),
+                "deferred_enrichment_count": str(_deferred_enrichment_count),
                 "verbatim_attach_source": _verbatim_attach_source,
                 "verbatim_fragment_count": str(_verbatim_fragment_count),
                 "elapsed_bucket": "high" if elapsed_ms >= 15000 else "normal",
@@ -1042,6 +1146,17 @@ class SessionLearnMixin:
                             "replay_fast_path": labels["replay_fast_path"],
                             "dominant_phase": labels["dominant_phase"],
                             "maintenance_source": labels["maintenance_source"],
+                        },
+                    )
+                for subphase, value in _learning_subphase_durations.items():
+                    _learning_metrics.record(
+                        "session_learn_subphase_timing_ms",
+                        value,
+                        {
+                            "subphase": subphase,
+                            "dominant_phase": labels["dominant_phase"],
+                            "maintenance_source": labels["maintenance_source"],
+                            "replay_fast_path": labels["replay_fast_path"],
                         },
                     )
             except Exception:
@@ -1142,6 +1257,15 @@ class SessionLearnMixin:
                     client_metadata.setdefault("knowledge_area_label_kind", boundary.label_kind)
                     if boundary.facet:
                         client_metadata.setdefault("knowledge_area_facet", boundary.facet)
+                    if boundary.client_topic_label:
+                        client_metadata.setdefault("client_topic_label", boundary.client_topic_label)
+                    if boundary.dynamic_ka_admission_reason:
+                        client_metadata.setdefault(
+                            "dynamic_ka_admission_reason",
+                            boundary.dynamic_ka_admission_reason,
+                        )
+                    if boundary.label_kind in {"dynamic_domain", "dynamic_topic"}:
+                        client_metadata.setdefault("knowledge_area_dynamic_scope", "profile")
                     conf = ec.confidence or 0.50
                     if batch_suspicion:
                         conf = min(conf, 0.40)
@@ -1397,28 +1521,35 @@ class SessionLearnMixin:
         # Replaces N sequential encode+search+DB calls with 1 batch encode + 1 WHERE IN query.
         # Falls back to per-call search if batch fails (graceful degradation).
         _batch_dedup: list[list[dict]] | None = None
-        if _wall_budget_exhausted_at("before_batch_dedup_precompute"):
+        _batch_precompute_started = time.perf_counter()
+        if _should_defer_optional_enrichment("batch_dedup_precompute"):
             logger.warning("session_learn: wall budget reached before batch dedup; using per-insight fallback for core persistence")
-        try:
-            from app.core.config import FEATURE_FLAGS as _perf021_ff
+        else:
+            try:
+                from app.core.config import FEATURE_FLAGS as _perf021_ff
 
-            _perf021_use_embedding = _perf021_ff.get("EMBEDDING_DEDUP_ENABLED", False)
-            if _replay_fast_path:
-                budget_warnings.append("replay_fast_path: deferred batch dedup precompute")
-            elif len(merged_insights) > 1:
-                _batch_summaries = [i.get("summary", "") for i in merged_insights]
-                if _perf021_use_embedding:
-                    # PERF-036: Batch embedding dedup
-                    _batch_dedup = retrieval_engine.search_for_dedup_embedding_batch(
-                        _batch_summaries, top_k=3
-                    )
-                else:
-                    _batch_dedup = retrieval_engine.search_for_dedup_tfidf_batch(
-                        _batch_summaries, top_k=3
-                    )
-        except Exception as _perf021_e:
-            logger.warning(f"PERF-021/036: batch dedup pre-compute failed, falling back to per-call: {_perf021_e}")
-            _batch_dedup = None
+                _perf021_use_embedding = _perf021_ff.get("EMBEDDING_DEDUP_ENABLED", False)
+                if _replay_fast_path:
+                    budget_warnings.append("replay_fast_path: deferred batch dedup precompute")
+                elif len(merged_insights) > 1:
+                    _batch_summaries = [i.get("summary", "") for i in merged_insights]
+                    if _perf021_use_embedding:
+                        # PERF-036: Batch embedding dedup
+                        _batch_dedup = retrieval_engine.search_for_dedup_embedding_batch(
+                            _batch_summaries, top_k=3
+                        )
+                    else:
+                        _batch_dedup = retrieval_engine.search_for_dedup_tfidf_batch(
+                            _batch_summaries, top_k=3
+                        )
+            except Exception as _perf021_e:
+                logger.warning(f"PERF-021/036: batch dedup pre-compute failed, falling back to per-call: {_perf021_e}")
+                _batch_dedup = None
+            finally:
+                _record_learning_subphase(
+                    "batch_dedup_precompute",
+                    (time.perf_counter() - _batch_precompute_started) * 1000,
+                )
         if _wall_budget_exhausted_at("after_batch_dedup_precompute"):
             logger.warning("session_learn: wall budget reached after batch dedup; preserving concepts for core persistence")
         _mark_phase("after_batch_dedup")
@@ -1472,6 +1603,7 @@ class SessionLearnMixin:
                 break
             try:
                 ext_source = insight.get("extraction_source", "heuristic")
+                _process_single_started = time.perf_counter()
 
                 # M1: Strip supersedes if aggregate cap reached (EXPLICIT_SUPERSESSION_SPEC v1.1)
                 if explicit_supersession_total >= 10 and insight.get("supersedes"):
@@ -1488,9 +1620,17 @@ class SessionLearnMixin:
                     precomputed_dedup=(
                         _batch_dedup[idx] if _batch_dedup and idx < len(_batch_dedup) else None
                     ),  # PERF-021
+                    should_defer_enrichment=_should_defer_optional_enrichment,
+                    record_subphase=_record_learning_subphase,
                 )
+                _process_single_ms = (time.perf_counter() - _process_single_started) * 1000
+                if _process_single_ms > _slowest_insight_ms:
+                    _slowest_insight_ms = _process_single_ms
+                    _slowest_insight_action = str(result.get("action", "unknown"))
                 if result["action"] == "created":
                     concepts_created.append(result["learned_concept"])
+                    if _should_archive_lifecycle_probe_insight(insight):
+                        _archive_lifecycle_probe_concept(result["learned_concept"].concept_id, insight)
                     associations_created += result.get("associations", 0)
                     source_breakdown[ext_source] = source_breakdown.get(ext_source, 0) + 1
                     self._consume_budget(knowledge_area=insight.get("knowledge_area", "unknown"))
@@ -1520,6 +1660,7 @@ class SessionLearnMixin:
                 elif result["action"] == "skipped_saturated":
                     duplicates_skipped += 1
             except Exception as e:
+                _record_learning_subphase("insight_error", 0.0)
                 logger.error(f"session_learn: insight processing failed: {e}")
                 errors += 1
         _mark_phase("after_insight_processing")
@@ -1751,8 +1892,9 @@ class SessionLearnMixin:
             if (
                 (concepts_created or concepts_evolved)
                 and not _replay_fast_path
-                and not _wall_budget_exhausted_at("before_trace_wave")
+                and not _should_defer_optional_enrichment("trace_linkage")
             ):
+                _trace_linkage_started = time.perf_counter()
                 concept_ref_ids = [c.concept_id for c in concepts_created] + [c.concept_id for c in concepts_evolved]
                 sid = request.session_id or (self.current_session.session_id if self.current_session else "unknown")
                 trace = create_trace(
@@ -1776,6 +1918,7 @@ class SessionLearnMixin:
                             _sc(c)
                     except Exception:
                         pass  # Best-effort linkage
+                _record_learning_subphase("trace_linkage", (time.perf_counter() - _trace_linkage_started) * 1000)
         except Exception as e:
             logger.debug(f"Wave 4b: trace creation skipped: {e}")
         _mark_phase("after_trace_wave")
@@ -1784,8 +1927,14 @@ class SessionLearnMixin:
         try:
             from app.ops.traces import resolve_predictions_for_concept
 
-            for ec in ([] if _wall_budget_exhausted_at("before_prediction_wave") else concepts_evolved):
-                resolve_predictions_for_concept(ec.concept_id, outcome="revised", outcome_source="evolution")
+            if concepts_evolved and not _should_defer_optional_enrichment("prediction_resolution"):
+                _prediction_resolution_started = time.perf_counter()
+                for ec in concepts_evolved:
+                    resolve_predictions_for_concept(ec.concept_id, outcome="revised", outcome_source="evolution")
+                _record_learning_subphase(
+                    "prediction_resolution",
+                    (time.perf_counter() - _prediction_resolution_started) * 1000,
+                )
         except Exception as e:
             logger.debug(f"Wave 4b: prediction resolution skipped: {e}")
         _mark_phase("after_prediction_wave")
@@ -1799,12 +1948,21 @@ class SessionLearnMixin:
                 load_threads,
             )
             from app.ops.metrics import metrics as _thread_metrics
+            from app.storage import load_concept as _thread_load_concept
 
-            active_threads = load_threads(status="active") if concepts_created and not _wall_budget_exhausted_at("before_thread_autolink") else []
+            _thread_autolink_started = time.perf_counter()
+            active_threads = (
+                load_threads(status="active") if concepts_created
+                and not (
+                    _wall_budget_exhausted_at("before_thread_autolink")
+                    and _should_defer_optional_enrichment("thread_autolink")
+                )
+                else []
+            )
             guardrail_cache = build_thread_guardrail_cache(active_threads) if active_threads else {}
             if active_threads:
                 for lc in concepts_created:
-                    concept = _lc(lc.concept_id, track_access=False)
+                    concept = _thread_load_concept(lc.concept_id, track_access=False)
                     if concept:
                         decisions = auto_link_candidates(
                             concept,
@@ -1839,6 +1997,10 @@ class SessionLearnMixin:
                                 1.0,
                                 {"reason": decision.get("reason_code", "unknown")},
                             )
+                _record_learning_subphase(
+                    "thread_autolink",
+                    (time.perf_counter() - _thread_autolink_started) * 1000,
+                )
         except Exception as e:
             logger.debug(f"Wave 5: thread auto-link skipped: {e}")
         _mark_phase("after_thread_autolink")
@@ -2816,6 +2978,8 @@ class SessionLearnMixin:
         evolved_this_call: set = None,
         budget_remaining: int = 50,
         precomputed_dedup: list[dict] | None = None,  # PERF-021: batch pre-computed dedup results
+        should_defer_enrichment: Callable[[str], bool] | None = None,
+        record_subphase: Callable[[str, float], None] | None = None,
     ) -> dict:
         """Process a single extracted insight through dedup, creation, and association.
 
@@ -2825,6 +2989,16 @@ class SessionLearnMixin:
         """
         if evolved_this_call is None:
             evolved_this_call = set()
+
+        _insight_started = time.perf_counter()
+
+        def _record_elapsed_subphase(subphase: str, started: float = _insight_started) -> None:
+            if record_subphase is None:
+                return
+            try:
+                record_subphase(subphase, (time.perf_counter() - started) * 1000)
+            except Exception:
+                pass
 
         summary = insight["summary"]
         confidence = insight.get("confidence", 0.40)
@@ -2850,8 +3024,10 @@ class SessionLearnMixin:
 
         # INGEST-001 + PRICING-006: Budget-aware confidence floors
         if extraction_source == "heuristic" and confidence < heuristic_floor:
+            _record_elapsed_subphase("insight_skip")
             return {"action": "skipped_confidence_heuristic", "budget_zone": _budget_zone_value}
         elif confidence < client_floor:
+            _record_elapsed_subphase("insight_skip")
             return {"action": "skipped_confidence", "budget_zone": _budget_zone_value}
 
         # INGEST-001: Minimum summary quality
@@ -2861,11 +3037,13 @@ class SessionLearnMixin:
         summary_words = len(summary.split())
         _min_words = 4 if (extraction_source == "client" and insight.get("evidence")) else 8
         if summary_words < _min_words:
+            _record_elapsed_subphase("insight_skip")
             return {"action": "skipped_short_summary"}
 
         # INGEST-001: Evidence requirement for client-extracted concepts
         evidence = insight.get("evidence", [])
         if extraction_source == "client" and not evidence:
+            _record_elapsed_subphase("insight_skip")
             return {"action": "skipped_no_evidence"}
 
         # --- Deduplication via cosine similarity ---
@@ -3126,6 +3304,7 @@ class SessionLearnMixin:
 
         # Three-zone dedup logic (thresholds adapt to search method)
         if _dedup_zone == "SKIP":
+            _record_elapsed_subphase("insight_skip")
             return {"action": "skipped_duplicate", "dedup_zone": "SKIP",
                     "cosine": round(top_cosine, 4), "match_id": _match_id, "method": _dedup_method}
 
@@ -3207,6 +3386,7 @@ class SessionLearnMixin:
                         top_k=3,
                         min_confidence=0.0,
                     )
+                    _create_started = time.perf_counter()
                     result = self._create_new_concept(
                         insight,
                         request,
@@ -3214,7 +3394,10 @@ class SessionLearnMixin:
                         search_results,
                         extraction_source=extraction_source,
                         skip_write_contradiction=True,
+                        should_defer_enrichment=should_defer_enrichment,
+                        record_subphase=record_subphase,
                     )
+                    _record_elapsed_subphase("insight_create", _create_started)
                     # If creation succeeded, supersede the old concept
                     if result.get("action") == "created":
                         new_id = result["learned_concept"].concept_id
@@ -3236,6 +3419,7 @@ class SessionLearnMixin:
                     f"'{top_match['concept_id']}' (cosine={top_cosine:.2f})"
                 )
                 search_results = retrieval_engine.search_lightweight(summary, top_k=3, min_confidence=0.0)
+                _create_started = time.perf_counter()
                 result = self._create_new_concept(
                     insight,
                     request,
@@ -3243,7 +3427,10 @@ class SessionLearnMixin:
                     search_results,
                     extraction_source=extraction_source,
                     skip_write_contradiction=True,
+                    should_defer_enrichment=should_defer_enrichment,
+                    record_subphase=record_subphase,
                 )
+                _record_elapsed_subphase("insight_create", _create_started)
                 if result.get("action") == "created":
                     new_id = result["learned_concept"].concept_id
                     self._supersede_concept(
@@ -3278,10 +3465,13 @@ class SessionLearnMixin:
                         f"DEDUP_DECISION: zone=EVOLVE_CAPPED cosine={top_cosine:.4f} "
                         f"match={concept_id} method={_dedup_method} reason=per_call_cap"
                     )
+                    _record_elapsed_subphase("insight_skip")
                     return {"action": "skipped_per_call_cap", "dedup_zone": "EVOLVE_CAPPED",
                             "cosine": round(top_cosine, 4), "match_id": concept_id, "method": _dedup_method}
                 evolved_this_call.add(concept_id)
+                _evolve_started = time.perf_counter()
                 _evolve_result = self._evolve_existing_from_dedup(top_match, insight, request, extraction_source=extraction_source)
+                _record_elapsed_subphase("insight_evolve", _evolve_started)
                 _evolve_result["dedup_zone"] = "EVOLVE"
                 _evolve_result["cosine"] = round(top_cosine, 4)
                 _evolve_result["match_id"] = concept_id
@@ -3294,9 +3484,17 @@ class SessionLearnMixin:
             top_k=3,
             min_confidence=0.0,
         )
+        _create_started = time.perf_counter()
         result = self._create_new_concept(
-            insight, request, retrieval_engine, search_results, extraction_source=extraction_source
+            insight,
+            request,
+            retrieval_engine,
+            search_results,
+            extraction_source=extraction_source,
+            should_defer_enrichment=should_defer_enrichment,
+            record_subphase=record_subphase,
         )
+        _record_elapsed_subphase("insight_create", _create_started)
 
         # --- Trigger 1: Staleness check on embedding neighbors ---
         # The dedup above used TF-IDF (cosine < 0.50), but embedding search
@@ -3638,6 +3836,8 @@ class SessionLearnMixin:
                 "raw_knowledge_area": client_metadata.get("raw_knowledge_area"),
                 "knowledge_area_label_kind": client_metadata.get("knowledge_area_label_kind"),
                 "knowledge_area_facet": client_metadata.get("knowledge_area_facet"),
+                "client_topic_label": client_metadata.get("client_topic_label"),
+                "dynamic_ka_admission_reason": client_metadata.get("dynamic_ka_admission_reason"),
             }.items()
             if value is not None
         }
@@ -3705,6 +3905,7 @@ class SessionLearnMixin:
                 "associations": 0,
             }
 
+        _record_elapsed_subphase("insight_skip")
         return {"action": "skipped_duplicate"}
 
     def _create_new_concept(
@@ -3715,6 +3916,8 @@ class SessionLearnMixin:
         search_results,
         extraction_source: str = "heuristic",
         skip_write_contradiction: bool = False,
+        should_defer_enrichment: Callable[[str], bool] | None = None,
+        record_subphase: Callable[[str, float], None] | None = None,
     ) -> dict:
         """Create a new concept with PROVISIONAL maturity and content-hash ID.
 
@@ -3728,6 +3931,22 @@ class SessionLearnMixin:
         """
         summary = insight["summary"]
         concept_type = insight.get("type", "observation")
+
+        def _record_elapsed_subphase(subphase: str, started: float) -> None:
+            if record_subphase is None:
+                return
+            try:
+                record_subphase(subphase, (time.perf_counter() - started) * 1000)
+            except Exception:
+                pass
+
+        def _defer_optional(stage: str) -> bool:
+            if should_defer_enrichment is None:
+                return False
+            try:
+                return bool(should_defer_enrichment(stage))
+            except Exception:
+                return False
 
         # ORIENTATION_V2 Fix A4: Content-type consistency gate at ingestion
         # Demotes misclassified types (e.g., backlog labeled "decision", impl detail labeled "principle")
@@ -3759,15 +3978,26 @@ class SessionLearnMixin:
         # --- Knowledge area resolution ---
         # DEBT-030: normalize_knowledge_area + infer_knowledge_area hoisted to module-level import
 
+        client_metadata = insight.get("metadata") if isinstance(insight.get("metadata"), dict) else {}
+
         # For client extractions, use the provided knowledge_area if available
         if extraction_source == "client" and insight.get("knowledge_area"):
             raw_area = insight["knowledge_area"]
-            # KA-007: Client KA was already normalized in Tier 2 (strict=False).
-            # Use strict=False here to preserve novel client KAs instead of
-            # double-normalizing with strict=True which drops them to "unclassified".
-            knowledge_area, ka_source, ka_confidence = classify_knowledge_area(
-                summary=summary, raw_area=raw_area, strict=False
-            )
+            if client_metadata.get("knowledge_area_label_kind") in {"dynamic_domain", "dynamic_topic"}:
+                knowledge_area = str(raw_area).strip().lower()
+                ka_source = (
+                    "client_dynamic_topic"
+                    if client_metadata.get("knowledge_area_label_kind") == "dynamic_topic"
+                    else "client_dynamic"
+                )
+                ka_confidence = None
+            else:
+                # KA-007: Client KA was already normalized in Tier 2 (strict=False).
+                # Use strict=False here to preserve novel client KAs instead of
+                # double-normalizing with strict=True which drops them to "unclassified".
+                knowledge_area, ka_source, ka_confidence = classify_knowledge_area(
+                    summary=summary, raw_area=raw_area, strict=False
+                )
         else:
             raw_area = self._resolve_knowledge_area(request, search_results)
             # DEBT-108/KA-003: Shared multi-tier classification (keyword → embedding)
@@ -3847,7 +4077,6 @@ class SessionLearnMixin:
         _benchmark_temporal_override = _source_observation_ts if _session_learn_benchmark_mode_active() else None
         _created_at = _benchmark_temporal_override or now
         _original_date = _benchmark_temporal_override or _original_date
-        client_metadata = insight.get("metadata") if isinstance(insight.get("metadata"), dict) else {}
         benchmark_source_metadata = {
             key: value
             for key, value in client_metadata.items()
@@ -3875,12 +4104,21 @@ class SessionLearnMixin:
         }
         branch_provenance_metadata = _normalise_branch_provenance_metadata(insight, request)
         grounding_metadata = _normalise_grounding_metadata(insight)
+        lifecycle_probe_metadata = _normalise_lifecycle_probe_metadata(insight)
         boundary_metadata = {
             key: value
             for key, value in {
                 "raw_knowledge_area": client_metadata.get("raw_knowledge_area"),
                 "knowledge_area_label_kind": client_metadata.get("knowledge_area_label_kind"),
                 "knowledge_area_facet": client_metadata.get("knowledge_area_facet"),
+                "knowledge_area_dynamic_scope": client_metadata.get("knowledge_area_dynamic_scope")
+                or (
+                    "profile"
+                    if client_metadata.get("knowledge_area_label_kind") in {"dynamic_domain", "dynamic_topic"}
+                    else None
+                ),
+                "client_topic_label": client_metadata.get("client_topic_label"),
+                "dynamic_ka_admission_reason": client_metadata.get("dynamic_ka_admission_reason"),
             }.items()
             if value is not None
         }
@@ -3927,6 +4165,7 @@ class SessionLearnMixin:
                 **facet_metadata,
                 **branch_provenance_metadata,
                 **grounding_metadata,
+                **lifecycle_probe_metadata,
                 **boundary_metadata,
             },
         )
@@ -4073,6 +4312,7 @@ class SessionLearnMixin:
         # STABILITY-045: Queue expensive governance/similarity maintenance instead
         # of running it inline on the autolearn thread.
         _ss_result_data = None
+        _maintenance_started = time.perf_counter()
         try:
             from app.session.autolearn_maintenance import (
                 enqueue_autolearn_maintenance,
@@ -4093,6 +4333,8 @@ class SessionLearnMixin:
                 concept_id,
                 _maint_err,
             )
+        finally:
+            _record_elapsed_subphase("maintenance_enqueue", _maintenance_started)
 
         # RETRIEVAL-072: Deterministic write-time subject-key supersession.
         # Runs even when PITH_DISABLE_EVOLVE=true. Uses structured pattern
@@ -4105,6 +4347,7 @@ class SessionLearnMixin:
         # unified execute_supersession() writer so branch authority metadata can
         # be populated from ready provenance envelopes.
         _subject_key_deferred = False
+        _subject_key_started = time.perf_counter()
         try:
             from app.core.config import get_autolearn_subject_key_timeout_s
             from app.storage import apply_lifecycle_transition_conn, db_immediate
@@ -4112,32 +4355,40 @@ class SessionLearnMixin:
             _new_key = _extract_subject_key(_new_summary)
             _explicit_supersedes_declared = bool(insight.get("supersedes"))
             if _new_key and not _explicit_supersedes_declared:
-                with db_immediate(
-                    timeout_s=get_autolearn_subject_key_timeout_s(),
-                    operation="autolearn_subject_key_supersession",
-                ) as _sk_conn:
-                    # EUNOMIA-040 Fix 3: Index-backed subject-key lookup
-                    # instead of full-table scan + Python _extract_subject_key per row
-                    _sk_candidates = _sk_conn.execute(
-                        "SELECT id FROM concepts "
-                        "WHERE subject_key = ? AND superseded_by IS NULL AND id != ?",
-                        (_new_key, concept_id),
-                    ).fetchall()
-                    for (_sk_cid,) in _sk_candidates:
-                        # Same subject key — supersede the old one
-                        apply_lifecycle_transition_conn(
-                            _sk_conn,
-                            _sk_cid,
-                            "supersede",
-                            superseded_by=concept_id,
-                            reason="RETRIEVAL-072: subject-key dedup",
-                        )
-                        logger.info(
-                            "RETRIEVAL-072: Subject-key supersession: %s superseded %s "
-                            "(key='%s')",
-                            concept_id, _sk_cid, _new_key[:60],
-                        )
-                        break  # One supersession per write
+                if _defer_optional("subject_key_supersession"):
+                    _subject_key_deferred = True
+                    enqueue_subject_key_supersession(
+                        concept_id,
+                        new_concept.version,
+                        source="session_learn_subject_key_fallback",
+                    )
+                else:
+                    with db_immediate(
+                        timeout_s=get_autolearn_subject_key_timeout_s(),
+                        operation="autolearn_subject_key_supersession",
+                    ) as _sk_conn:
+                        # EUNOMIA-040 Fix 3: Index-backed subject-key lookup
+                        # instead of full-table scan + Python _extract_subject_key per row
+                        _sk_candidates = _sk_conn.execute(
+                            "SELECT id FROM concepts "
+                            "WHERE subject_key = ? AND superseded_by IS NULL AND id != ?",
+                            (_new_key, concept_id),
+                        ).fetchall()
+                        for (_sk_cid,) in _sk_candidates:
+                            # Same subject key — supersede the old one
+                            apply_lifecycle_transition_conn(
+                                _sk_conn,
+                                _sk_cid,
+                                "supersede",
+                                superseded_by=concept_id,
+                                reason="RETRIEVAL-072: subject-key dedup",
+                            )
+                            logger.info(
+                                "RETRIEVAL-072: Subject-key supersession: %s superseded %s "
+                                "(key='%s')",
+                                concept_id, _sk_cid, _new_key[:60],
+                            )
+                            break  # One supersession per write
             elif _new_key and _explicit_supersedes_declared:
                 logger.info(
                     "RETRIEVAL-072: Subject-key supersession skipped for %s because explicit supersedes is declared",
@@ -4158,6 +4409,7 @@ class SessionLearnMixin:
             except Exception:
                 pass
         finally:
+            _record_elapsed_subphase("subject_key_supersession", _subject_key_started)
             try:
                 kick_autolearn_maintenance_drain()
             except Exception as _kick_err:
@@ -4201,44 +4453,58 @@ class SessionLearnMixin:
         # --- L5: Auto-association (budget: 35ms) ---
         assoc_count = 0
         if request.auto_associate:
-            assoc_count = self._auto_associate(concept_id, search_results, retrieval_engine,
-                                                     cached_triples=self._cached_association_triples)
+            if _defer_optional("auto_association"):
+                assoc_count = 0
+            else:
+                _auto_association_started = time.perf_counter()
+                assoc_count = self._auto_associate(concept_id, search_results, retrieval_engine,
+                                                         cached_triples=self._cached_association_triples)
+                _record_elapsed_subphase("auto_association", _auto_association_started)
 
         # --- L6: Incremental index update ---
+        _index_update_started = time.perf_counter()
         try:
             retrieval_engine.add_concept(concept_id)
         except Exception as e:
             logger.warning(f"session_learn: index update failed for {concept_id}: {e}")
+        finally:
+            _record_elapsed_subphase("index_update", _index_update_started)
 
         # --- L6.5: Prospective indexing (RETRIEVAL-057) ---
         from app.core.config import PROSPECTIVE_INDEXING_ENABLED
         _benchmark_mode = os.environ.get("PITH_BENCHMARK_MODE", "").lower() in ("true", "1")
         if PROSPECTIVE_INDEXING_ENABLED and not _benchmark_mode:
-            try:
-                _evidence_strs_pi = []
-                for _e in insight.get("evidence", []):
-                    if isinstance(_e, str):
-                        _evidence_strs_pi.append(_e)
-                    elif isinstance(_e, dict):
-                        _evidence_strs_pi.append(_e.get("content", ""))
+            if _defer_optional("prospective_indexing_enqueue"):
+                logger.debug("RETRIEVAL-057: Deferred implications generation for %s", concept_id)
+            else:
+                _prospective_started = time.perf_counter()
+                try:
+                    _evidence_strs_pi = []
+                    for _e in insight.get("evidence", []):
+                        if isinstance(_e, str):
+                            _evidence_strs_pi.append(_e)
+                        elif isinstance(_e, dict):
+                            _evidence_strs_pi.append(_e.get("content", ""))
 
-                # Fire-and-forget via dedicated executor (non-blocking)
-                import concurrent.futures as _cf_pi
-                if not hasattr(self, '_pi_executor') or self._pi_executor is None:
-                    self._pi_executor = _cf_pi.ThreadPoolExecutor(
-                        max_workers=1, thread_name_prefix="prospective_idx"
+                    # Fire-and-forget via dedicated executor (non-blocking)
+                    import concurrent.futures as _cf_pi
+                    if not hasattr(self, '_pi_executor') or self._pi_executor is None:
+                        self._pi_executor = _cf_pi.ThreadPoolExecutor(
+                            max_workers=1, thread_name_prefix="prospective_idx"
+                        )
+                    self._pi_executor.submit(
+                        self._generate_implications,
+                        concept_id=concept_id,
+                        summary=summary,
+                        knowledge_area=knowledge_area,
+                        concept_type=insight.get("type", "observation"),
+                        evidence=_evidence_strs_pi[:3],
                     )
-                self._pi_executor.submit(
-                    self._generate_implications,
-                    concept_id=concept_id,
-                    summary=summary,
-                    knowledge_area=knowledge_area,
-                    concept_type=insight.get("type", "observation"),
-                    evidence=_evidence_strs_pi[:3],
-                )
-                logger.debug(f"RETRIEVAL-057: Queued implications generation for {concept_id}")
-            except Exception as e:
-                logger.debug(f"RETRIEVAL-057: Failed to queue implications: {e}")
+                    logger.debug(f"RETRIEVAL-057: Queued implications generation for {concept_id}")
+                except Exception as e:
+                    logger.debug(f"RETRIEVAL-057: Failed to queue implications: {e}")
+                finally:
+                    _record_elapsed_subphase("prospective_indexing_enqueue", _prospective_started)
         elif PROSPECTIVE_INDEXING_ENABLED and _benchmark_mode:
             logger.debug("RETRIEVAL-057: Skipped prospective indexing in benchmark mode")
 

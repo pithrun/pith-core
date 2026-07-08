@@ -230,6 +230,19 @@ async def phase2_reflection(conn=None, dry_run: bool = False) -> dict:
         return {"reflection_summary": {"status": "skipped", "reason": "no_consolidation_candidates"}}
     summary_dict = summary.model_dump() if hasattr(summary, "model_dump") else summary
     budget_status = getattr(summary, "budget_status", None)
+    merge_progress = getattr(summary, "merge_progress", {})
+    phase_budget_decisions = getattr(summary, "phase_budget_decisions", {})
+    if getattr(summary, "aborted", False) and budget_status == "paused_cap":
+        return {
+            "reflection_summary": summary_dict,
+            "budget_paused": True,
+            "budget_status": budget_status,
+            "abort_reason": getattr(summary, "abort_reason", None),
+            "last_completed_step": getattr(summary, "last_completed_step", None),
+            "abort_stage": getattr(summary, "abort_stage", None),
+            "phase_budget_decisions": phase_budget_decisions,
+            "merge_progress": merge_progress,
+        }
     if getattr(summary, "aborted", False) and budget_status == "deferred":
         return {
             "reflection_summary": summary_dict,
@@ -239,7 +252,8 @@ async def phase2_reflection(conn=None, dry_run: bool = False) -> dict:
             "last_completed_step": getattr(summary, "last_completed_step", None),
             "abort_stage": getattr(summary, "abort_stage", None),
             "deferred_phases": getattr(summary, "deferred_phases", []),
-            "phase_budget_decisions": getattr(summary, "phase_budget_decisions", {}),
+            "phase_budget_decisions": phase_budget_decisions,
+            "merge_progress": merge_progress,
         }
     if getattr(summary, "aborted", False):
         return {
@@ -249,6 +263,8 @@ async def phase2_reflection(conn=None, dry_run: bool = False) -> dict:
             "abort_reason": getattr(summary, "abort_reason", None),
             "last_completed_step": getattr(summary, "last_completed_step", None),
             "abort_stage": getattr(summary, "abort_stage", None),
+            "phase_budget_decisions": phase_budget_decisions,
+            "merge_progress": merge_progress,
         }
     return {"reflection_summary": summary_dict}
 
@@ -654,24 +670,38 @@ async def _phase2_9_pbc_reconcile(conn, dry_run: bool = False) -> dict:
     MAINT-004: Concepts that appear in governance_events with PRESENT_BOTH_CONTESTED
     should be promoted to currency_status='CONTESTED' if not already CONTRADICTED/CONTESTED.
     """
+    from app.governance.lifecycle_remediation import protects_lifecycle_remediated_current_head
+
     rows = conn.execute(
-        """SELECT DISTINCT concept_id FROM governance_events
-           WHERE details LIKE '%PRESENT_BOTH_CONTESTED%'"""
+        """SELECT DISTINCT c.id, c.status, c.is_current, c.superseded_by,
+                  c.currency_status, c.concept_type, c.data
+           FROM governance_events g
+           JOIN concepts c ON c.id = g.concept_id
+           WHERE g.details LIKE '%PRESENT_BOTH_CONTESTED%'"""
     ).fetchall()
-    ids = [r[0] for r in rows]
-    updated = 0
+    protected_ids = [r["id"] for r in rows if protects_lifecycle_remediated_current_head(r)]
+    ids = [
+        r["id"]
+        for r in rows
+        if r["id"] not in protected_ids
+        and r["currency_status"] not in {"CONTRADICTED", "CONTESTED"}
+    ]
     if ids and not dry_run:
         conn.execute(
             f"""UPDATE concepts SET currency_status='CONTESTED'
-                WHERE id IN ({','.join('?' * len(ids))})
-                AND currency_status NOT IN ('CONTRADICTED','CONTESTED')""",
+                WHERE id IN ({','.join('?' * len(ids))})""",
             ids,
         )
         updated = conn.execute("SELECT changes()").fetchone()[0]
-    elif ids and dry_run:
-        updated = len(ids)
-    logger.info("MAINT-004 PBC reconcile: %d concepts → CONTESTED (dry_run=%s)", updated, dry_run)
-    return {"pbc_reconciled": updated, "status": "ok"}
+    else:
+        updated = len(ids) if dry_run else 0
+    logger.info(
+        "MAINT-004 PBC reconcile: %d concepts → CONTESTED, %d protected current heads (dry_run=%s)",
+        updated,
+        len(protected_ids),
+        dry_run,
+    )
+    return {"pbc_reconciled": updated, "pbc_current_head_protected": len(protected_ids), "status": "ok"}
 
 
 async def _phase2_10_ghost_superseder_cleanup(conn, dry_run: bool = False) -> dict:
@@ -2191,6 +2221,15 @@ async def run_maintenance(
                 )
                 report.warnings.append(warning_msg)
                 logger.warning(warning_msg)
+            elif result.get("budget_paused"):
+                logger.info(
+                    "Phase %s (%s) paused within reflection budget: %s after %s; merge_progress=%s",
+                    phase_num,
+                    phase_name,
+                    result.get("abort_reason", "unknown"),
+                    result.get("abort_stage") or result.get("last_completed_step") or "unknown",
+                    result.get("merge_progress", {}),
+                )
             elif result.get("budget_deferred"):
                 logger.info(
                     "Phase %s (%s) deferred within reflection budget: %s after %s",
@@ -2279,15 +2318,36 @@ def _write_heartbeat(report: MaintenanceReport, *, source: str = "manual") -> No
         }
         reflection_result = report.results.get("reflection")
         if reflection_result:
+            reflection_summary = reflection_result.get("reflection_summary")
+            if not isinstance(reflection_summary, dict):
+                reflection_summary = {}
+            merge_progress = reflection_result.get("merge_progress")
+            if merge_progress is None:
+                merge_progress = reflection_summary.get("merge_progress", {})
+            if not isinstance(merge_progress, dict):
+                merge_progress = {}
+            budget_status = reflection_result.get("budget_status")
+            if budget_status == "paused_cap" and merge_progress.get("status") == "paused_cap":
+                progress_state = "paused_cap_progressing"
+            elif reflection_result.get("budget_deferred"):
+                progress_state = "deferred"
+            elif reflection_result.get("budget_aborted"):
+                progress_state = "aborted"
+            else:
+                progress_state = "completed"
             heartbeat["reflection_status"] = {
                 "budget_aborted": bool(reflection_result.get("budget_aborted")),
                 "budget_deferred": bool(reflection_result.get("budget_deferred")),
-                "budget_status": reflection_result.get("budget_status"),
+                "budget_paused": bool(reflection_result.get("budget_paused")),
+                "budget_status": budget_status,
                 "abort_reason": reflection_result.get("abort_reason"),
                 "last_completed_step": reflection_result.get("last_completed_step"),
                 "abort_stage": reflection_result.get("abort_stage"),
                 "elapsed_seconds": reflection_result.get("elapsed_seconds"),
                 "deferred_phases": reflection_result.get("deferred_phases", []),
+                "phase_budget_decisions": reflection_result.get("phase_budget_decisions", {}),
+                "merge_progress": merge_progress,
+                "progress_state": progress_state,
             }
         os.makedirs(os.path.dirname(heartbeat_path), exist_ok=True)
         with open(heartbeat_path, "w") as f:
@@ -2431,17 +2491,38 @@ def strip_superseded_prefix(conn) -> dict:
 
             # Re-embed with clean summary
             try:
-                from app.retrieval import retrieval_engine
+                import numpy as np
 
-                if retrieval_engine and hasattr(retrieval_engine, "embedding_engine"):
-                    embedding = retrieval_engine.embedding_engine.embed_text(new_summary.strip())
-                    if embedding:
-                        import struct
+                from app.retrieval.searchable_text import build_searchable_text, embedding_freshness_metadata
+                from app.storage.embedding import EMBEDDING_VERSION, embedding_engine
 
-                        blob = struct.pack(f"{len(embedding)}f", *embedding)
+                if embedding_engine.is_available:
+                    searchable_text = build_searchable_text(
+                        {
+                            "data": payload,
+                            "summary": new_summary.strip(),
+                            "fragment_keywords": payload.get("fragment_keywords", ""),
+                        }
+                    )
+                    embedding = embedding_engine.embed_text(searchable_text)
+                    if embedding is not None:
+                        emb = np.asarray(embedding, dtype=np.float32)
+                        metadata = embedding_freshness_metadata(searchable_text)
                         conn.execute(
-                            "UPDATE concepts SET embedding = ? WHERE id = ?",
-                            (blob, concept_id),
+                            """UPDATE concepts
+                               SET embedding = ?, embedding_version = ?,
+                                   embedding_text_hash = ?,
+                                   embedding_text_contract_version = ?,
+                                   embedding_refreshed_at = ?
+                               WHERE id = ?""",
+                            (
+                                emb.tobytes(),
+                                EMBEDDING_VERSION,
+                                metadata["embedding_text_hash"],
+                                metadata["embedding_text_contract_version"],
+                                metadata["embedding_refreshed_at"],
+                                concept_id,
+                            ),
                         )
                         stats["re_embedded"] += 1
             except Exception as embed_err:

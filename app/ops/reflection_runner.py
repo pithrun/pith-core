@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import fcntl
 import json
 import logging
 import os
@@ -25,6 +24,7 @@ from typing import Any
 
 from app.cognitive.reflection import reflection_engine
 from app.core.datetime_utils import _utc_now_iso
+from app.core.file_lock import lock_file_exclusive, unlock_file
 from app.core.fork_safety import should_suppress_optional_subprocess
 from app.core.profile import resolve_data_dir
 from app.ops.metrics import metrics
@@ -551,7 +551,7 @@ class ReflectionRunner:
         handle = lock_path.open("a+", encoding="utf-8")
         try:
             try:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                lock_file_exclusive(handle)
             except BlockingIOError:
                 yield ReflectionAdmission(
                     accepted=False,
@@ -564,7 +564,7 @@ class ReflectionRunner:
             yield None
         finally:
             with contextlib.suppress(Exception):
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                unlock_file(handle)
             handle.close()
 
     def _set_active_run(self, run_id: str, request: ReflectionRunRequest, started_at: str) -> dict[str, Any]:
@@ -651,7 +651,12 @@ class ReflectionRunner:
         if summary is None:
             return "skipped"
         if getattr(summary, "aborted", False):
-            return "deferred" if getattr(summary, "budget_status", None) == "deferred" else "aborted"
+            budget_status = getattr(summary, "budget_status", None)
+            if budget_status == "deferred":
+                return "deferred"
+            if budget_status == "paused_cap":
+                return "paused"
+            return "aborted"
         return "completed"
 
     def _finish_rejected(

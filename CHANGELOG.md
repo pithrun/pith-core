@@ -4,6 +4,17 @@ All notable changes to Pith are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.6] - 2026-07-07
+
+### Changed
+- Publishes the current public developer preview as macOS-only.
+- Removes unsupported Windows installer and zip assets from the public release payload.
+- Updates public install copy and packaging metadata so the release does not imply Windows support.
+
+### Fixed
+- Rebuilds the server tarball without macOS AppleDouble metadata files.
+- Adds release-build safeguards so generated Python caches and macOS metadata do not ship in the tarball.
+
 ## [1.0.5] - 2026-06-26
 
 ### Added

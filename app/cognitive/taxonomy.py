@@ -268,6 +268,8 @@ class KnowledgeAreaBoundaryResult:
     label_kind: str
     facet: str | None = None
     confidence: float | None = None
+    client_topic_label: str | None = None
+    dynamic_ka_admission_reason: str | None = None
 
 
 _SOURCE_CONTEXT_LABELS = {"conversation"}
@@ -297,6 +299,77 @@ _KNOWN_CONCEPT_TYPE_LABELS = {
     "preference",
     "principle",
 }
+_RESERVED_DYNAMIC_KA_LABELS = (
+    {"general", "unclassified", "unknown"}
+    | _SOURCE_CONTEXT_LABELS
+    | _KNOWN_FACET_LABELS
+    | _KNOWN_CONCEPT_TYPE_LABELS
+)
+_SAFE_DYNAMIC_KA_RE = re.compile(r"^[a-z0-9][a-z0-9_]{2,79}$")
+_DYNAMIC_TOPIC_MARKERS = {"probe", "sentinel", "dogfood"}
+_DYNAMIC_TOPIC_TAIL_TOKENS = {
+    "campaign",
+    "campaigns",
+    "experiment",
+    "experiments",
+    "playbook",
+    "playbooks",
+    "runbook",
+    "runbooks",
+    "workflow",
+    "workflows",
+}
+_DYNAMIC_TOPIC_META_TOKENS = {
+    "data",
+    "dynamic",
+    "ka",
+    "knowledge",
+    "area",
+    "label",
+    "labels",
+}
+_DYNAMIC_TOPIC_DATA_TOKEN_RE = re.compile(r"^data_?\d+[a-z]*$")
+_DYNAMIC_TOPIC_DATE_TOKEN_RE = re.compile(r"^\d{6,}(?:t?\d{2,}z?)?$")
+
+
+def _is_safe_dynamic_ka_label(raw: str) -> bool:
+    if raw in _RESERVED_DYNAMIC_KA_LABELS:
+        return False
+    if not _SAFE_DYNAMIC_KA_RE.fullmatch(raw):
+        return False
+    return "__" not in raw and not raw.endswith("_")
+
+
+def _is_granular_dynamic_topic(tokens: list[str]) -> bool:
+    return any(
+        token in _DYNAMIC_TOPIC_MARKERS
+        or _DYNAMIC_TOPIC_DATA_TOKEN_RE.fullmatch(token)
+        or _DYNAMIC_TOPIC_DATE_TOKEN_RE.fullmatch(token)
+        for token in tokens
+    )
+
+
+def _derive_dynamic_topic_domain(raw: str) -> tuple[str | None, str | None]:
+    tokens = [token for token in raw.split("_") if token]
+    if not tokens or not _is_granular_dynamic_topic(tokens):
+        return None, None
+
+    semantic_tokens = [
+        token
+        for token in tokens
+        if token not in _DYNAMIC_TOPIC_MARKERS
+        and token not in _DYNAMIC_TOPIC_TAIL_TOKENS
+        and token not in _DYNAMIC_TOPIC_META_TOKENS
+        and not _DYNAMIC_TOPIC_DATA_TOKEN_RE.fullmatch(token)
+        and not _DYNAMIC_TOPIC_DATE_TOKEN_RE.fullmatch(token)
+    ]
+    if not semantic_tokens:
+        return None, "granular_dynamic_label_no_domain"
+
+    candidate = "_".join(semantic_tokens[:2])
+    if candidate == raw or not _is_safe_dynamic_ka_label(candidate):
+        return None, "granular_dynamic_label_no_safe_domain"
+    return candidate, "granular_dynamic_label"
 
 
 def _probe_canonical_or_alias_no_warning(raw: str) -> tuple[str | None, str | None]:
@@ -363,6 +436,30 @@ def normalize_knowledge_area_boundary(
             "facet",
             raw,
         )
+
+    if not strict and _is_safe_dynamic_ka_label(raw):
+        topic_domain, topic_reason = _derive_dynamic_topic_domain(raw)
+        if topic_domain:
+            _ensure_provisional(topic_domain, source="client_dynamic")
+            return KnowledgeAreaBoundaryResult(
+                topic_domain,
+                "client_dynamic_topic",
+                raw,
+                "dynamic_topic",
+                client_topic_label=raw,
+                dynamic_ka_admission_reason=topic_reason,
+            )
+        if topic_reason:
+            normalized, source = normalize_knowledge_area(raw, strict=strict)
+            return KnowledgeAreaBoundaryResult(
+                normalized,
+                source,
+                raw,
+                "unknown",
+                dynamic_ka_admission_reason=topic_reason,
+            )
+        _ensure_provisional(raw, source="client_dynamic")
+        return KnowledgeAreaBoundaryResult(raw, "client_dynamic", raw, "dynamic_domain")
 
     normalized, source = normalize_knowledge_area(raw, strict=strict)
     return KnowledgeAreaBoundaryResult(normalized, source, raw, "unknown")

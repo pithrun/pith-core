@@ -333,6 +333,50 @@ def fail_lifecycle_job(
         )
 
 
+def terminalize_exhausted_stale_lifecycle_jobs(
+    *,
+    profile: str,
+    stale_before_iso: str,
+    max_attempts: int,
+    error: str,
+    now: str | None = None,
+    source: str | None = None,
+) -> int:
+    """Fail stale running jobs that can no longer be claimed."""
+    if source is not None and source not in VALID_SOURCES:
+        raise ValueError(f"invalid lifecycle job source: {source}")
+    ts = now or _utc_now_iso()
+    with _db(operation="lifecycle_terminalize_exhausted_stale") as conn:
+        cur = conn.execute(
+            """UPDATE lifecycle_jobs
+               SET status='failed',
+                   last_error=?,
+                   lease_owner=NULL,
+                   lease_expires_at=NULL,
+                   next_retry_at=NULL,
+                   updated_at=?
+               WHERE profile=?
+                 AND (? IS NULL OR source=?)
+                 AND status='running'
+                 AND attempts >= ?
+                 AND (
+                    (lease_expires_at IS NOT NULL AND lease_expires_at <= ?)
+                    OR (updated_at IS NOT NULL AND updated_at < ?)
+                 )""",
+            (
+                error[:1000],
+                ts,
+                profile,
+                source,
+                source,
+                max(0, int(max_attempts or 0)),
+                ts,
+                stale_before_iso,
+            ),
+        )
+        return int(cur.rowcount or 0)
+
+
 def count_failed_lifecycle_jobs_by_error(
     *,
     profile: str,

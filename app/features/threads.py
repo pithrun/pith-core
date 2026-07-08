@@ -1412,7 +1412,11 @@ def _resolve_lifecycle_thread(
             return resolved, terminal
     if require_exact_when_implicit:
         raise ValueError("thread_id_or_exact_binding_required")
-    active = load_active_workstream_binding_checkpoint(origin_id=origin_id, session_id=session_id)
+    active = load_active_workstream_binding_checkpoint(
+        origin_id=origin_id,
+        session_id=session_id,
+        current_task_id=current_task_id,
+    )
     resolved = (active.get("context") or {}).get("workstream_thread_id") if active else None
     if not resolved:
         raise ValueError("thread_id_or_active_binding_required")
@@ -2111,6 +2115,7 @@ def load_terminal_exact_workstream_binding_checkpoint(
 def load_active_workstream_binding_checkpoint(
     origin_id: str | None = None,
     session_id: str | None = None,
+    current_task_id: str | None = None,
     max_age_hours: int = 24,
 ) -> dict | None:
     """Load only active Workstream binding checkpoints for an origin/session authority."""
@@ -2121,7 +2126,7 @@ def load_active_workstream_binding_checkpoint(
 
     authority_predicate = "origin_id = ?" if authority_type == "origin_id" else "session_id = ?"
     with read_snapshot_db("load_active_workstream_binding_checkpoint") as conn:
-        row = conn.execute(
+        rows = conn.execute(
             f"""
             SELECT * FROM checkpoints
             WHERE status NOT IN ('complete', 'archived')
@@ -2131,11 +2136,41 @@ def load_active_workstream_binding_checkpoint(
               AND json_extract(context, '$.workstream_thread_id') IS NOT NULL
               AND {authority_predicate}
             ORDER BY updated_at DESC
-            LIMIT 1
+            LIMIT 20
             """,
             (_utc_now_iso(), cutoff, authority_value),
-        ).fetchone()
-    return _checkpoint_row_to_dict(row, selection_source=authority_type, selection_authority="authoritative")
+        ).fetchall()
+    for row in rows:
+        checkpoint = _checkpoint_row_to_dict(row, selection_source=authority_type, selection_authority="authoritative")
+        if _workstream_binding_checkpoint_applies_to_task(checkpoint, current_task_id):
+            return checkpoint
+    return None
+
+
+def _workstream_binding_checkpoint_matches_task_stamp(checkpoint: dict | None, current_task_id: str | None) -> bool | None:
+    if not checkpoint:
+        return False
+    context = checkpoint.get("context") or {}
+    checkpoint_task = context.get("current_task_id")
+    checkpoint_hash = context.get("current_task_hash")
+    if not checkpoint_task and not checkpoint_hash:
+        return None
+    if not current_task_id:
+        return False
+    normalized_task = _normalize_activation_task_id(current_task_id)
+    if checkpoint_task:
+        try:
+            return _normalize_activation_task_id(checkpoint_task) == normalized_task
+        except Exception:
+            return False
+    return str(checkpoint_hash) == _current_task_hash(normalized_task)
+
+
+def _workstream_binding_checkpoint_applies_to_task(checkpoint: dict | None, current_task_id: str | None) -> bool:
+    task_match = _workstream_binding_checkpoint_matches_task_stamp(checkpoint, current_task_id)
+    if task_match is None:
+        return bool(checkpoint)
+    return task_match
 
 
 def clear_workstream_binding(
@@ -2170,7 +2205,11 @@ def clear_workstream_binding(
     binding_authority, _ = _workstream_binding_authority(origin_id=origin_id, session_id=session_id)
     target_thread_id = str(thread_id).strip() if thread_id else None
     if target_thread_id is None:
-        checkpoint = load_active_workstream_binding_checkpoint(origin_id=origin_id, session_id=session_id)
+        checkpoint = load_active_workstream_binding_checkpoint(
+            origin_id=origin_id,
+            session_id=session_id,
+            current_task_id=current_task_id,
+        )
         context = checkpoint.get("context", {}) if checkpoint else {}
         target_thread_id = context.get("workstream_thread_id")
     if not target_thread_id:
@@ -2223,6 +2262,50 @@ def _load_workstream_skip(
     return None
 
 
+def _workstream_skip_scope(skip_checkpoint: dict, current_task_id: str | None) -> dict:
+    context = skip_checkpoint.get("context") or {}
+    authority = (
+        context.get("binding_authority")
+        or skip_checkpoint.get("selection_source")
+        or "unknown"
+    )
+    normalized_task = _normalize_activation_task_id(current_task_id) if current_task_id else None
+    exact_task = bool(normalized_task and context.get("current_task_id") == normalized_task)
+    return {
+        "scope": "task" if exact_task else f"broad_{authority}",
+        "applies_to_current_task": exact_task,
+        "required_action": None if exact_task else "provide_current_task_id_or_clear_skip",
+    }
+
+
+def _build_workstream_task_identity_required_decision(
+    *,
+    recommended_count: int,
+    possible_match_count: int = 0,
+    advisory_candidate_count: int = 0,
+    proof_or_maintenance_count: int,
+    needs_review_count: int,
+) -> dict:
+    return {
+        "read_only": True,
+        "current_task_id_present": False,
+        "active_binding_related": None,
+        "recommended_count": recommended_count,
+        "possible_match_count": possible_match_count,
+        "advisory_candidate_count": advisory_candidate_count,
+        "proof_or_maintenance_count": proof_or_maintenance_count,
+        "needs_review_count": needs_review_count,
+        "skip_allowed": True,
+        "skip_requires_reason": True,
+        "skip_exception_kinds": sorted(WORKSTREAM_ACTIVATION_SKIP_EXCEPTION_KINDS),
+        "suggested_create_metadata": _activation_create_metadata(None),
+        "decision_options": _activation_decision_options(),
+        "decision_kind": "task_identity_required",
+        "required_action": "provide_current_task_id_or_clear_skip",
+        "recommended_next_action": "provide_current_task_id_or_clear_skip",
+    }
+
+
 def build_workstream_activation_hint(
     origin_id: str | None = None,
     session_id: str | None = None,
@@ -2272,6 +2355,7 @@ def build_workstream_activation_hint(
             active_checkpoint = load_active_workstream_binding_checkpoint(
                 origin_id=origin_id,
                 session_id=session_id,
+                current_task_id=current_task_id,
             )
     except ValueError as exc:
         return {
@@ -2313,7 +2397,12 @@ def build_workstream_activation_hint(
                 proof_or_maintenance_count=0,
                 needs_review_count=0,
                 current_task_id=current_task_id,
-                active_binding_related=True if binding_source in {"composite_task", "session_task"} else None,
+                active_binding_related=(
+                    True
+                    if binding_source in {"composite_task", "session_task"}
+                    or _workstream_binding_checkpoint_matches_task_stamp(active_checkpoint, current_task_id) is True
+                    else None
+                ),
             ),
         }
 
@@ -2324,17 +2413,40 @@ def build_workstream_activation_hint(
     )
     if explicit_skip:
         skip_context = explicit_skip.get("context") or {}
+        skip_scope = _workstream_skip_scope(explicit_skip, current_task_id)
+        explicit_skip_payload = {
+            "status": explicit_skip.get("status"),
+            "checkpoint_task_id": explicit_skip.get("task_id"),
+            "current_task_id": skip_context.get("current_task_id"),
+            "skip_exception_kind": _normalize_skip_exception_kind(skip_context.get("skip_exception_kind")),
+            "scope": skip_scope["scope"],
+            "applies_to_current_task": skip_scope["applies_to_current_task"],
+            "required_action": skip_scope["required_action"],
+        }
+        if not skip_scope["applies_to_current_task"]:
+            return {
+                "status": "ok",
+                "activation_state": "task_identity_required",
+                "read_only": True,
+                "active_binding": None,
+                "explicit_skip": explicit_skip_payload,
+                "decision_needed": True,
+                "candidate_detail_available": True,
+                "origin_id_present": bool(origin_id),
+                "session_id_present": bool(session_id),
+                "current_task_id_present": bool(current_task_id),
+                "activation_decision": _build_workstream_task_identity_required_decision(
+                    recommended_count=0,
+                    proof_or_maintenance_count=0,
+                    needs_review_count=0,
+                ),
+            }
         return {
             "status": "ok",
             "activation_state": "explicit_skip",
             "read_only": True,
             "active_binding": None,
-            "explicit_skip": {
-                "status": explicit_skip.get("status"),
-                "checkpoint_task_id": explicit_skip.get("task_id"),
-                "current_task_id": skip_context.get("current_task_id"),
-                "skip_exception_kind": _normalize_skip_exception_kind(skip_context.get("skip_exception_kind")),
-            },
+            "explicit_skip": explicit_skip_payload,
             "decision_needed": False,
             "origin_id_present": bool(origin_id),
             "session_id_present": bool(session_id),
@@ -2577,6 +2689,7 @@ def ensure_workstream_activation(
                     active_checkpoint = load_active_workstream_binding_checkpoint(
                         origin_id=origin_id,
                         session_id=session_id,
+                        current_task_id=current_task_id,
                     )
                 if active_checkpoint:
                     context = active_checkpoint.get("context", {})
@@ -2619,7 +2732,10 @@ def ensure_workstream_activation(
             active.get("thread_id") if active else None,
             _activation_topic_tokens(current_task_id, situation),
         )
-        if active and active.get("binding_source") in {"composite_task", "session_task"}:
+        if active and (
+            active.get("binding_source") in {"composite_task", "session_task"}
+            or _workstream_binding_checkpoint_matches_task_stamp(active_checkpoint, current_task_id) is True
+        ):
             active_related = True
         activation_decision = _build_workstream_activation_decision(
             active_binding=active,
@@ -2633,6 +2749,28 @@ def ensure_workstream_activation(
             current_task_id=current_task_id,
             active_binding_related=active_related,
         )
+        explicit_skip_payload = None
+        if explicit_skip:
+            skip_context = explicit_skip.get("context") or {}
+            skip_scope = _workstream_skip_scope(explicit_skip, current_task_id)
+            explicit_skip_payload = {
+                "status": explicit_skip.get("status"),
+                "checkpoint_task_id": explicit_skip.get("task_id"),
+                "skip_reason": skip_context.get("skip_reason"),
+                "skip_exception_kind": _normalize_skip_exception_kind(skip_context.get("skip_exception_kind")),
+                "current_task_id": skip_context.get("current_task_id"),
+                "scope": skip_scope["scope"],
+                "applies_to_current_task": skip_scope["applies_to_current_task"],
+                "required_action": skip_scope["required_action"],
+            }
+            if not skip_scope["applies_to_current_task"]:
+                activation_decision = _build_workstream_task_identity_required_decision(
+                    recommended_count=counts["recommended"],
+                    possible_match_count=counts["possible_matches"],
+                    advisory_candidate_count=counts["advisory_candidates"],
+                    proof_or_maintenance_count=counts["proof_or_maintenance"],
+                    needs_review_count=counts["needs_review"],
+                )
         _record_workstream_metric(
             "workstream_activation_decision",
             {
@@ -2653,19 +2791,7 @@ def ensure_workstream_activation(
             "mode": "candidate",
             "read_only": True,
             "active_binding": active,
-            "explicit_skip": (
-                {
-                    "status": explicit_skip.get("status"),
-                    "checkpoint_task_id": explicit_skip.get("task_id"),
-                    "skip_reason": (explicit_skip.get("context") or {}).get("skip_reason"),
-                    "skip_exception_kind": _normalize_skip_exception_kind(
-                        (explicit_skip.get("context") or {}).get("skip_exception_kind")
-                    ),
-                    "current_task_id": (explicit_skip.get("context") or {}).get("current_task_id"),
-                }
-                if explicit_skip
-                else None
-            ),
+            "explicit_skip": explicit_skip_payload,
             "recommended": split["recommended"],
             "advisory_candidates": split["advisory_candidates"],
             "possible_matches": split["possible_matches"],
@@ -2750,7 +2876,11 @@ def ensure_workstream_activation(
             current_task_id=current_task_id,
         )
         if previous is None:
-            previous = load_active_workstream_binding_checkpoint(origin_id=origin_id, session_id=session_id)
+            previous = load_active_workstream_binding_checkpoint(
+                origin_id=origin_id,
+                session_id=session_id,
+                current_task_id=current_task_id,
+            )
         previous_context = previous.get("context", {}) if previous else {}
         previous_thread_id = previous_context.get("workstream_thread_id")
         if previous and previous_thread_id and previous_thread_id != normalized_thread_id:
@@ -2900,10 +3030,10 @@ def resolve_active_workstream(
             binding_status = checkpoint.get("selection_source") or "exact_task"
     if origin_id:
         if checkpoint is None:
-            checkpoint = load_active_workstream_binding_checkpoint(origin_id=origin_id)
+            checkpoint = load_active_workstream_binding_checkpoint(origin_id=origin_id, current_task_id=current_task_id)
             binding_status = "origin_id"
     if checkpoint is None and session_id:
-        checkpoint = load_active_workstream_binding_checkpoint(session_id=session_id)
+        checkpoint = load_active_workstream_binding_checkpoint(session_id=session_id, current_task_id=current_task_id)
         binding_status = "session_id"
 
     context = checkpoint.get("context", {}) if checkpoint else {}

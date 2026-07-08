@@ -16,7 +16,10 @@ from app.storage import (
     save_concept,
     save_concept_conn,
 )
-from app.cognitive.taxonomy import classify_knowledge_area  # KA-001/DEBT-108 (DEBT-112: removed unused imports)
+from app.cognitive.taxonomy import (  # KA-001/DEBT-108 (DEBT-112: removed unused imports)
+    classify_knowledge_area,
+    normalize_knowledge_area_boundary,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -83,11 +86,22 @@ def validate_proposal(proposal: ConceptProposal) -> tuple[bool, str]:
 def create_concept(proposal: ConceptProposal) -> Concept:
     """Create new concept from proposal."""
     # DEBT-108/KA-003: Shared multi-tier classification (keyword → embedding)
-    normalized_area, ka_source, ka_confidence = classify_knowledge_area(
+    boundary = normalize_knowledge_area_boundary(
+        proposal.knowledge_area or "general",
         summary=proposal.summary or "",
-        raw_area=proposal.knowledge_area or "general",
+        concept_type=getattr(proposal, "concept_type", None),
         strict=False,
     )
+    if boundary.label_kind in {"dynamic_domain", "dynamic_topic"}:
+        normalized_area = boundary.canonical_knowledge_area
+        ka_source = boundary.source
+        ka_confidence = boundary.confidence
+    else:
+        normalized_area, ka_source, ka_confidence = classify_knowledge_area(
+            summary=proposal.summary or "",
+            raw_area=boundary.canonical_knowledge_area or proposal.knowledge_area or "general",
+            strict=False,
+        )
     normalized_area, ka_admission_metadata = resolve_ka_admission(
         summary=proposal.summary or "",
         knowledge_area=normalized_area,
@@ -98,6 +112,20 @@ def create_concept(proposal: ConceptProposal) -> Concept:
         trusted_intentional_general=False,
         now=_utc_now_iso(),
     )
+    boundary_metadata = {
+        key: value
+        for key, value in {
+            "raw_knowledge_area": boundary.raw_knowledge_area,
+            "knowledge_area_label_kind": boundary.label_kind,
+            "knowledge_area_facet": boundary.facet,
+            "knowledge_area_dynamic_scope": "profile"
+            if boundary.label_kind in {"dynamic_domain", "dynamic_topic"}
+            else None,
+            "client_topic_label": boundary.client_topic_label,
+            "dynamic_ka_admission_reason": boundary.dynamic_ka_admission_reason,
+        }.items()
+        if value is not None
+    }
     # Memory Integrity §5.2.3: Evidence method anti-spoofing
     sanitized_evidence = proposal.evidence
     try:
@@ -147,6 +175,7 @@ def create_concept(proposal: ConceptProposal) -> Concept:
             "knowledge_area": normalized_area,
             "knowledge_area_source": ka_source,
             **ka_admission_metadata,
+            **boundary_metadata,
             "created_by": "learning_engine",
             "agent_id": proposal.agent_id,
         },

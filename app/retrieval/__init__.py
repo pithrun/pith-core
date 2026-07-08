@@ -10,8 +10,8 @@ P0.3: Hybrid architecture — embeddings for search, TF-IDF for dedup/auto-assoc
 
 import collections
 import contextlib
-import fcntl
 import functools
+import hashlib
 import json
 import logging
 import math
@@ -20,6 +20,7 @@ import re
 import shutil
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,7 @@ import numpy as np
 
 from app.core.datetime_utils import _ensure_aware, _utc_now
 from app.core.deadline import TurnDeadline
+from app.core.file_lock import lock_fd_exclusive, unlock_fd
 from app.core.foreground_contract import (
     ForegroundContractConfig,
     ForegroundDecision,
@@ -38,12 +40,18 @@ from app.core.profile import resolve_data_dir
 from app.retrieval import refresh_drain as _refresh_drain
 from app.retrieval.incremental_tfidf import IncrementalTfidfIndex
 from app.retrieval.query_intent import QueryIntentExpansion, expand_query_intent
-from app.retrieval.searchable_text import build_searchable_text
+from app.retrieval.searchable_text import (
+    EMBEDDING_TEXT_CONTRACT_VERSION,
+    build_searchable_text,
+    build_searchable_text_from_concept,
+    embedding_freshness_metadata,
+)
 from app.storage import (  # DEBT-022: hoisted from function-level
     INDEX_DIR,
     list_concepts,
     list_concepts_full,
     load_concept,
+    load_concepts_batch,
     read_snapshot_db,  # T2-3: RLock-free read path for retrieval
 )
 from app.storage.embedding import EMBEDDING_DIM, EMBEDDING_VERSION, embedding_engine
@@ -96,6 +104,87 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+_EMBEDDING_FRESHNESS_MODES = {"observe", "repair", "enforce"}
+_SEMANTIC_WARM_READINESS_SCHEMA = "retrieval.semantic_warm_readiness.v1"
+_SEMANTIC_WARM_READY_STATES = frozenset({"not_started", "running", "ready", "failed", "skipped", "cancelled"})
+_SEMANTIC_WARM_SOURCES = frozenset({"startup", "foreground", "direct", "unknown"})
+_SEMANTIC_FULL_SEARCH_WAIT_BUDGET_MS = 50
+_SEMANTIC_FULL_SEARCH_MAX_UNGAUNTLETED_WAIT_MS = 100
+_PRELOAD_RECENT_P95_SKIP_MS = 150.0
+_PRELOAD_MIN_DEADLINE_REMAINING_MS = 250.0
+_PRELOAD_RECENT_SAMPLE_SIZE = 32
+
+
+@dataclass(frozen=True)
+class SemanticAdmissionDecision:
+    use_semantic: bool
+    semantic_state: str
+    semantic_admission: str
+    skip_reason: str | None
+    wait_ms: float
+    foreground_init_attempted: bool
+
+
+def _default_semantic_warm_readiness() -> dict[str, Any]:
+    return {
+        "schema_version": _SEMANTIC_WARM_READINESS_SCHEMA,
+        "state": "not_started",
+        "source": "unknown",
+        "last_attempt_at": None,
+        "last_success_at": None,
+        "last_failure_at": None,
+        "last_result": None,
+        "error_type": None,
+        "query_path_warmed": False,
+    }
+
+
+def _bounded_warm_label(value: str | None, *, default: str | None = None) -> str | None:
+    text = str(value or default or "").strip()
+    return text[:80] if text else None
+
+
+def _ensure_semantic_warm_readiness(engine: Any) -> None:
+    if not hasattr(engine, "_semantic_warm_readiness_lock"):
+        engine._semantic_warm_readiness_lock = threading.Lock()
+    if not hasattr(engine, "_semantic_warm_readiness"):
+        engine._semantic_warm_readiness = _default_semantic_warm_readiness()
+
+
+def embedding_freshness_mode() -> str:
+    value = os.environ.get("PITH_EMBEDDING_FRESHNESS_MODE", "observe").strip().lower()
+    if value not in _EMBEDDING_FRESHNESS_MODES:
+        logger.warning("Invalid PITH_EMBEDDING_FRESHNESS_MODE=%r; using observe", value)
+        return "observe"
+    return value
+
+
+def _freshness_metadata_matches(row: Any, searchable_text: str) -> tuple[bool, str, dict[str, Any]]:
+    metadata = embedding_freshness_metadata(searchable_text)
+    stored_hash = row["embedding_text_hash"] if "embedding_text_hash" in row.keys() else None
+    stored_contract = (
+        row["embedding_text_contract_version"] if "embedding_text_contract_version" in row.keys() else None
+    )
+    if not stored_hash or not stored_contract:
+        return False, "missing_metadata", metadata
+    if int(stored_contract) != EMBEDDING_TEXT_CONTRACT_VERSION:
+        return False, "contract_mismatch", metadata
+    if stored_hash != metadata["embedding_text_hash"]:
+        return False, "hash_mismatch", metadata
+    return True, "fresh", metadata
+
+
+def _embedding_update_tuple(emb: np.ndarray, searchable_text: str, concept_id: str) -> tuple[Any, ...]:
+    metadata = embedding_freshness_metadata(searchable_text)
+    return (
+        emb.tobytes(),
+        EMBEDDING_VERSION,
+        metadata["embedding_text_hash"],
+        metadata["embedding_text_contract_version"],
+        metadata["embedding_refreshed_at"],
+        concept_id,
+    )
+
 
 def _record_metric(
     name: str,
@@ -112,6 +201,37 @@ def _record_metric(
             metrics.flush()
     except Exception:
         pass
+
+
+def _record_search_stage_latency(
+    stage: str,
+    elapsed_ms: float,
+    *,
+    path: str,
+    result_count: int | None = None,
+    candidate_count: int | None = None,
+    extra_labels: dict[str, str | int | float | bool] | None = None,
+) -> None:
+    labels: dict[str, str | int | float] = {"stage": stage, "path": path}
+    if result_count is not None:
+        labels["result_count"] = int(result_count)
+    if candidate_count is not None:
+        labels["candidate_count"] = int(candidate_count)
+    if extra_labels:
+        for key, value in extra_labels.items():
+            if isinstance(value, bool):
+                labels[key] = "true" if value else "false"
+            else:
+                labels[key] = value
+    _record_metric("retrieval_search_stage_latency_ms", round(float(elapsed_ms), 2), labels)
+
+
+_KA_SUPPLEMENT_MAX_KAS = 3
+_KA_SUPPLEMENT_SQL_LIMIT_PER_KA = 20
+_KA_SUPPLEMENT_MAX_ELIGIBLE_CANDIDATES = 24
+_KA_SUPPLEMENT_MAX_ADDITIONS = 8
+_KA_SUPPLEMENT_MIN_SIMILARITY = 0.12
+_KA_SUPPLEMENT_BUDGET_MS = 120.0
 
 
 _AUTHORITY_ARTIFACT_AUTHORITY_TERMS = frozenset(
@@ -298,6 +418,18 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _env_int_clamped(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(float(os.environ.get(name, str(default))))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, value))
+
+
+def _embedding_feature_available() -> bool:
+    return bool(getattr(embedding_engine, "is_available", False))
+
+
 _DIAGNOSTIC_SOURCE_METADATA_FLAG = "PITH_RETRIEVAL_DIAGNOSTIC_SOURCE_METADATA"
 _PRIVATE_DIAGNOSTIC_FLAGS = (
     "PITH_BENCHMARK_MODE",
@@ -368,6 +500,86 @@ def _diagnostic_source_metadata(concept: Any) -> dict[str, Any] | None:
         return None
     _record_metric("retrieval_diagnostic_source_metadata_copied", 1.0, {"keys": str(len(diagnostic))})
     return diagnostic
+
+
+_LEXICAL_EVIDENCE_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_-]*")
+_LEXICAL_EVIDENCE_STOPWORDS = frozenset(
+    {
+        "what",
+        "when",
+        "where",
+        "who",
+        "which",
+        "how",
+        "why",
+        "is",
+        "are",
+        "was",
+        "were",
+        "did",
+        "does",
+        "do",
+        "has",
+        "have",
+        "had",
+        "the",
+        "a",
+        "an",
+        "in",
+        "on",
+        "at",
+        "to",
+        "for",
+        "of",
+        "with",
+        "by",
+        "from",
+        "and",
+        "or",
+        "not",
+        "be",
+        "been",
+        "being",
+        "would",
+        "could",
+        "should",
+        "will",
+        "can",
+        "may",
+        "might",
+        "shall",
+        "it",
+        "its",
+        "this",
+        "that",
+        "these",
+        "those",
+        "if",
+        "still",
+        "likely",
+        "all",
+        "must",
+    }
+)
+
+
+@dataclass(frozen=True)
+class LexicalEvidenceAdmissionResult:
+    results: list[SearchResult]
+    concept_cache: dict
+    protected_ids: set[str]
+    attempted: bool
+    admitted_count: int
+    reason: str
+    support_trace: dict[str, Any] | None = None
+
+
+def _lexical_evidence_tokens(text: str) -> set[str]:
+    return {
+        token
+        for token in _LEXICAL_EVIDENCE_TOKEN_RE.findall((text or "").casefold())
+        if len(token) > 2 and token not in _LEXICAL_EVIDENCE_STOPWORDS
+    }
 
 
 _MH262_CANARY_TRACE_LIMIT = 30
@@ -584,7 +796,12 @@ class RetrievalEngine:
         self._writer_cv = threading.Condition()
         self._quiesce_skipped: collections.Counter = collections.Counter()
         self.last_canary_search_lightweight_trace: dict | None = None
+        self.last_live_initial_admission_probe_trace: dict | None = None
         self.last_query_intent_trace: dict | None = None
+        self.last_lexical_evidence_support_trace: dict | None = None
+        self._semantic_warm_readiness_lock = threading.Lock()
+        self._semantic_warm_readiness = _default_semantic_warm_readiness()
+        self._preload_latency_ms: collections.deque[float] = collections.deque(maxlen=_PRELOAD_RECENT_SAMPLE_SIZE)
 
         # Try to load existing index
         index_dir = Path(self.index_path)
@@ -598,6 +815,476 @@ class RetrievalEngine:
             logger.info("No existing index found, will build on first search/add")
 
         logger.info("RetrievalEngine initialized (incremental TF-IDF + embeddings)")
+
+    def _ensure_semantic_warm_readiness_state(self) -> None:
+        _ensure_semantic_warm_readiness(self)
+
+    def record_semantic_warm_readiness(
+        self,
+        *,
+        state: str,
+        source: str,
+        result: str | None = None,
+        error: str | None = None,
+        query_path_warmed: bool | None = None,
+    ) -> None:
+        bounded_state = state if state in _SEMANTIC_WARM_READY_STATES else "failed"
+        bounded_source = source if source in _SEMANTIC_WARM_SOURCES else "unknown"
+        now = _utc_now().isoformat()
+        _ensure_semantic_warm_readiness(self)
+        with self._semantic_warm_readiness_lock:
+            next_state = dict(self._semantic_warm_readiness)
+            next_state.update(
+                {
+                    "schema_version": _SEMANTIC_WARM_READINESS_SCHEMA,
+                    "state": bounded_state,
+                    "source": bounded_source,
+                    "last_result": _bounded_warm_label(result, default=bounded_state),
+                    "error_type": _bounded_warm_label(error),
+                    "initialized": bool(getattr(self, "_embeddings_initialized", False)),
+                    "available": bool(getattr(self, "_embeddings_available", False)),
+                    "index_size": int(getattr(embedding_engine, "index_size", 0) or 0),
+                }
+            )
+            if bounded_state == "running":
+                next_state["last_attempt_at"] = now
+            elif bounded_state == "ready":
+                next_state["last_success_at"] = now
+            elif bounded_state in {"failed", "cancelled"}:
+                next_state["last_failure_at"] = now
+            if query_path_warmed is not None:
+                next_state["query_path_warmed"] = bool(query_path_warmed)
+            self._semantic_warm_readiness = next_state
+
+    def semantic_warm_readiness_snapshot(self) -> dict[str, Any]:
+        _ensure_semantic_warm_readiness(self)
+        with self._semantic_warm_readiness_lock:
+            snapshot = dict(self._semantic_warm_readiness)
+        snapshot["schema_version"] = _SEMANTIC_WARM_READINESS_SCHEMA
+        snapshot["initialized"] = bool(getattr(self, "_embeddings_initialized", False))
+        snapshot["available"] = bool(getattr(self, "_embeddings_available", False))
+        snapshot["index_size"] = int(getattr(embedding_engine, "index_size", 0) or 0)
+        return snapshot
+
+    def semantic_full_search_state(self) -> str:
+        if not _embedding_feature_available():
+            return "unavailable"
+        if bool(getattr(self, "_embeddings_available", False)) and int(getattr(embedding_engine, "index_size", 0) or 0) > 0:
+            return "ready"
+        snapshot = self.semantic_warm_readiness_snapshot()
+        if snapshot.get("state") == "running":
+            return "warming"
+        if bool(getattr(self, "_embeddings_initialized", False)) and int(snapshot.get("index_size") or 0) <= 0:
+            return "empty_index"
+        return "tfidf_fallback"
+
+    def _semantic_admission_labels(
+        self,
+        decision: SemanticAdmissionDecision,
+        *,
+        request_cluster_id: str,
+    ) -> dict[str, str | int | float | bool]:
+        labels: dict[str, str | int | float | bool] = {
+            "request_cluster_id": request_cluster_id,
+            "pid": os.getpid(),
+            "semantic_state": decision.semantic_state,
+            "semantic_admission": decision.semantic_admission,
+            "foreground_init_attempted": decision.foreground_init_attempted,
+        }
+        if decision.skip_reason:
+            labels["skip_reason"] = decision.skip_reason
+        return labels
+
+    def _semantic_ready_for_full_search(self) -> bool:
+        return bool(getattr(self, "_embeddings_available", False)) and int(getattr(embedding_engine, "index_size", 0) or 0) > 0
+
+    def _decide_semantic_admission(
+        self,
+        *,
+        caller: str,
+        deadline: TurnDeadline | None = None,
+        allow_foreground_init: bool = False,
+        bounded_wait_ms: int = _SEMANTIC_FULL_SEARCH_WAIT_BUDGET_MS,
+    ) -> SemanticAdmissionDecision:
+        wait_budget_ms = max(0, min(int(bounded_wait_ms), _SEMANTIC_FULL_SEARCH_MAX_UNGAUNTLETED_WAIT_MS))
+        waited_ms = 0.0
+        foreground_attempted = False
+
+        def _finish(
+            *,
+            use_semantic: bool,
+            semantic_state: str,
+            semantic_admission: str,
+            skip_reason: str | None,
+        ) -> SemanticAdmissionDecision:
+            decision = SemanticAdmissionDecision(
+                use_semantic=use_semantic,
+                semantic_state=semantic_state,
+                semantic_admission=semantic_admission,
+                skip_reason=skip_reason,
+                wait_ms=round(waited_ms, 2),
+                foreground_init_attempted=foreground_attempted,
+            )
+            labels = {
+                "caller": caller,
+                "semantic_state": decision.semantic_state,
+                "semantic_admission": decision.semantic_admission,
+                "foreground_init_attempted": "true" if decision.foreground_init_attempted else "false",
+            }
+            if decision.skip_reason:
+                labels["skip_reason"] = decision.skip_reason
+            _record_metric("retrieval_semantic_admission_total", 1.0, labels)
+            if decision.wait_ms:
+                _record_metric(
+                    "retrieval_semantic_wait_ms",
+                    decision.wait_ms,
+                    {
+                        "caller": caller,
+                        "semantic_state": decision.semantic_state,
+                        "semantic_admission": decision.semantic_admission,
+                    },
+                )
+            return decision
+
+        if self._semantic_ready_for_full_search():
+            return _finish(
+                use_semantic=True,
+                semantic_state="ready",
+                semantic_admission="ready",
+                skip_reason=None,
+            )
+
+        if not _embedding_feature_available():
+            return _finish(
+                use_semantic=False,
+                semantic_state="unavailable",
+                semantic_admission="tfidf_fallback",
+                skip_reason="semantic_unavailable",
+            )
+
+        if wait_budget_ms > 0 and self.semantic_warm_readiness_snapshot().get("state") == "running":
+            wait_start = time.perf_counter()
+            deadline_at = wait_start + (wait_budget_ms / 1000.0)
+            while time.perf_counter() < deadline_at:
+                if self._semantic_ready_for_full_search():
+                    waited_ms = (time.perf_counter() - wait_start) * 1000.0
+                    return _finish(
+                        use_semantic=True,
+                        semantic_state="ready",
+                        semantic_admission="ready_after_wait",
+                        skip_reason=None,
+                    )
+                time.sleep(min(0.01, max(0.0, deadline_at - time.perf_counter())))
+            waited_ms = (time.perf_counter() - wait_start) * 1000.0
+
+        if allow_foreground_init:
+            if deadline and not deadline.can_start(
+                "retrieval.full_search.embedding_init",
+                min_remaining_ms=float(wait_budget_ms or _SEMANTIC_FULL_SEARCH_WAIT_BUDGET_MS),
+            ):
+                return _finish(
+                    use_semantic=False,
+                    semantic_state=self.semantic_full_search_state(),
+                    semantic_admission="tfidf_fallback",
+                    skip_reason="deadline_before_start",
+                )
+            foreground_attempted = True
+            self.record_semantic_warm_readiness(
+                state="running",
+                source="foreground",
+                result="foreground_init_started",
+            )
+            self._init_embeddings()
+            if self._semantic_ready_for_full_search():
+                self.record_semantic_warm_readiness(
+                    state="ready",
+                    source="foreground",
+                    result="foreground_init_complete",
+                )
+                return _finish(
+                    use_semantic=True,
+                    semantic_state="ready",
+                    semantic_admission="foreground_init",
+                    skip_reason=None,
+                )
+
+        state = self.semantic_full_search_state()
+        if state == "warming":
+            reason = "semantic_warmup_running"
+        elif state == "empty_index":
+            reason = "semantic_empty_index"
+        elif state == "unavailable":
+            reason = "semantic_unavailable"
+        elif not allow_foreground_init:
+            reason = "foreground_init_disabled"
+        else:
+            reason = "semantic_not_initialized"
+        return _finish(
+            use_semantic=False,
+            semantic_state=state,
+            semantic_admission="tfidf_fallback",
+            skip_reason=reason,
+        )
+
+    def _recent_preload_p95_ms(self) -> float | None:
+        values = list(getattr(self, "_preload_latency_ms", []) or [])
+        if not values:
+            return None
+        values.sort()
+        idx = min(len(values) - 1, max(0, math.ceil(len(values) * 0.95) - 1))
+        return float(values[idx])
+
+    def _record_preload_latency_ms(self, elapsed_ms: float) -> None:
+        try:
+            self._preload_latency_ms.append(float(elapsed_ms))
+        except Exception:
+            pass
+
+    def _predictive_preload_skip_reason(
+        self,
+        decision: SemanticAdmissionDecision,
+        *,
+        deadline: TurnDeadline | None = None,
+    ) -> str | None:
+        if not decision.use_semantic:
+            return decision.skip_reason or "semantic_not_ready"
+        recent_p95 = self._recent_preload_p95_ms()
+        p95_limit = _env_float("PITH_PRELOAD_RECENT_P95_SKIP_MS", _PRELOAD_RECENT_P95_SKIP_MS)
+        if recent_p95 is not None and recent_p95 > p95_limit:
+            return "preload_recent_p95_exceeded"
+        if deadline and not deadline.can_start(
+            "retrieval.predictive_preload",
+            min_remaining_ms=_PRELOAD_MIN_DEADLINE_REMAINING_MS,
+        ):
+            return "deadline_before_start"
+        return None
+
+    @staticmethod
+    def _trim_with_protected_ids(
+        results: list[SearchResult],
+        limit: int,
+        protected_ids: set[str] | None = None,
+    ) -> list[SearchResult]:
+        if limit <= 0:
+            return []
+        if not results:
+            return results
+
+        protected_ids = protected_ids or set()
+        deduped: dict[str, SearchResult] = {}
+        for result in results:
+            existing = deduped.get(result.concept_id)
+            if existing is None or result.relevance_score > existing.relevance_score:
+                deduped[result.concept_id] = result
+
+        ordered = sorted(deduped.values(), key=lambda r: (-r.relevance_score, r.concept_id))
+        trimmed = ordered[:limit]
+        trimmed_ids = {result.concept_id for result in trimmed}
+        missing_protected = [
+            result
+            for result in ordered[limit:]
+            if result.concept_id in protected_ids and result.concept_id not in trimmed_ids
+        ]
+        if not missing_protected:
+            return trimmed
+
+        for protected in missing_protected[:1]:
+            replacement_index = None
+            for idx in range(len(trimmed) - 1, -1, -1):
+                if trimmed[idx].concept_id not in protected_ids:
+                    replacement_index = idx
+                    break
+            if replacement_index is None:
+                break
+            trimmed[replacement_index] = protected
+            trimmed_ids.add(protected.concept_id)
+
+        return sorted(trimmed, key=lambda r: (-r.relevance_score, r.concept_id))
+
+    @staticmethod
+    def _lexical_candidate_current_state(concept_id: str) -> dict[str, Any] | None:
+        try:
+            with read_snapshot_db("retrieval_137_lexical_current_state") as conn:
+                row = conn.execute(
+                    """SELECT status, is_current, currency_status, superseded_by
+                       FROM concepts WHERE id = ?""",
+                    (concept_id,),
+                ).fetchone()
+        except Exception as exc:
+            logger.debug("RETRIEVAL-137: current-state gate failed for %s: %s", concept_id, exc)
+            return None
+        if row is None:
+            return None
+        return {
+            "status": row["status"],
+            "is_current": int(row["is_current"] or 0),
+            "currency_status": (row["currency_status"] or "ACTIVE").upper(),
+            "superseded_by": row["superseded_by"],
+        }
+
+    def _admit_strong_lexical_evidence(
+        self,
+        results: list[SearchResult],
+        query_text: str,
+        *,
+        path: str,
+        concept_cache: dict | None = None,
+        deadline: TurnDeadline | None = None,
+    ) -> LexicalEvidenceAdmissionResult:
+        from app.core.config import (
+            LEXICAL_EVIDENCE_ADMISSION_ENABLED,
+            LEXICAL_EVIDENCE_ADMISSION_MAX_PER_QUERY,
+            LEXICAL_EVIDENCE_ADMISSION_MAX_RANK,
+            LEXICAL_EVIDENCE_ADMISSION_MIN_OVERLAP_RATIO,
+            LEXICAL_EVIDENCE_ADMISSION_MIN_QUERY_TOKENS,
+            LEXICAL_EVIDENCE_ADMISSION_MIN_TFIDF,
+            LEXICAL_EVIDENCE_ADMISSION_SCORE_CAP,
+        )
+
+        start = time.perf_counter()
+        concept_cache = concept_cache if concept_cache is not None else {}
+        protected_ids: set[str] = set()
+        support_ids: set[str] = set()
+        current_ids: set[str] = set()
+        contested_ids: set[str] = set()
+
+        def _support_trace(attempted: bool, admitted_count: int, reason: str) -> dict[str, Any]:
+            return {
+                "schema_version": "retrieval.lexical_evidence_support.v1",
+                "path": path,
+                "attempted": bool(attempted),
+                "admitted": admitted_count > 0,
+                "support_present": bool(support_ids),
+                "reason": reason,
+                "admitted_count": int(admitted_count),
+                "admitted_ids": sorted(protected_ids),
+                "support_ids": sorted(support_ids),
+                "protected_ids": sorted(protected_ids),
+                "current_ids": sorted(current_ids),
+                "contested_ids": sorted(contested_ids),
+                "trace_authority": "retrieval_137_lexical_admission",
+                "runtime_eligible": True,
+            }
+
+        def _finish(attempted: bool, admitted_count: int, reason: str) -> LexicalEvidenceAdmissionResult:
+            _record_metric(
+                "retrieval_lexical_evidence_admission_attempt_total",
+                1.0,
+                {"path": path, "reason": reason, "attempted": str(attempted).lower()},
+            )
+            _record_metric(
+                "retrieval_lexical_evidence_admission_latency_ms",
+                round((time.perf_counter() - start) * 1000.0, 2),
+                {"path": path, "reason": reason},
+            )
+            if admitted_count:
+                _record_metric(
+                    "retrieval_lexical_evidence_admission_admitted_total",
+                    float(admitted_count),
+                    {"path": path},
+                )
+            elif attempted:
+                _record_metric(
+                    "retrieval_lexical_evidence_admission_rejected_total",
+                    1.0,
+                    {"path": path, "reason": reason},
+                )
+            return LexicalEvidenceAdmissionResult(
+                results,
+                concept_cache,
+                protected_ids,
+                attempted,
+                admitted_count,
+                reason,
+                _support_trace(attempted, admitted_count, reason),
+            )
+
+        if not LEXICAL_EVIDENCE_ADMISSION_ENABLED:
+            return _finish(False, 0, "feature_disabled")
+        if not results:
+            return _finish(False, 0, "no_results")
+        if self.index.document_count == 0:
+            return _finish(False, 0, "empty_index")
+        if deadline and not deadline.can_start("retrieval.lexical_evidence_admission", min_remaining_ms=50.0):
+            deadline.skip("retrieval.lexical_evidence_admission", "deadline_before_start", priority="optional")
+            return _finish(True, 0, "deadline_before_start")
+
+        query_tokens = _lexical_evidence_tokens(query_text)
+        if len(query_tokens) < LEXICAL_EVIDENCE_ADMISSION_MIN_QUERY_TOKENS:
+            return _finish(True, 0, "query_too_short")
+
+        existing_ids = {result.concept_id for result in results}
+        raw_results = self.index.search(query_text, top_k=max(LEXICAL_EVIDENCE_ADMISSION_MAX_RANK, 1))
+        admitted = 0
+        reason = "rank_out_of_range"
+        for rank, (concept_id, tfidf_score) in enumerate(raw_results, start=1):
+            if rank > LEXICAL_EVIDENCE_ADMISSION_MAX_RANK:
+                break
+            already_present = concept_id in existing_ids
+            if tfidf_score < LEXICAL_EVIDENCE_ADMISSION_MIN_TFIDF:
+                reason = "score_below_floor"
+                continue
+            concept = concept_cache.get(concept_id)
+            if concept is None:
+                concept = load_concept(concept_id, track_access=False)
+            if concept is None:
+                reason = "concept_missing"
+                continue
+            try:
+                concept_text = build_searchable_text_from_concept(concept)
+            except Exception:
+                concept_text = getattr(concept, "summary", "")
+            concept_tokens = _lexical_evidence_tokens(concept_text)
+            overlap_ratio = len(query_tokens & concept_tokens) / max(1, len(query_tokens))
+            if overlap_ratio < LEXICAL_EVIDENCE_ADMISSION_MIN_OVERLAP_RATIO:
+                reason = "overlap_below_floor"
+                continue
+            current_state = self._lexical_candidate_current_state(concept_id)
+            if (
+                current_state is None
+                or current_state["status"] != "active"
+                or current_state["is_current"] != 1
+                or current_state["currency_status"] in {"STALE", "SUPERSEDED"}
+                or current_state["superseded_by"] not in (None, "")
+            ):
+                reason = "not_current"
+                continue
+            score = self._governance_score(concept, tfidf_score)
+            if score < 0:
+                reason = "governance_filtered"
+                continue
+            score = min(LEXICAL_EVIDENCE_ADMISSION_SCORE_CAP, score)
+            support_ids.add(concept_id)
+            if current_state["is_current"] == 1:
+                current_ids.add(concept_id)
+            if current_state["currency_status"] == "CONTESTED":
+                contested_ids.add(concept_id)
+            if already_present:
+                reason = "already_present"
+                continue
+            results.append(
+                SearchResult(
+                    concept_id=concept.id,
+                    version=concept.version,
+                    summary=concept.summary,
+                    confidence=concept.confidence,
+                    relevance_score=round(score, 4),
+                    knowledge_area=concept.metadata.get("knowledge_area"),
+                    ka_relative_authority=getattr(concept, "ka_relative_authority", None),
+                    maturity=getattr(concept, "maturity", None),
+                    created_at=getattr(concept, "created_at", None),
+                    metadata=_diagnostic_source_metadata(concept),
+                )
+            )
+            concept_cache[concept_id] = concept
+            protected_ids.add(concept_id)
+            existing_ids.add(concept_id)
+            admitted += 1
+            reason = "admitted"
+            if admitted >= LEXICAL_EVIDENCE_ADMISSION_MAX_PER_QUERY:
+                break
+
+        return _finish(True, admitted, reason)
 
     @contextlib.contextmanager
     def _writer_admission(self, op: str):
@@ -684,10 +1371,27 @@ class RetrievalEngine:
             # Defense-in-depth: Layer 1c evicts on supersession, but this prevents
             # re-entry on restart. _governance_score (line 705) also hard-filters,
             # but loading them wastes memory and compute.
+            freshness_mode = embedding_freshness_mode()
             with read_snapshot_db("init_embeddings") as conn:
-                rows = conn.execute(
-                    "SELECT id, embedding, embedding_version, data FROM concepts WHERE status = 'active' AND maturity != 'DISCARDED' AND is_current = 1"
-                ).fetchall()
+                try:
+                    rows = conn.execute(
+                        """SELECT id, summary, data, fragment_keywords, embedding,
+                                  embedding_version, embedding_text_hash,
+                                  embedding_text_contract_version, embedding_refreshed_at
+                           FROM concepts
+                           WHERE status = 'active' AND maturity != 'DISCARDED' AND is_current = 1"""
+                    ).fetchall()
+                except Exception as exc:
+                    logger.warning(
+                        "_init_embeddings: freshness metadata columns unavailable; "
+                        "falling back to observe-compatible legacy SELECT: %s",
+                        exc,
+                    )
+                    rows = conn.execute(
+                        """SELECT id, summary, data, embedding, embedding_version
+                           FROM concepts
+                           WHERE status = 'active' AND maturity != 'DISCARDED' AND is_current = 1"""
+                    ).fetchall()
 
             if not rows:
                 self._embeddings_initialized = True
@@ -696,6 +1400,7 @@ class RetrievalEngine:
             existing_ids = []
             existing_embeddings = []
             needs_embedding = []  # (concept_id, searchable_text)
+            freshness_counts: collections.Counter[str] = collections.Counter()
 
             for row in rows:
                 cid = row["id"]
@@ -703,28 +1408,25 @@ class RetrievalEngine:
                     # Load pre-computed embedding from BLOB
                     emb = np.frombuffer(row["embedding"], dtype=np.float32).copy()
                     if emb.shape[0] == EMBEDDING_DIM:
-                        existing_ids.append(cid)
-                        existing_embeddings.append(emb)
+                        searchable_text = build_searchable_text(row)
+                        is_fresh, state, _ = _freshness_metadata_matches(row, searchable_text)
+                        freshness_counts[state] += 1
+                        if is_fresh or freshness_mode in {"observe", "repair"}:
+                            existing_ids.append(cid)
+                            existing_embeddings.append(emb)
+                            continue
+                        # enforce mode refuses stale-compatible blobs; explicit
+                        # repair CLI owns re-embedding so startup stays bounded.
                         continue
+                    freshness_counts["wrong_dimension"] += 1
+                elif row["embedding"] and row["embedding_version"] != EMBEDDING_VERSION:
+                    freshness_counts["wrong_version"] += 1
+                else:
+                    freshness_counts["missing_blob"] += 1
 
                 # Need to compute embedding — extract searchable text
-                import json
-
                 try:
-                    data = json.loads(row["data"])
-                    concept = type(
-                        "C",
-                        (),
-                        {
-                            "summary": data.get("summary", ""),
-                            "signals": data.get("signals", []),
-                            "evidence": data.get("evidence", []),
-                            "metadata": data.get("metadata", {}),
-                            "hypotheses": [],
-                        },
-                    )()
-                    text = self._concept_to_document(concept)
-                    needs_embedding.append((cid, text))
+                    needs_embedding.append((cid, build_searchable_text(row)))
                 except Exception as e:
                     logger.warning(f"_init_embeddings: failed to parse {cid}: {e}")
 
@@ -741,8 +1443,13 @@ class RetrievalEngine:
                     for i, (cid, _) in enumerate(needs_embedding):
                         emb = new_embeddings[i]
                         _w_conn.execute(
-                            "UPDATE concepts SET embedding = ?, embedding_version = ? WHERE id = ?",
-                            (emb.tobytes(), EMBEDDING_VERSION, cid),
+                            """UPDATE concepts
+                               SET embedding = ?, embedding_version = ?,
+                                   embedding_text_hash = ?,
+                                   embedding_text_contract_version = ?,
+                                   embedding_refreshed_at = ?
+                               WHERE id = ?""",
+                            _embedding_update_tuple(emb, needs_embedding[i][1], cid),
                         )
                         existing_ids.append(cid)
                         existing_embeddings.append(emb)
@@ -755,6 +1462,12 @@ class RetrievalEngine:
 
             self._embeddings_initialized = True
             self._embeddings_available = True
+            if freshness_counts:
+                logger.info(
+                    "Embedding freshness init states mode=%s counts=%s",
+                    freshness_mode,
+                    dict(freshness_counts),
+                )
             logger.info(f"Embedding index ready: {len(existing_ids)} concepts")
         finally:
             self._embedding_init_lock.release()
@@ -867,8 +1580,13 @@ class RetrievalEngine:
 
                     with _db_immediate() as conn:
                         conn.execute(
-                            "UPDATE concepts SET embedding = ?, embedding_version = ? WHERE id = ?",
-                            (emb.tobytes(), EMBEDDING_VERSION, concept_id),
+                            """UPDATE concepts
+                               SET embedding = ?, embedding_version = ?,
+                                   embedding_text_hash = ?,
+                                   embedding_text_contract_version = ?,
+                                   embedding_refreshed_at = ?
+                               WHERE id = ?""",
+                            _embedding_update_tuple(emb, searchable_text, concept_id),
                         )
             except Exception as e:
                 logger.warning(f"Embedding update failed for {concept_id}: {e}")
@@ -926,7 +1644,11 @@ class RetrievalEngine:
         import time as _time_mod
 
         _search_t0 = _time_mod.perf_counter()
+        _request_cluster_id = hashlib.sha256(
+            f"{os.getpid()}:{time.time_ns()}:{id(query)}".encode()
+        ).hexdigest()[:12]
         self.last_query_intent_trace = None
+        self.last_lexical_evidence_support_trace = None
 
         intent_expansion: QueryIntentExpansion | None = None
         if get_feature_flag("QUERY_INTENT_EXPANSION_ENABLED", True):
@@ -977,13 +1699,45 @@ class RetrievalEngine:
             logger.info("Index empty, building from existing concepts...")
             self.build_index()
 
-        # P0.3: Initialize embedding index if not ready
-        self._init_embeddings()
+        _semantic_wait_ms = _env_int_clamped(
+            "PITH_FULL_SEARCH_SEMANTIC_WAIT_MS",
+            _SEMANTIC_FULL_SEARCH_WAIT_BUDGET_MS,
+            0,
+            _SEMANTIC_FULL_SEARCH_MAX_UNGAUNTLETED_WAIT_MS,
+        )
+        _semantic_decision = self._decide_semantic_admission(
+            caller="search",
+            allow_foreground_init=_env_flag("PITH_FULL_SEARCH_FOREGROUND_EMBEDDING_INIT", False),
+            bounded_wait_ms=_semantic_wait_ms,
+        )
+        _embedding_phase1_used = _semantic_decision.use_semantic
+        _search_path = "embedding" if _embedding_phase1_used else "tfidf"
+        _semantic_stage_labels = self._semantic_admission_labels(
+            _semantic_decision,
+            request_cluster_id=_request_cluster_id,
+        )
         _t_init = _time_mod.perf_counter()  # PERF-022
 
         # Pre-activate concepts if enhanced retrieval is available
         if ENHANCED_RETRIEVAL:
-            predictive_activation.preload_for_query(query.query, query.context)
+            _preload_skip_reason = self._predictive_preload_skip_reason(_semantic_decision)
+            if _preload_skip_reason is None:
+                _preload_start = _time_mod.perf_counter()
+                predictive_activation.preload_for_query(query.query, query.context)
+                self._record_preload_latency_ms((_time_mod.perf_counter() - _preload_start) * 1000)
+                _preload_skipped = False
+            else:
+                _preload_skipped = True
+                _record_metric(
+                    "retrieval_preload_skipped_total",
+                    1.0,
+                    {
+                        "path": _search_path,
+                        "semantic_state": _semantic_decision.semantic_state,
+                        "semantic_admission": _semantic_decision.semantic_admission,
+                        "skip_reason": _preload_skip_reason,
+                    },
+                )
             _t_preload = _time_mod.perf_counter()  # PERF-022
             if query.goal:
                 goal_directed.set_goal(query.goal, {"query": query.query, "source": "explicit"})
@@ -993,22 +1747,61 @@ class RetrievalEngine:
                     goal_directed.set_goal(inferred_goal, {"query": query.query, "source": "inferred"})
             _t_goal = _time_mod.perf_counter()  # PERF-022
         else:
+            _preload_skipped = True
+            _preload_skip_reason = "enhanced_retrieval_disabled"
             _t_preload = _t_init  # PERF-022: no-op placeholders
             _t_goal = _t_init
 
         # ===== Phase 1: Get raw results (embedding OR TF-IDF) =====
-        if self._embeddings_available and embedding_engine.index_size > 0:
+        _record_search_stage_latency(
+            "init_embeddings",
+            (_t_init - _search_t0) * 1000,
+            path=_search_path,
+            extra_labels={**_semantic_stage_labels, "semantic_wait_ms": round(_semantic_decision.wait_ms, 2)},
+        )
+        _preload_stage_labels = {
+            **_semantic_stage_labels,
+            "preload_skipped": _preload_skipped,
+        }
+        if _preload_skip_reason:
+            _preload_stage_labels["skip_reason"] = _preload_skip_reason
+        _record_search_stage_latency(
+            "preload_for_query",
+            (_t_preload - _t_init) * 1000,
+            path=_search_path,
+            extra_labels=_preload_stage_labels,
+        )
+        _record_search_stage_latency(
+            "goal_inference",
+            (_t_goal - _t_preload) * 1000,
+            path=_search_path,
+            extra_labels=_semantic_stage_labels,
+        )
+        if _embedding_phase1_used:
             results, concept_cache = self._search_phase1_embeddings(query)
         else:
             results, concept_cache = self._search_phase1_tfidf(query)
         _t_phase1 = _time_mod.perf_counter()  # PERF-022
+        _record_search_stage_latency(
+            "phase1_total",
+            (_t_phase1 - _t_goal) * 1000,
+            path=_search_path,
+            result_count=len(results),
+            candidate_count=len(concept_cache),
+            extra_labels=_semantic_stage_labels,
+        )
 
         # ===== Phase 1.5: KA-scoped supplement for cross-session coverage =====
         # RETRIEVAL-032: When Phase 1 returns results concentrated in one KA,
         # supplement with concepts from the SAME KA(s) that fell below the
         # cosine cutoff. This ensures cross-session facts get surfaced.
         if get_feature_flag("KA_CROSS_SESSION_SUPPLEMENT", False):
-            results, concept_cache = self._supplement_ka_coverage(results, query, concept_cache)
+            results, concept_cache = self._supplement_ka_coverage(
+                results,
+                query,
+                concept_cache,
+                path=_search_path,
+            )
 
         # ===== Phase 1.5b: Keyword supplement for low-quality embedding results =====
         # RAGAS-DIAG-001: When embedding top score < threshold, supplement with TF-IDF
@@ -1038,12 +1831,44 @@ class RetrievalEngine:
                 if added:
                     logger.info(f"RAGAS-DIAG-001: Added {added} TF-IDF supplements")
 
+        lexical_admission = self._admit_strong_lexical_evidence(
+            results,
+            query.query,
+            path="search" if _embedding_phase1_used else "search_tfidf",
+            concept_cache=concept_cache,
+        )
+        results = lexical_admission.results
+        concept_cache = lexical_admission.concept_cache
+        self.last_lexical_evidence_support_trace = lexical_admission.support_trace
+
         _t_supplement = _time_mod.perf_counter()  # PERF-022
+        _record_search_stage_latency(
+            "supplement_admission",
+            (_t_supplement - _t_phase1) * 1000,
+            path=_search_path,
+            result_count=len(results),
+            candidate_count=len(concept_cache),
+            extra_labels=_semantic_stage_labels,
+        )
 
         # ===== Phase 2: Post-processing pipeline (same for both paths) =====
-        results = self._apply_post_processing(results, query, _search_t0, _time_mod, concept_cache)
+        results = self._apply_post_processing(
+            results,
+            query,
+            _search_t0,
+            _time_mod,
+            concept_cache,
+            search_path=_search_path,
+        )
         _t_phase2 = _time_mod.perf_counter()  # PERF-022
         _t_supplement = locals().get("_t_supplement", _t_phase1)  # safe if flag off
+        _record_search_stage_latency(
+            "post_processing_total",
+            (_t_phase2 - _t_supplement) * 1000,
+            path=_search_path,
+            result_count=len(results),
+            extra_labels=_semantic_stage_labels,
+        )
         logger.info(
             "PERF-022 search() breakdown: init=%.1fms preload=%.1fms goal=%.1fms "
             "phase1=%.1fms supplement=%.1fms phase2=%.1fms total=%.1fms n=%d",
@@ -1058,14 +1883,38 @@ class RetrievalEngine:
         )
 
         # ===== AGENT-002: Scoped filtering (PERF-003: batch lookup) =====
+        _t_scope = _time_mod.perf_counter()
         if agent_id and scope == "agent":
             aid_map = self._batch_concept_agent_ids([r.concept_id for r in results])
             results = [r for r in results if aid_map.get(r.concept_id, "default") in (agent_id, "default")]
+        _t_trim_start = _time_mod.perf_counter()
+        _record_search_stage_latency(
+            "agent_scope_filter",
+            (_t_trim_start - _t_scope) * 1000,
+            path=_search_path,
+            result_count=len(results),
+            extra_labels=_semantic_stage_labels,
+        )
 
         # ===== Final trim: enforce max_results after ALL post-processing =====
         # KA supplement (Phase 1.5) and post-processing can expand results
         # beyond max_results. Trim here as the single enforcement point.
-        results = results[: query.max_results]
+        results = self._trim_with_protected_ids(results, query.max_results, lexical_admission.protected_ids)
+        _t_done = _time_mod.perf_counter()
+        _record_search_stage_latency(
+            "final_trim",
+            (_t_done - _t_trim_start) * 1000,
+            path=_search_path,
+            result_count=len(results),
+            extra_labels=_semantic_stage_labels,
+        )
+        _record_search_stage_latency(
+            "total",
+            (_t_done - _search_t0) * 1000,
+            path=_search_path,
+            result_count=len(results),
+            extra_labels=_semantic_stage_labels,
+        )
 
         return results
 
@@ -1099,6 +1948,12 @@ class RetrievalEngine:
         _emb_t0 = _t_emb.perf_counter()
         raw_results = embedding_engine.search(query.query, top_k=query.max_results * 2)
         _emb_ms = (_t_emb.perf_counter() - _emb_t0) * 1000
+        _record_search_stage_latency(
+            "embedding_raw_search",
+            _emb_ms,
+            path="embedding",
+            candidate_count=len(raw_results),
+        )
 
         # OBS-001: Embedding search latency + candidate count
         try:
@@ -1111,6 +1966,7 @@ class RetrievalEngine:
         results = []
         concept_cache = {}  # PERF-016: Cache for Phase 2 reuse
         _gov_scored = 0
+        _load_score_t0 = _t_emb.perf_counter()
         for concept_id, emb_score in raw_results:
             if emb_score < 0.20:
                 continue
@@ -1151,6 +2007,13 @@ class RetrievalEngine:
             _m_gov.record("retrieval_candidates_scored", _gov_scored, {"returned": len(results)})
         except Exception:
             pass
+        _record_search_stage_latency(
+            "embedding_current_load_score",
+            (_t_emb.perf_counter() - _load_score_t0) * 1000,
+            path="embedding",
+            result_count=len(results),
+            candidate_count=len(raw_results),
+        )
 
         return results, concept_cache
 
@@ -1165,10 +2028,19 @@ class RetrievalEngine:
         # Bind a local handle so the search runs against one consistent index
         # snapshot even if a rebuild+swap rebinds self.index concurrently.
         idx = self.index
+        _tfidf_t0 = time.perf_counter()
         raw_results = idx.search(query.query, top_k=query.max_results)
+        _tfidf_raw_ms = (time.perf_counter() - _tfidf_t0) * 1000
+        _record_search_stage_latency(
+            "tfidf_raw_search",
+            _tfidf_raw_ms,
+            path="tfidf",
+            candidate_count=len(raw_results),
+        )
 
         results = []
         concept_cache = {}  # PERF-016: Cache for Phase 2 reuse
+        _load_score_t0 = time.perf_counter()
         for concept_id, tfidf_score in raw_results:
             if tfidf_score < 0.05:
                 continue
@@ -1215,11 +2087,26 @@ class RetrievalEngine:
                 )
             )
 
+        _record_search_stage_latency(
+            "tfidf_current_load_score",
+            (time.perf_counter() - _load_score_t0) * 1000,
+            path="tfidf",
+            result_count=len(results),
+            candidate_count=len(raw_results),
+        )
+        _sort_t0 = time.perf_counter()
         results.sort(key=lambda r: (-r.relevance_score, r.concept_id))  # RETRIEVAL-037b v4.2: deterministic
         # PERF-016: Filter cache to only returned results
         trimmed = results[: query.max_results]
         trimmed_ids = {r.concept_id for r in trimmed}
         concept_cache = {k: v for k, v in concept_cache.items() if k in trimmed_ids}
+        _record_search_stage_latency(
+            "tfidf_sort_trim",
+            (time.perf_counter() - _sort_t0) * 1000,
+            path="tfidf",
+            result_count=len(trimmed),
+            candidate_count=len(raw_results),
+        )
         return trimmed, concept_cache
 
     def _supplement_ka_coverage(
@@ -1227,6 +2114,8 @@ class RetrievalEngine:
         results: list[SearchResult],
         query: SearchQuery,
         concept_cache: dict,
+        *,
+        path: str = "embedding",
     ) -> tuple[list[SearchResult], dict]:
         """RETRIEVAL-032: KA-scoped supplementary search for cross-session coverage.
 
@@ -1256,7 +2145,10 @@ class RetrievalEngine:
         # Step 2: Fetch concepts from dominant KA(s) not already in results
         # T2-3: read_snapshot_db — RLock-free KA supplement read
         existing_ids = {r.concept_id for r in results}
-        supplement_results = []
+        scored_candidates: list[dict[str, Any]] = []
+        scanned_count = 0
+        budget_exhausted = False
+        supplement_t0 = time.perf_counter()
 
         # Pre-compute query embedding once (outside loop)
         query_vec = None
@@ -1264,7 +2156,15 @@ class RetrievalEngine:
             query_vec = embedding_engine.embed_text(query.query)
 
         with read_snapshot_db("supplement_ka") as conn:
-            for ka in dominant_kas[:3]:  # Cap at 3 KAs to bound cost
+            for ka in dominant_kas[:_KA_SUPPLEMENT_MAX_KAS]:
+                if len(scored_candidates) >= _KA_SUPPLEMENT_MAX_ELIGIBLE_CANDIDATES:
+                    budget_exhausted = True
+                    break
+                elapsed_ms = (time.perf_counter() - supplement_t0) * 1000
+                if elapsed_ms >= _KA_SUPPLEMENT_BUDGET_MS:
+                    budget_exhausted = True
+                    break
+
                 placeholders = ",".join("?" * len(existing_ids)) if existing_ids else "''"
                 rows = conn.execute(
                     f"""SELECT id, summary, confidence, knowledge_area
@@ -1274,11 +2174,20 @@ class RetrievalEngine:
                          AND confidence >= ?
                          AND id NOT IN ({placeholders})
                        ORDER BY confidence DESC
-                       LIMIT 20""",
-                    [ka, query.min_confidence] + list(existing_ids),
+                       LIMIT ?""",
+                    [ka, query.min_confidence] + list(existing_ids) + [_KA_SUPPLEMENT_SQL_LIMIT_PER_KA],
                 ).fetchall()
 
                 for row in rows:
+                    scanned_count += 1
+                    if len(scored_candidates) >= _KA_SUPPLEMENT_MAX_ELIGIBLE_CANDIDATES:
+                        budget_exhausted = True
+                        break
+                    elapsed_ms = (time.perf_counter() - supplement_t0) * 1000
+                    if elapsed_ms >= _KA_SUPPLEMENT_BUDGET_MS:
+                        budget_exhausted = True
+                        break
+
                     concept_id, summary, confidence, concept_ka = row
                     # Score via embedding similarity to query
                     if query_vec is not None and concept_id in embedding_engine._id_to_pos:
@@ -1287,28 +2196,59 @@ class RetrievalEngine:
                     else:
                         emb_score = 0.10  # Fallback: low but non-zero
 
-                    if emb_score < 0.12:  # Lower threshold than Phase 1 (0.20)
+                    if emb_score < _KA_SUPPLEMENT_MIN_SIMILARITY:  # Lower threshold than Phase 1 (0.20)
                         continue
 
-                    concept = load_concept(concept_id, track_access=False)
-                    if not concept:
-                        continue
-
-                    concept_cache[concept_id] = concept
-                    supplement_results.append(
-                        SearchResult(
-                            concept_id=concept_id,
-                            version=getattr(concept, "version", "v1"),
-                            summary=summary,
-                            confidence=confidence,
-                            relevance_score=emb_score,
-                            knowledge_area=concept_ka or ka,
-                            ka_relative_authority=getattr(concept, "ka_relative_authority", None),
-                            maturity=getattr(concept, "maturity", None),
-                            created_at=getattr(concept, "created_at", None),
-                            metadata=_diagnostic_source_metadata(concept),
-                        )
+                    scored_candidates.append(
+                        {
+                            "concept_id": concept_id,
+                            "summary": summary,
+                            "confidence": confidence,
+                            "knowledge_area": concept_ka or ka,
+                            "relevance_score": emb_score,
+                        }
                     )
+
+        scored_candidates.sort(key=lambda item: (-item["relevance_score"], item["concept_id"]))
+        admitted_candidates = scored_candidates[:_KA_SUPPLEMENT_MAX_ADDITIONS]
+        admitted_ids = [item["concept_id"] for item in admitted_candidates]
+        hydrated = load_concepts_batch(admitted_ids)
+        supplement_results = []
+
+        for item in admitted_candidates:
+            concept_id = item["concept_id"]
+            concept = hydrated.get(concept_id)
+            if not concept:
+                continue
+
+            concept_cache[concept_id] = concept
+            supplement_results.append(
+                SearchResult(
+                    concept_id=concept_id,
+                    version=getattr(concept, "version", "v1"),
+                    summary=item["summary"],
+                    confidence=item["confidence"],
+                    relevance_score=item["relevance_score"],
+                    knowledge_area=item["knowledge_area"],
+                    ka_relative_authority=getattr(concept, "ka_relative_authority", None),
+                    maturity=getattr(concept, "maturity", None),
+                    created_at=getattr(concept, "created_at", None),
+                    metadata=_diagnostic_source_metadata(concept),
+                )
+            )
+
+        _record_search_stage_latency(
+            "ka_cross_session_supplement",
+            (time.perf_counter() - supplement_t0) * 1000,
+            path=path,
+            result_count=len(supplement_results),
+            candidate_count=len(scored_candidates),
+            extra_labels={
+                "accepted_count": len(supplement_results),
+                "scanned_count": scanned_count,
+                "budget_exhausted": budget_exhausted,
+            },
+        )
 
         if supplement_results:
             logger.info(
@@ -1329,6 +2269,8 @@ class RetrievalEngine:
         _search_t0,
         _time_mod,
         concept_cache: dict | None = None,
+        *,
+        search_path: str = "search",
     ) -> list[SearchResult]:
         """Phase 2: Post-processing pipeline applied to ALL search results.
 
@@ -1343,6 +2285,7 @@ class RetrievalEngine:
 
         if concept_cache is None:
             concept_cache = {}
+        _post_t0 = _time_mod.perf_counter()
 
         def _get_concept(concept_id: str):
             """PERF-016: Cache-first concept lookup."""
@@ -1360,9 +2303,21 @@ class RetrievalEngine:
             scored = [(r.concept_id, r.relevance_score) for r in results]
             scored = predictive_activation.boost_retrieval_scores(scored, boost_weight=0.15)
             _pp_t1 = _time_mod.perf_counter()
+            _record_search_stage_latency(
+                "post_predictive_boost",
+                (_pp_t1 - _pp_t0) * 1000,
+                path=search_path,
+                result_count=len(results),
+            )
             # PERF-018: pass concept_cache to avoid N DB reads (PERF-016 cache was bypassed)
             scored = goal_directed.boost_scores_by_goal(scored, concept_cache=concept_cache)
             _pp_t2 = _time_mod.perf_counter()
+            _record_search_stage_latency(
+                "post_goal_boost",
+                (_pp_t2 - _pp_t1) * 1000,
+                path=search_path,
+                result_count=len(results),
+            )
             logger.info(  # PERF-022: promoted from debug for visibility
                 "PERF-018 post_processing: predictive=%.1fms goal=%.1fms n=%d",
                 (_pp_t1 - _pp_t0) * 1000,
@@ -1376,6 +2331,7 @@ class RetrievalEngine:
             results.sort(key=lambda r: (-r.relevance_score, r.concept_id))  # RETRIEVAL-037b v4.2: deterministic
 
         # Wave 4a §4a.2: SAL Multiplier
+        _sal_t0 = _time_mod.perf_counter()
         try:
             from app.retrieval.salience import apply_sal_multiplier
 
@@ -1387,8 +2343,16 @@ class RetrievalEngine:
             results.sort(key=lambda r: (-r.relevance_score, r.concept_id))  # RETRIEVAL-037b v4.2: deterministic
         except ImportError:
             pass
+        finally:
+            _record_search_stage_latency(
+                "post_salience",
+                (_time_mod.perf_counter() - _sal_t0) * 1000,
+                path=search_path,
+                result_count=len(results),
+            )
 
         # Wave 4b §4b.3: Preference salience floor
+        _pref_t0 = _time_mod.perf_counter()
         try:
             from app.retrieval.provenance import apply_preference_floor
 
@@ -1400,8 +2364,16 @@ class RetrievalEngine:
                         result.relevance_score = max(result.relevance_score, 0.3)
         except ImportError:
             pass
+        finally:
+            _record_search_stage_latency(
+                "post_preference_floor",
+                (_time_mod.perf_counter() - _pref_t0) * 1000,
+                path=search_path,
+                result_count=len(results),
+            )
 
         # INGEST-015: Fact-seeking query boost — is_factual concepts score ×FACT_SEEKING_BOOST
+        _fact_t0 = _time_mod.perf_counter()
         try:
             if get_feature_flag("FACT_SEEKING_BOOST_ENABLED", True) and _is_fact_seeking_query(query.query):
                 boosted_count = 0
@@ -1415,8 +2387,28 @@ class RetrievalEngine:
                     logger.debug("INGEST-015: fact boost applied, n=%d", boosted_count)
         except Exception:
             pass  # Non-fatal — retrieval degrades gracefully without the boost
+        finally:
+            _record_search_stage_latency(
+                "post_fact_boost",
+                (_time_mod.perf_counter() - _fact_t0) * 1000,
+                path=search_path,
+                result_count=len(results),
+            )
 
+        _authority_t0 = _time_mod.perf_counter()
         _apply_authority_artifact_boost(results, query.query, path="search")
+        _record_search_stage_latency(
+            "post_authority_artifact_boost",
+            (_time_mod.perf_counter() - _authority_t0) * 1000,
+            path=search_path,
+            result_count=len(results),
+        )
+        _record_search_stage_latency(
+            "post_processing_internal_total",
+            (_time_mod.perf_counter() - _post_t0) * 1000,
+            path=search_path,
+            result_count=len(results),
+        )
 
         # WS2: Metric 7 — retrieval_search_latency_ms
         try:
@@ -1637,45 +2629,7 @@ class RetrievalEngine:
 
         Handles both legacy string evidence and v2 Evidence objects (stored as dicts).
         """
-        # Extract evidence text — handle str, dict (Evidence), or Evidence object
-        evidence_texts = []
-        for e in concept.evidence:
-            if isinstance(e, str):
-                evidence_texts.append(e)
-            elif isinstance(e, dict):
-                evidence_texts.append(e.get("content", ""))
-            elif hasattr(e, "content"):
-                evidence_texts.append(e.content)
-
-        parts = [
-            concept.summary,
-            " ".join(concept.signals),
-            " ".join(evidence_texts),
-            concept.metadata.get("knowledge_area", ""),
-        ]
-
-        # Add hypothesis descriptions
-        for hyp in concept.hypotheses:
-            parts.append(hyp.description)
-
-        # RETRIEVAL-057: Add prospective indexing implications
-        _impl = concept.metadata.get("implications", []) if isinstance(concept.metadata, dict) else []
-        for imp in _impl:
-            if isinstance(imp, str):
-                parts.append(imp)
-
-        # INGEST-034: Include event text from metadata
-        for _evt in concept.metadata.get("events", []) if isinstance(concept.metadata, dict) else []:
-            _evt_parts = [_evt.get("action", "")]
-            if _evt.get("cause"):
-                _evt_parts.append(f"because {_evt['cause']}")
-            if _evt.get("consequence"):
-                _evt_parts.append(f"resulting in {_evt['consequence']}")
-            if _evt.get("actors"):
-                _evt_parts.append(f"involving {', '.join(_evt['actors'])}")
-            parts.append(" ".join(_evt_parts))
-
-        return " ".join(parts)
+        return build_searchable_text_from_concept(concept)
 
     def _auto_save(self):
         """Auto-save index periodically."""
@@ -2116,12 +3070,40 @@ class RetrievalEngine:
             "PITH_SLW_EMBEDDING_SEARCH_ADMISSION_ENABLED",
             True,
         )
+        _slw_semantic_recovery_enabled = get_feature_flag("LIVE_SEMANTIC_RECOVERY_ENABLED", False)
+        _slw_semantic_recovery_top_k = _env_int_clamped(
+            "PITH_SLW_SEMANTIC_RECOVERY_TOP_K",
+            10,
+            1,
+            50,
+        )
+        _slw_semantic_recovery_max_admitted = _env_int_clamped(
+            "PITH_SLW_SEMANTIC_RECOVERY_MAX_ADMITTED",
+            10,
+            1,
+            20,
+        )
+        _slw_semantic_recovery_min_score = _env_float(
+            "PITH_SLW_SEMANTIC_RECOVERY_MIN_SCORE",
+            MIN_RETRIEVAL_SIMILARITY,
+        )
+        _slw_min_semantic_recovery_ms = _env_float("PITH_SLW_MIN_SEMANTIC_RECOVERY_MS", 250.0)
+        _slw_semantic_recovery_p95_limit_ms = _env_float(
+            "PITH_FOREGROUND_SEMANTIC_RECOVERY_P95_LIMIT_MS",
+            750.0,
+        )
+        _slw_semantic_recovery_circuit_ttl_s = _env_float(
+            "PITH_FOREGROUND_SEMANTIC_RECOVERY_CIRCUIT_TTL_S",
+            60.0,
+        )
         _slw_foreground_embedding_init_enabled = _env_flag(
             "PITH_SLW_FOREGROUND_EMBEDDING_INIT_ENABLED",
             False,
         )
         self.last_canary_search_lightweight_trace = None
+        self.last_live_initial_admission_probe_trace = None
         self.last_query_intent_trace = None
+        self.last_lexical_evidence_support_trace = None
         intent_expansion: QueryIntentExpansion | None = None
         effective_query_text = query_text
         if query_intent_expansion_enabled and get_feature_flag("QUERY_INTENT_EXPANSION_ENABLED", True):
@@ -2139,14 +3121,15 @@ class RetrievalEngine:
                         input_scope="query_argument",
                         expansion_input_source="query_text",
                     )
-                if intent_expansion.matched_aliases:
+                if intent_expansion.matched_aliases or intent_expansion.contamination_guard_blocked:
                     effective_query_text = intent_expansion.expanded_query
                     self.last_query_intent_trace = intent_expansion.to_trace()
-                    _record_metric(
-                        "query_intent.alias_match_total",
-                        float(len(intent_expansion.matched_aliases)),
-                        {"path": "search_lightweight", "source": intent_expansion.source},
-                    )
+                    if intent_expansion.matched_aliases:
+                        _record_metric(
+                            "query_intent.alias_match_total",
+                            float(len(intent_expansion.matched_aliases)),
+                            {"path": "search_lightweight", "source": intent_expansion.source},
+                        )
                     if intent_expansion.contamination_guard_blocked:
                         _record_metric(
                             "query_intent.contamination_guard_blocked_total",
@@ -2178,22 +3161,171 @@ class RetrievalEngine:
                     predictive_activation
                 )
             self.last_canary_search_lightweight_trace = _slw_trace
+        _slw_timed_out = False
+        _slw_timeout_metric_recorded = False
+        _slw_timeout_min_results = max(0, int(_env_float("PITH_SLW_TIMEOUT_MIN_RESULTS", 1.0)))
+        _slw_timeout_candidate_limit = max(
+            1,
+            int(_env_float("PITH_SLW_TIMEOUT_CANDIDATE_LIMIT", float(min(max(top_k, 1), 3)))),
+        )
+        _live_probe_trace_enabled = (
+            _env_flag("PITH_LIVE_INITIAL_ADMISSION_PROBE_TRACE", False) or _slw_trace is not None
+        )
+        _live_probe_trace: dict[str, Any] | None = None
+        if _live_probe_trace_enabled:
+            _live_probe_trace = {
+                "schema_version": "retrieval.live_initial_admission_probe.v1",
+                "enabled": True,
+                "behavior_changed": False,
+                "semantic_warm_readiness": self.semantic_warm_readiness_snapshot(),
+                "query_hash": hashlib.sha256(effective_query_text.encode("utf-8")).hexdigest()[:12],
+                "top_k": int(top_k),
+                "min_confidence": float(min_confidence),
+                "search_lightweight_skipped_reason": None,
+                "embedding": {
+                    "available": bool(getattr(self, "_embeddings_available", False)),
+                    "initialized": bool(getattr(self, "_embeddings_initialized", False)),
+                    "index_size": int(getattr(embedding_engine, "index_size", 0) or 0),
+                    "init_skipped_reason": None,
+                    "search_started": False,
+                    "search_skipped_reason": None,
+                    "raw_count": 0,
+                    "candidate_id_count": 0,
+                    "loaded_count": 0,
+                    "score_floor_rejected_count": 0,
+                    "confidence_rejected_count": 0,
+                    "governance_rejected_count": 0,
+                    "result_count": 0,
+                },
+                "tfidf": {
+                    "started": False,
+                    "skipped_reason": None,
+                    "fallback_reason": None,
+                    "fallback_mode": "unknown",
+                    "document_count": int(getattr(self.index, "document_count", 0) or 0),
+                    "raw_count": 0,
+                    "candidate_id_count": 0,
+                    "loaded_count": 0,
+                    "score_floor_rejected_count": 0,
+                    "confidence_rejected_count": 0,
+                    "governance_rejected_count": 0,
+                    "result_count": 0,
+                },
+                "soft_timeout": {
+                    "fired": False,
+                    "min_results": int(_slw_timeout_min_results),
+                    "candidate_limit": int(_slw_timeout_candidate_limit),
+                    "partial_result_count": 0,
+                },
+                "lexical": None,
+                "semantic_recovery": {
+                    "enabled": bool(_slw_semantic_recovery_enabled),
+                    "attempted": False,
+                    "reason": "not_attempted",
+                    "trigger_reason": None,
+                    "top_k": int(_slw_semantic_recovery_top_k),
+                    "max_admitted": int(_slw_semantic_recovery_max_admitted),
+                    "min_score": float(_slw_semantic_recovery_min_score),
+                    "search_started": False,
+                    "raw_count": 0,
+                    "candidate_id_count": 0,
+                    "loaded_count": 0,
+                    "score_floor_rejected_count": 0,
+                    "confidence_rejected_count": 0,
+                    "governance_rejected_count": 0,
+                    "duplicate_rejected_count": 0,
+                    "admitted_count": 0,
+                    "admitted_ids": [],
+                    "latency_ms": None,
+                },
+                "final_result_count": 0,
+            }
+
+        def _probe_set(section: str, key: str, value: Any) -> None:
+            if _live_probe_trace is None:
+                return
+            target = _live_probe_trace.get(section)
+            if isinstance(target, dict):
+                target[key] = value
+
+        def _probe_inc(section: str, key: str, amount: int = 1) -> None:
+            if _live_probe_trace is None:
+                return
+            target = _live_probe_trace.get(section)
+            if isinstance(target, dict):
+                target[key] = int(target.get(key, 0) or 0) + amount
+
+        def _finish_live_probe(results_for_trace: list[SearchResult]) -> list[SearchResult]:
+            if _live_probe_trace is None:
+                return results_for_trace
+            _live_probe_trace["final_result_count"] = len(results_for_trace or [])
+            _live_probe_trace["lexical"] = self.last_lexical_evidence_support_trace
+            _live_probe_trace["semantic_warm_readiness"] = self.semantic_warm_readiness_snapshot()
+            soft_timeout = _live_probe_trace.get("soft_timeout")
+            if isinstance(soft_timeout, dict):
+                soft_timeout["fired"] = bool(_slw_timed_out)
+            self.last_live_initial_admission_probe_trace = _live_probe_trace
+            path = "none"
+            reason = str(_live_probe_trace.get("search_lightweight_skipped_reason") or "none")
+            embedding_trace = _live_probe_trace.get("embedding")
+            tfidf_trace = _live_probe_trace.get("tfidf")
+            if isinstance(embedding_trace, dict) and embedding_trace.get("result_count"):
+                path = "embedding"
+            elif isinstance(tfidf_trace, dict) and tfidf_trace.get("result_count"):
+                path = "tfidf"
+            elif isinstance(tfidf_trace, dict) and tfidf_trace.get("started"):
+                path = "tfidf"
+                reason = str(tfidf_trace.get("skipped_reason") or tfidf_trace.get("fallback_reason") or reason)
+            elif isinstance(embedding_trace, dict) and embedding_trace.get("search_started"):
+                path = "embedding"
+                reason = str(embedding_trace.get("search_skipped_reason") or reason)
+            _record_metric(
+                "retrieval_live_initial_admission_probe_emitted_total", 1.0, {"path": path, "reason": reason}
+            )
+            if len(results_for_trace or []) == 0:
+                _record_metric(
+                    "retrieval_live_initial_admission_probe_zero_result_total",
+                    1.0,
+                    {"path": path, "reason": reason},
+                )
+            if isinstance(embedding_trace, dict) and embedding_trace.get("search_skipped_reason"):
+                _record_metric(
+                    "retrieval_live_initial_admission_probe_embedding_skipped_total",
+                    1.0,
+                    {"path": "embedding", "reason": str(embedding_trace.get("search_skipped_reason"))},
+                )
+            if isinstance(tfidf_trace, dict) and tfidf_trace.get("fallback_reason"):
+                _record_metric(
+                    "retrieval_live_initial_admission_probe_tfidf_fallback_total",
+                    1.0,
+                    {"path": "tfidf", "reason": str(tfidf_trace.get("fallback_reason"))},
+                )
+            return results_for_trace
+
         if deadline and not deadline.can_start(
             "retrieval.search_lightweight",
             min_remaining_ms=_slw_min_remaining_ms,
         ):
+            if _live_probe_trace is not None:
+                _live_probe_trace["search_lightweight_skipped_reason"] = "deadline_before_start"
             deadline.skip(
                 "retrieval.search_lightweight",
                 "deadline_before_start",
                 priority="optional",
                 min_remaining_ms=_slw_min_remaining_ms,
             )
-            return []
+            return _finish_live_probe([])
 
         # Ensure embedding index is ready when already warm. In deadline-bound
         # turn paths, avoid minutes-long foreground hydration; TF-IDF remains
         # available while startup warms semantic embeddings in the background.
         if deadline and not self._embeddings_initialized and not _slw_foreground_embedding_init_enabled:
+            self.record_semantic_warm_readiness(
+                state="skipped",
+                source="foreground",
+                result="foreground_embedding_init_disabled",
+            )
+            _probe_set("embedding", "init_skipped_reason", "foreground_embedding_init_disabled")
             deadline.skip(
                 "retrieval.embedding_init",
                 "foreground_embedding_init_disabled",
@@ -2216,13 +3348,33 @@ class RetrievalEngine:
                     priority="optional",
                     min_remaining_ms=_slw_min_embedding_init_ms,
                 )
-                return []
+                _probe_set("embedding", "init_skipped_reason", "deadline_before_start")
+                self.record_semantic_warm_readiness(
+                    state="skipped",
+                    source="foreground",
+                    result="deadline_before_start",
+                )
+                return _finish_live_probe([])
             _embedding_init_start = time.perf_counter()
+            self.record_semantic_warm_readiness(
+                state="running",
+                source="foreground",
+                result="foreground_init_started",
+            )
             self._init_embeddings()
+            _embedding_available = bool(getattr(self, "_embeddings_available", False))
+            self.record_semantic_warm_readiness(
+                state="ready" if _embedding_available else "skipped",
+                source="foreground",
+                result=("foreground_init_complete" if _embedding_available else "foreground_init_unavailable"),
+            )
+            _probe_set("embedding", "available", bool(getattr(self, "_embeddings_available", False)))
+            _probe_set("embedding", "initialized", bool(getattr(self, "_embeddings_initialized", False)))
+            _probe_set("embedding", "index_size", int(getattr(embedding_engine, "index_size", 0) or 0))
             _record_metric(
                 "search_lightweight.embedding_init_ms",
                 round((time.perf_counter() - _embedding_init_start) * 1000.0, 2),
-                {"path": "embedding" if self._embeddings_available else "tfidf"},
+                {"path": "embedding" if getattr(self, "_embeddings_available", False) else "tfidf"},
             )
 
         # ===== SESSION-012: Concurrent session detection =====
@@ -2262,17 +3414,14 @@ class RetrievalEngine:
                     "deadline_child_budget_exhausted",
                     priority="optional",
                 )
-                return []
+                if _live_probe_trace is not None:
+                    _live_probe_trace["search_lightweight_skipped_reason"] = "deadline_child_budget_exhausted"
+                return _finish_live_probe([])
             _slw_soft_timeout_s = max(0.001, _slw_soft_timeout_ms) / 1000.0
         else:
             _slw_soft_timeout_s = max(0.1, _slw_soft_timeout_ms) / 1000.0
-        _slw_timed_out = False
-        _slw_timeout_metric_recorded = False
-        _slw_timeout_min_results = max(0, int(_env_float("PITH_SLW_TIMEOUT_MIN_RESULTS", 1.0)))
-        _slw_timeout_candidate_limit = max(
-            1,
-            int(_env_float("PITH_SLW_TIMEOUT_CANDIDATE_LIMIT", float(min(max(top_k, 1), 3)))),
-        )
+        _slw_lexical_protected_ids: set[str] = set()
+        _slw_semantic_recovery_protected_ids: set[str] = set()
 
         def _slw_should_check_timeout(candidate_index: int) -> bool:
             return _slw_timed_out or candidate_index == 0 or candidate_index % 10 == 0
@@ -2291,6 +3440,11 @@ class RetrievalEngine:
             action: str,
         ) -> None:
             nonlocal _slw_timeout_metric_recorded
+            if _live_probe_trace is not None:
+                soft_timeout = _live_probe_trace.get("soft_timeout")
+                if isinstance(soft_timeout, dict):
+                    soft_timeout["fired"] = True
+                    soft_timeout["partial_result_count"] = int(partial_results)
             if _slw_timeout_metric_recorded:
                 return
             _slw_timeout_metric_recorded = True
@@ -2321,9 +3475,48 @@ class RetrievalEngine:
                 {"from": "embedding", "to": "tfidf", "reason": reason, "mode": mode, "denied": denied_reason},
             )
 
+        def _semantic_recovery_trace() -> dict[str, Any] | None:
+            if _live_probe_trace is None:
+                return None
+            trace = _live_probe_trace.get("semantic_recovery")
+            return trace if isinstance(trace, dict) else None
+
+        def _semantic_recovery_set(key: str, value: Any) -> None:
+            trace = _semantic_recovery_trace()
+            if trace is not None:
+                trace[key] = value
+
+        def _semantic_recovery_inc(key: str, amount: int = 1) -> None:
+            trace = _semantic_recovery_trace()
+            if trace is not None:
+                trace[key] = int(trace.get(key, 0) or 0) + amount
+
+        def _finish_semantic_recovery(reason: str, admitted_count: int = 0, *, attempted: bool = False) -> None:
+            _semantic_recovery_set("reason", reason)
+            _semantic_recovery_set("admitted_count", int(admitted_count))
+            _record_metric(
+                "search_lightweight.semantic_recovery_attempt_total",
+                1.0,
+                {
+                    "reason": reason,
+                    "attempted": str(bool(attempted)).lower(),
+                },
+            )
+            if admitted_count:
+                _record_metric(
+                    "search_lightweight.semantic_recovery_admitted_total",
+                    float(admitted_count),
+                    {"reason": reason},
+                )
+
         def _run_tfidf_path(fallback_reason: str | None = None, fallback_mode: str = "unknown") -> list[SearchResult]:
             nonlocal _slw_timed_out
+            _probe_set("tfidf", "started", True)
+            _probe_set("tfidf", "fallback_reason", fallback_reason)
+            _probe_set("tfidf", "fallback_mode", fallback_mode)
+            _probe_set("tfidf", "document_count", int(getattr(self.index, "document_count", 0) or 0))
             if self.index.document_count == 0:
+                _probe_set("tfidf", "skipped_reason", "empty_index")
                 if fallback_reason:
                     _record_slw_fallback_denied(fallback_reason, fallback_mode, "empty_index")
                 return []
@@ -2337,11 +3530,13 @@ class RetrievalEngine:
                     priority="optional",
                     min_remaining_ms=_slw_min_remaining_ms,
                 )
+                _probe_set("tfidf", "skipped_reason", "deadline_before_start")
                 if fallback_reason:
                     _record_slw_fallback_denied(fallback_reason, fallback_mode, "deadline_before_start")
                 return []
             _tfidf_search_start = time.perf_counter()
             raw_results_tfidf = self.index.search(effective_query_text, top_k=top_k)
+            _probe_set("tfidf", "raw_count", len(raw_results_tfidf or []))
             _record_metric(
                 "search_lightweight.tfidf_search_ms",
                 round((time.perf_counter() - _tfidf_search_start) * 1000.0, 2),
@@ -2350,6 +3545,7 @@ class RetrievalEngine:
 
             # PERF-076: Batch load all candidate concepts in one query
             _candidate_ids_tfidf = [cid for cid, score in raw_results_tfidf if score >= MIN_RETRIEVAL_SIMILARITY * 0.5]
+            _probe_set("tfidf", "candidate_id_count", len(_candidate_ids_tfidf))
             if deadline and not deadline.can_start(
                 "retrieval.load_concepts_batch",
                 min_remaining_ms=_slw_min_batch_load_ms,
@@ -2360,6 +3556,7 @@ class RetrievalEngine:
                     priority="optional",
                     min_remaining_ms=_slw_min_batch_load_ms,
                 )
+                _probe_set("tfidf", "skipped_reason", "batch_deadline_before_start")
                 if fallback_reason:
                     _record_slw_fallback_denied(fallback_reason, fallback_mode, "batch_deadline_before_start")
                 return []
@@ -2367,6 +3564,7 @@ class RetrievalEngine:
 
             _batch_load_start = time.perf_counter()
             _batch_cache_tfidf = load_concepts_batch(_candidate_ids_tfidf)
+            _probe_set("tfidf", "loaded_count", len(_batch_cache_tfidf or {}))
             _record_metric(
                 "search_lightweight.batch_load_ms",
                 round((time.perf_counter() - _batch_load_start) * 1000.0, 2),
@@ -2399,16 +3597,19 @@ class RetrievalEngine:
                         if _slw_stop:
                             break
                 if tfidf_score < MIN_RETRIEVAL_SIMILARITY * 0.5:  # RETRIEVAL-031: TF-IDF scale differs
+                    _probe_inc("tfidf", "score_floor_rejected_count")
                     continue
                 concept = _batch_cache_tfidf.get(concept_id)  # PERF-076: dict lookup
                 if not concept:
                     continue
                 if concept.confidence < min_confidence:
+                    _probe_inc("tfidf", "confidence_rejected_count")
                     continue
 
                 score = self._governance_score(concept, tfidf_score)
                 if score < 0:
                     if not include_deprecated:
+                        _probe_inc("tfidf", "governance_rejected_count")
                         continue  # Hard-filtered (STALE/SUPERSEDED)
                     score = 0.01  # RETRIEVAL-056: include_deprecated — floor score
                 # SESSION-012: Cross-session proximity boost (post-scoring, additive)
@@ -2428,7 +3629,170 @@ class RetrievalEngine:
                         metadata=_diagnostic_source_metadata(concept),
                     )
                 )
+            _probe_set("tfidf", "result_count", len(tfidf_results))
             return tfidf_results
+
+        def _run_semantic_recovery(
+            fallback_reason: str,
+            current_results: list[SearchResult],
+        ) -> list[SearchResult]:
+            nonlocal _slw_semantic_recovery_protected_ids
+            recovery_reasons = {
+                "latency_over_limit",
+                "recent_p95_over_limit",
+                "recovery_probe_over_limit",
+                "cold_start_no_samples",
+            }
+            _semantic_recovery_set("trigger_reason", fallback_reason)
+            if not _slw_semantic_recovery_enabled:
+                _finish_semantic_recovery("feature_disabled")
+                return current_results
+            if fallback_reason not in recovery_reasons:
+                _finish_semantic_recovery("unsupported_trigger")
+                return current_results
+            if len(current_results or []) >= max(1, int(top_k)):
+                _finish_semantic_recovery("sufficient_results")
+                return current_results
+
+            readiness = self.semantic_warm_readiness_snapshot()
+            if (
+                readiness.get("state") != "ready"
+                or not readiness.get("available")
+                or not readiness.get("initialized")
+                or not readiness.get("query_path_warmed")
+                or int(readiness.get("index_size") or 0) <= 0
+            ):
+                _finish_semantic_recovery("semantic_not_ready")
+                return current_results
+            if deadline and not deadline.can_start(
+                "retrieval.semantic_recovery",
+                min_remaining_ms=_slw_min_semantic_recovery_ms,
+            ):
+                deadline.skip(
+                    "retrieval.semantic_recovery",
+                    "deadline_before_start",
+                    priority="optional",
+                    min_remaining_ms=_slw_min_semantic_recovery_ms,
+                )
+                _finish_semantic_recovery("deadline_before_start")
+                return current_results
+
+            recovery_config = ForegroundContractConfig(
+                unit="retrieval.semantic_recovery",
+                criticality="quality_sensitive_optional",
+                min_remaining_ms=_slw_min_semantic_recovery_ms,
+                recent_p95_limit_ms=_slw_semantic_recovery_p95_limit_ms,
+                mode=foreground_contract_mode_for_unit("retrieval.semantic_recovery"),
+                circuit_ttl_s=_slw_semantic_recovery_circuit_ttl_s,
+                skip_when_cold=False,
+            )
+            recovery_decision = None
+            try:
+                recovery_decision = get_foreground_contract(_record_metric).decide(
+                    recovery_config,
+                    deadline=deadline,
+                    answer_path="unknown",
+                )
+            except Exception as recovery_decision_err:
+                logger.debug("FOREGROUND-CONTRACT: semantic recovery decision failed: %s", recovery_decision_err)
+            if recovery_decision is not None and recovery_decision.decision is ForegroundDecision.SKIP:
+                if deadline:
+                    deadline.skip(
+                        "retrieval.semantic_recovery",
+                        recovery_decision.reason,
+                        priority="optional",
+                        min_remaining_ms=_slw_min_semantic_recovery_ms,
+                    )
+                _finish_semantic_recovery(recovery_decision.reason)
+                return current_results
+
+            _semantic_recovery_set("attempted", True)
+            _semantic_recovery_set("search_started", True)
+            recovery_start = time.perf_counter()
+            raw_recovery_results = embedding_engine.search(effective_query_text, top_k=_slw_semantic_recovery_top_k)
+            recovery_latency_ms = round((time.perf_counter() - recovery_start) * 1000.0, 2)
+            _semantic_recovery_set("latency_ms", recovery_latency_ms)
+            _semantic_recovery_set("raw_count", len(raw_recovery_results or []))
+            _record_metric(
+                "search_lightweight.semantic_recovery_latency_ms",
+                recovery_latency_ms,
+                {"trigger_reason": fallback_reason},
+            )
+            try:
+                get_foreground_contract(_record_metric).record_latency_ms(
+                    recovery_config,
+                    recovery_latency_ms,
+                    answer_path="unknown",
+                )
+            except Exception as recovery_latency_err:
+                logger.debug("FOREGROUND-CONTRACT: semantic recovery latency record failed: %s", recovery_latency_err)
+
+            candidate_ids = [cid for cid, score in raw_recovery_results if score >= _slw_semantic_recovery_min_score]
+            _semantic_recovery_set("candidate_id_count", len(candidate_ids))
+            if not candidate_ids:
+                for _cid, _score in raw_recovery_results:
+                    if _score < _slw_semantic_recovery_min_score:
+                        _semantic_recovery_inc("score_floor_rejected_count")
+                _finish_semantic_recovery("no_candidates_above_floor", attempted=True)
+                return current_results
+
+            from app.storage.concepts import load_concepts_batch
+
+            concept_cache = load_concepts_batch(candidate_ids)
+            _semantic_recovery_set("loaded_count", len(concept_cache or {}))
+            existing_ids = {result.concept_id for result in current_results or []}
+            admitted_ids: list[str] = []
+            recovered_results = list(current_results or [])
+            reason = "no_admission"
+            for concept_id, semantic_score in raw_recovery_results:
+                if semantic_score < _slw_semantic_recovery_min_score:
+                    _semantic_recovery_inc("score_floor_rejected_count")
+                    reason = "score_below_floor"
+                    continue
+                if concept_id in existing_ids:
+                    _semantic_recovery_inc("duplicate_rejected_count")
+                    reason = "already_present"
+                    continue
+                concept = concept_cache.get(concept_id)
+                if concept is None:
+                    reason = "concept_missing"
+                    continue
+                if concept.confidence < min_confidence:
+                    _semantic_recovery_inc("confidence_rejected_count")
+                    reason = "confidence_below_floor"
+                    continue
+                score = self._governance_score(concept, semantic_score)
+                if score < 0:
+                    if not include_deprecated:
+                        _semantic_recovery_inc("governance_rejected_count")
+                        reason = "governance_filtered"
+                        continue
+                    score = 0.01
+                recovered_results.append(
+                    SearchResult(
+                        concept_id=concept.id,
+                        version=concept.version,
+                        summary=concept.summary,
+                        confidence=concept.confidence,
+                        relevance_score=score,
+                        knowledge_area=concept.metadata.get("knowledge_area"),
+                        ka_relative_authority=getattr(concept, "ka_relative_authority", None),
+                        maturity=getattr(concept, "maturity", None),
+                        created_at=concept.created_at,
+                        metadata=_diagnostic_source_metadata(concept),
+                    )
+                )
+                existing_ids.add(concept_id)
+                _slw_semantic_recovery_protected_ids.add(concept_id)
+                admitted_ids.append(concept_id)
+                reason = "admitted"
+                if len(admitted_ids) >= _slw_semantic_recovery_max_admitted:
+                    break
+            if admitted_ids:
+                reason = "admitted"
+            _semantic_recovery_set("admitted_ids", admitted_ids)
+            _finish_semantic_recovery(reason, len(admitted_ids), attempted=True)
+            return recovered_results
 
         if self._embeddings_available and embedding_engine.index_size > 0:
             if (
@@ -2450,6 +3814,7 @@ class RetrievalEngine:
                     0.0,
                     {"path": "embedding", "reason": "deadline_before_start", "admission": "skipped"},
                 )
+                _probe_set("embedding", "search_skipped_reason", "deadline_before_start")
                 _record_metric(
                     "search_lightweight.fallback_total",
                     1.0,
@@ -2458,6 +3823,14 @@ class RetrievalEngine:
                 results = _run_tfidf_path("deadline_before_start", "deadline")
             else:
                 # Embedding path
+                _slw_embedding_search_ready_for_probe = (
+                    bool(self._embeddings_available)
+                    and bool(getattr(self, "_embeddings_initialized", False))
+                    and int(getattr(embedding_engine, "index_size", 0) or 0) > 0
+                )
+                _slw_embedding_search_skip_when_cold = (
+                    _slw_embedding_search_cold_skip_enabled and not _slw_embedding_search_ready_for_probe
+                )
                 _slw_foreground_config = ForegroundContractConfig(
                     unit="retrieval.embedding_search",
                     criticality="quality_sensitive_optional",
@@ -2465,7 +3838,7 @@ class RetrievalEngine:
                     recent_p95_limit_ms=_slw_embedding_search_p95_limit_ms,
                     mode=foreground_contract_mode_for_unit("retrieval.embedding_search"),
                     circuit_ttl_s=_slw_embedding_search_circuit_ttl_s,
-                    skip_when_cold=_slw_embedding_search_cold_skip_enabled,
+                    skip_when_cold=_slw_embedding_search_skip_when_cold,
                 )
                 _slw_fg_decision = None
                 try:
@@ -2493,6 +3866,7 @@ class RetrievalEngine:
                             "admission": "skipped",
                         },
                     )
+                    _probe_set("embedding", "search_skipped_reason", _slw_fg_decision.reason)
                     _record_metric(
                         "search_lightweight.fallback_total",
                         1.0,
@@ -2504,10 +3878,13 @@ class RetrievalEngine:
                         },
                     )
                     results = _run_tfidf_path(_slw_fg_decision.reason, _slw_fg_decision.mode.value)
+                    results = _run_semantic_recovery(_slw_fg_decision.reason, results)
                 else:
                     query_text = effective_query_text
+                    _probe_set("embedding", "search_started", True)
                     _embedding_search_start = time.perf_counter()
                     raw_results = embedding_engine.search(query_text, top_k=top_k)
+                    _probe_set("embedding", "raw_count", len(raw_results or []))
                     _embedding_search_elapsed_ms = round((time.perf_counter() - _embedding_search_start) * 1000.0, 2)
                     _record_metric(
                         "search_lightweight.embedding_search_ms",
@@ -2525,6 +3902,7 @@ class RetrievalEngine:
 
                     # PERF-076: Batch load all candidate concepts in one query
                     _candidate_ids = [cid for cid, score in raw_results if score >= MIN_RETRIEVAL_SIMILARITY]
+                    _probe_set("embedding", "candidate_id_count", len(_candidate_ids))
                     if deadline and not deadline.can_start(
                         "retrieval.load_concepts_batch",
                         min_remaining_ms=_slw_min_batch_load_ms,
@@ -2535,11 +3913,13 @@ class RetrievalEngine:
                             priority="optional",
                             min_remaining_ms=_slw_min_batch_load_ms,
                         )
-                        return []
+                        _probe_set("embedding", "search_skipped_reason", "batch_deadline_before_start")
+                        return _finish_live_probe([])
                     from app.storage.concepts import load_concepts_batch
 
                     _batch_load_start = time.perf_counter()
                     _batch_cache = load_concepts_batch(_candidate_ids)
+                    _probe_set("embedding", "loaded_count", len(_batch_cache or {}))
                     _record_metric(
                         "search_lightweight.batch_load_ms",
                         round((time.perf_counter() - _batch_load_start) * 1000.0, 2),
@@ -2572,16 +3952,19 @@ class RetrievalEngine:
                                 if _slw_stop:
                                     break
                         if emb_score < MIN_RETRIEVAL_SIMILARITY:  # RETRIEVAL-031: raised from 0.15
+                            _probe_inc("embedding", "score_floor_rejected_count")
                             continue
                         concept = _batch_cache.get(concept_id)  # PERF-076: dict lookup, not DB query
                         if not concept:
                             continue
                         if concept.confidence < min_confidence:
+                            _probe_inc("embedding", "confidence_rejected_count")
                             continue
 
                         score = self._governance_score(concept, emb_score)
                         if score < 0:
                             if not include_deprecated:
+                                _probe_inc("embedding", "governance_rejected_count")
                                 continue  # Hard-filtered (STALE/SUPERSEDED)
                             score = 0.01  # RETRIEVAL-056: include_deprecated — floor score
                         # SESSION-012: Cross-session proximity boost (post-scoring, additive)
@@ -2601,9 +3984,30 @@ class RetrievalEngine:
                                 metadata=_diagnostic_source_metadata(concept),
                             )
                         )
+                    _probe_set("embedding", "result_count", len(results))
+                    lexical_admission = self._admit_strong_lexical_evidence(
+                        results,
+                        effective_query_text,
+                        path="search_lightweight",
+                        deadline=deadline,
+                    )
+                    results = lexical_admission.results
+                    _slw_lexical_protected_ids = lexical_admission.protected_ids
+                    self.last_lexical_evidence_support_trace = lexical_admission.support_trace
         else:
             # TF-IDF fallback path
             results = _run_tfidf_path()
+
+        if self.last_lexical_evidence_support_trace is None:
+            lexical_admission = self._admit_strong_lexical_evidence(
+                results,
+                effective_query_text,
+                path="search_lightweight_tfidf",
+                deadline=deadline,
+            )
+            results = lexical_admission.results
+            _slw_lexical_protected_ids = lexical_admission.protected_ids
+            self.last_lexical_evidence_support_trace = lexical_admission.support_trace
 
         if _slw_trace is not None:
             _mh262_trace_score_stage(
@@ -2627,7 +4031,12 @@ class RetrievalEngine:
                 path="search_lightweight_timeout",
             )
             results.sort(key=lambda r: (-r.relevance_score, r.concept_id))
-            return results
+            results = self._trim_with_protected_ids(
+                results,
+                top_k,
+                _slw_lexical_protected_ids | _slw_semantic_recovery_protected_ids,
+            )
+            return _finish_live_probe(results)
 
         if results:
             inferred_kas_set: set[str] = set()
@@ -2697,7 +4106,11 @@ class RetrievalEngine:
         if agent_id and scope == "agent":
             aid_map = self._batch_concept_agent_ids([r.concept_id for r in results])
             results = [r for r in results if aid_map.get(r.concept_id, "default") in (agent_id, "default")]
-            results = results[:top_k]
+        results = self._trim_with_protected_ids(
+            results,
+            top_k,
+            _slw_lexical_protected_ids | _slw_semantic_recovery_protected_ids,
+        )
 
         if _slw_trace is not None:
             _mh262_trace_score_stage(
@@ -2706,7 +4119,7 @@ class RetrievalEngine:
                 after_scores=[(r.concept_id, r.relevance_score) for r in results],
             )
 
-        return results
+        return _finish_live_probe(results)
 
     def sync_index(self) -> int:
         """Ensure all active concepts are in the TF-IDF index.
@@ -3081,7 +4494,7 @@ class RetrievalEngine:
         fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
         try:
             try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                lock_fd_exclusive(fd)
             except BlockingIOError:
                 report["deferred"] = "reflection_active"
                 return report
@@ -3162,7 +4575,7 @@ class RetrievalEngine:
                 raise
         finally:
             try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
+                unlock_fd(fd)
             finally:
                 os.close(fd)
                 report["duration_s"] = round(time.perf_counter() - t0, 3)
@@ -3193,8 +4606,13 @@ class RetrievalEngine:
 
             with _db_immediate() as conn:
                 conn.execute(
-                    "UPDATE concepts SET embedding = ?, embedding_version = ? WHERE id = ?",
-                    (emb.tobytes(), EMBEDDING_VERSION, concept_id),
+                    """UPDATE concepts
+                       SET embedding = ?, embedding_version = ?,
+                           embedding_text_hash = ?,
+                           embedding_text_contract_version = ?,
+                           embedding_refreshed_at = ?
+                       WHERE id = ?""",
+                    _embedding_update_tuple(emb, searchable_text, concept_id),
                 )
             return True
         except Exception as e:
@@ -3265,7 +4683,7 @@ class RetrievalEngine:
         fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
         try:
             try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                lock_fd_exclusive(fd)
             except BlockingIOError:
                 report["deferred"] = "reflection_active"
                 return report
@@ -3376,7 +4794,7 @@ class RetrievalEngine:
                 raise
         finally:
             try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
+                unlock_fd(fd)
             finally:
                 os.close(fd)
                 report["duration_s"] = round(time.perf_counter() - t0, 3)

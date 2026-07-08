@@ -7,13 +7,12 @@ classification semantics.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
-from functools import lru_cache
 import hashlib
 import re
 import time
-from typing import Iterable
-
+from collections.abc import Iterable
+from dataclasses import asdict, dataclass
+from functools import lru_cache
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 
@@ -42,6 +41,9 @@ class QueryIntentExpansion:
     expansion_input_source: str
     raw_query_hash: str
     assembled_query_hash: str
+    effective_query_hash: str
+    effective_query_source: str
+    assembled_context_used: bool
     deduped_alias_count: int
     contamination_guard_blocked: bool
 
@@ -280,9 +282,20 @@ def expand_query_intent(
 
     terms_t = _dedupe(terms)
     kas_t = _dedupe(kas)
-    expanded_query = assembled
+    contamination_guard_blocked = assembled_query is not None and _normalize(assembled) != normalized
+    effective_base_query = original if contamination_guard_blocked else assembled
+    effective_query_source = (
+        "raw_user_message"
+        if contamination_guard_blocked
+        else ("assembled_query" if assembled_query is not None else expansion_input_source)
+    )
+    assembled_context_used = bool(
+        assembled_query is not None and not contamination_guard_blocked and assembled != original
+    )
+
+    expanded_query = effective_base_query
     if terms_t:
-        expanded_query = f"{assembled} {' '.join(terms_t)}".strip()
+        expanded_query = f"{effective_base_query} {' '.join(terms_t)}".strip()
 
     variants = [original]
     for match in matched[:3]:
@@ -297,7 +310,6 @@ def expand_query_intent(
         confidence = min(0.95, 0.45 + 0.15 * len(matched) + 0.05 * len(kas_t))
 
     elapsed_ms = round((time.perf_counter() - start) * 1000.0, 3)
-    contamination_guard_blocked = assembled_query is not None and _normalize(assembled) != normalized
     return QueryIntentExpansion(
         original_query=original,
         normalized_query=normalized,
@@ -313,6 +325,9 @@ def expand_query_intent(
         expansion_input_source=expansion_input_source,
         raw_query_hash=_safe_hash(original),
         assembled_query_hash=_safe_hash(assembled),
+        effective_query_hash=_safe_hash(expanded_query),
+        effective_query_source=effective_query_source,
+        assembled_context_used=assembled_context_used,
         deduped_alias_count=len(matched),
         contamination_guard_blocked=contamination_guard_blocked,
     )

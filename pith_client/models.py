@@ -46,7 +46,9 @@ class Concept(_PithModel):
     associations: list[str] = Field(default_factory=list)
     age_minutes: Optional[float] = None
     freshness_label: Optional[str] = None
+    superseded_by: Optional[str] = None
     currency_status: Optional[str] = None
+    staleness_state: Optional[str] = None
     verbatim_fragments: list[VerbatimFragment] = Field(default_factory=list)
 
 
@@ -79,6 +81,12 @@ class ConversationTurnResponse(_PithModel):
     is_resumption: bool = False
     is_first_call: bool = False
     extraction_request: Optional[list[str]] = None
+    context_trust_conflicts: Optional[list[dict[str, Any]]] = None
+    context_trust_decision: Optional[dict[str, Any]] = None
+    context_freshness_conflicts: Optional[list[dict[str, Any]]] = None
+    context_freshness_decision: Optional[dict[str, Any]] = None
+    retrieval_policy_trace: Optional[dict[str, Any]] = None
+    context_resolution_summary: Optional[dict[str, Any]] = None
     processing_time_ms: float = 0.0
 
 

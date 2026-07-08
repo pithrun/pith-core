@@ -58,6 +58,7 @@ from app.core.models import (
     PresentMomentOrientation,
     RecentConceptSummary,
     RecentEvolutionSummary,
+    SearchQuery,
     SearchResult,
     SessionEndRequest,
     SessionInfo,
@@ -82,6 +83,7 @@ from app.storage import (
     load_association_indexes_budgeted,
     load_associations,
     load_concept,
+    load_concepts_batch,
     load_recent_concepts,
     load_resume_snapshot,
     load_session,
@@ -1839,6 +1841,73 @@ def _mh262_canary_retrieval_trace_enabled() -> bool:
     )
 
 
+def _bench_budget_decision_trace_enabled() -> bool:
+    """Benchmark-only effective-budget and hard-cap trace exposure gate."""
+    return (
+        _env_bool("PITH_BENCH_BUDGET_DECISION_TRACE", False)
+        and (BENCHMARK.enabled or BENCHMARK_READONLY)
+    )
+
+
+def _bench_budget_trace_max_ids() -> int:
+    return _env_int_clamped("PITH_BENCH_BUDGET_DECISION_TRACE_MAX_IDS", 40, 0, 100)
+
+
+def _bench_concept_ids_bounded(concepts, *, max_ids: int) -> tuple[list[str], bool]:
+    try:
+        iterator = iter(concepts or [])
+    except TypeError:
+        return [], False
+
+    ids: list[str] = []
+    count = 0
+    for concept in iterator:
+        count += 1
+        if len(ids) >= max_ids:
+            continue
+        concept_id = getattr(concept, "concept_id", None)
+        if concept_id:
+            ids.append(str(concept_id))
+    return ids, count > max_ids
+
+
+def _bench_budget_hard_cap_trace(
+    *,
+    scope: str,
+    pre_count: int,
+    post_concepts,
+    pre_concepts,
+    effective_max_concepts: int,
+    keyword_count: int,
+    max_ids: int,
+) -> dict:
+    pre_ids, pre_truncated = _bench_concept_ids_bounded(
+        pre_concepts,
+        max_ids=max_ids,
+    )
+    post_ids, post_truncated = _bench_concept_ids_bounded(
+        post_concepts,
+        max_ids=max_ids,
+    )
+    post_id_set = set(post_ids)
+    dropped_ids = [
+        concept_id for concept_id in pre_ids
+        if concept_id not in post_id_set
+    ][:max_ids]
+    return {
+        "applied": True,
+        "scope": scope,
+        "pre_count": pre_count,
+        "post_count": len(post_concepts),
+        "effective_max_concepts": effective_max_concepts,
+        "keyword_count": keyword_count,
+        "pre_hard_cap_ids": pre_ids,
+        "post_hard_cap_ids": post_ids,
+        "dropped_hard_cap_ids": dropped_ids,
+        "ids_truncated": bool(pre_truncated or post_truncated),
+    }
+
+
 _LOCOMO_CANDIDATE_BOUNDARY_TRACE_ENV_NAMES: tuple[str, ...] = (
     "PITH_BENCHMARK_MODE",
     "PITH_BENCHMARK_READONLY",
@@ -2003,6 +2072,7 @@ _FOREGROUND_DEFAULT_ENFORCE_UNITS = frozenset(
         "injection.keyword_supplement",
         "injection.verbatim_path_b",
         "injection.serial_order_map",
+        "injection.recency_baseline",
         "coverage.llm",
     }
 )
@@ -2059,20 +2129,824 @@ def _activated_concept_from_search_result_fallback(
     *,
     serial_order: int | None = None,
 ) -> ActivatedConcept:
-    """Build the minimum activation payload when optional cache loading misses."""
+    """Build activation payload when optional cache loading misses.
+
+    The fallback still preserves lifecycle fields when storage can be loaded
+    without tracking access; otherwise superseded context can bypass freshness
+    suppression as if it were active.
+    """
+    loaded_concept = None
+    try:
+        loaded_concept = load_concept(result.concept_id, track_access=False)
+    except Exception:
+        loaded_concept = None
     return ActivatedConcept(
         concept_id=result.concept_id,
         summary=result.summary,
         confidence=result.confidence,
         relevance_score=round(result.relevance_score, 4),
         knowledge_area=result.knowledge_area or "unknown",
-        key_evidence=[],
-        associations=[],
+        key_evidence=[str(e) for e in getattr(loaded_concept, "evidence", [])[:2]] if loaded_concept else [],
+        associations=list(getattr(loaded_concept, "associations", []) or [])[:10] if loaded_concept else [],
         shadow_expanded=False,
-        currency_status="ACTIVE",
+        currency_status=getattr(
+            loaded_concept,
+            "currency_status",
+            getattr(result, "currency_status", "ACTIVE"),
+        ),
+        superseded_by=getattr(
+            loaded_concept,
+            "superseded_by",
+            getattr(result, "superseded_by", None),
+        ),
+        staleness_state=getattr(loaded_concept, "staleness_state", None),
         ka_relative_authority=getattr(result, "ka_relative_authority", None),
         serial_order=serial_order,
-        created_at=getattr(result, "created_at", None),
+        created_at=getattr(loaded_concept, "created_at", getattr(result, "created_at", None)),
+        valid_from=getattr(loaded_concept, "valid_from", None),
+        content_updated_at=getattr(loaded_concept, "content_updated_at", None),
+        session_id=getattr(loaded_concept, "session_id", None),
+        original_date=getattr(loaded_concept, "original_date", None),
+        edit_provenance=getattr(result, "edit_provenance", None),
+    )
+
+
+_ABSTENTION_FALLBACK_STRATEGY_TERMS = frozenset(
+    {
+        "gtm",
+        "go to market",
+        "go-to-market",
+        "launch",
+        "distribution",
+        "positioning",
+    }
+)
+_ABSTENTION_FALLBACK_STRATEGY_KAS = frozenset(
+    {
+        "product_strategy",
+        "business_strategy",
+        "go_to_market",
+        "competitive_analysis",
+    }
+)
+_ABSTENTION_FALLBACK_PROCESS_KAS = frozenset(
+    {
+        "process",
+        "workflow",
+        "firmware",
+        "system",
+        "constraints",
+    }
+)
+_ABSTENTION_FALLBACK_BLOCKED_MATURITIES = frozenset({"QUARANTINED", "DISCARDED"})
+_ABSTENTION_FALLBACK_DEPRECATED_STATUSES = frozenset(
+    {"STALE", "SUPERSEDED", "CONTRADICTED"}
+)
+_NONSTRATEGY_RECOVERY_SUPPORTED_KAS = frozenset(
+    {
+        "architecture",
+        "brain_engineering",
+        "constraints",
+        "implementation",
+        "methodology",
+        "process",
+        "retrieval",
+        "specification",
+        "system",
+        "testing",
+        "workflow",
+    }
+)
+_NONSTRATEGY_RECOVERY_SUPPORTED_QUESTION_CLASSES = frozenset(
+    {
+        "architecture",
+        "diagnostic",
+        "fact_lookup",
+        "factual",
+        "implementation",
+        "process",
+        "procedural",
+        "specification",
+        "technical",
+        "temporal_state",
+        "testing",
+    }
+)
+_NONSTRATEGY_EXISTING_SUPPORT_SCHEMA = "retrieval.nonstrategy_existing_support.v1"
+_NONSTRATEGY_EXISTING_SUPPORT_TRACE_AUTHORITY = "retrieval_141_existing_support"
+_NONSTRATEGY_EXISTING_SUPPORT_ALLOWLIST_IDENTIFIER_LIMIT = 160
+_SEMANTIC_RECOVERY_SUPPORT_TRACE_AUTHORITY = "retrieval_153_semantic_recovery"
+_ABSTENTION_SUPPORT_AUTHORITIES = frozenset(
+    {
+        "retrieval_137_lexical_admission",
+        _NONSTRATEGY_EXISTING_SUPPORT_TRACE_AUTHORITY,
+        _SEMANTIC_RECOVERY_SUPPORT_TRACE_AUTHORITY,
+    }
+)
+_NONSTRATEGY_RECOVERY_STOPWORDS = frozenset(
+    {
+        "about",
+        "after",
+        "again",
+        "also",
+        "and",
+        "any",
+        "are",
+        "can",
+        "did",
+        "does",
+        "for",
+        "from",
+        "have",
+        "how",
+        "into",
+        "our",
+        "should",
+        "that",
+        "the",
+        "their",
+        "then",
+        "there",
+        "this",
+        "was",
+        "were",
+        "what",
+        "when",
+        "where",
+        "which",
+        "why",
+        "with",
+        "would",
+    }
+)
+
+
+def _abstention_fallback_env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.lower() in ("1", "true", "yes", "on")
+
+
+def _abstention_fallback_env_int(
+    name: str,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, value))
+
+
+def _abstention_fallback_env_float(
+    name: str,
+    default: float,
+    minimum: float,
+    maximum: float,
+) -> float:
+    try:
+        value = float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, value))
+
+
+def _abstention_fallback_deadline_remaining_ms(turn_deadline: Any) -> float | None:
+    if not hasattr(turn_deadline, "remaining_ms"):
+        return None
+    remaining = turn_deadline.remaining_ms()
+    if remaining is None:
+        return None
+    return round(remaining, 2)
+
+
+def _abstention_fallback_error_trace(turn_deadline: Any) -> dict[str, Any]:
+    return {
+        "schema_version": "retrieval_abstention_fallback.v1",
+        "attempted": False,
+        "triggered": False,
+        "trigger_reason": None,
+        "source": "same_profile_search",
+        "query_hash": None,
+        "candidate_count": 0,
+        "top_score": None,
+        "admitted_ids": [],
+        "rejected": [],
+        "skipped_reason": "fallback_error",
+        "latency_ms": None,
+        "deadline_remaining_ms": _abstention_fallback_deadline_remaining_ms(
+            turn_deadline
+        ),
+    }
+
+
+def _abstention_fallback_is_hard(
+    coverage_confidence: dict | None,
+    abstention_signal: dict | None,
+) -> bool:
+    if isinstance(abstention_signal, dict) and abstention_signal.get("level") == "hard":
+        return True
+    if isinstance(coverage_confidence, dict):
+        return coverage_confidence.get("level") in {"no_results", "no_strong_match"}
+    return False
+
+
+def _nonstrategy_recovery_base_trace(
+    turn_deadline: Any,
+    *,
+    observe_only: bool = True,
+) -> dict[str, Any]:
+    return {
+        "schema_version": "retrieval.nonstrategy_evidence_recovery.v1",
+        "attempted": False,
+        "triggered": False,
+        "trigger_reason": None,
+        "source": "same_profile_search",
+        "mode": "observe_only" if observe_only else "behavior",
+        "query_hash": None,
+        "candidate_count": 0,
+        "top_score": None,
+        "admitted_ids": [],
+        "would_admit_ids": [],
+        "contested_ids": [],
+        "rejected": [],
+        "skipped_reason": None,
+        "latency_ms": None,
+        "deadline_remaining_ms": _abstention_fallback_deadline_remaining_ms(
+            turn_deadline
+        ),
+    }
+
+
+def _nonstrategy_recovery_error_trace(turn_deadline: Any) -> dict[str, Any]:
+    trace = _nonstrategy_recovery_base_trace(turn_deadline)
+    trace["skipped_reason"] = "recovery_error"
+    return trace
+
+
+def _nonstrategy_existing_support_base_trace(
+    turn_deadline: Any,
+    *,
+    observe_only: bool = True,
+) -> dict[str, Any]:
+    return {
+        "schema_version": _NONSTRATEGY_EXISTING_SUPPORT_SCHEMA,
+        "attempted": False,
+        "triggered": False,
+        "trigger_reason": None,
+        "mode": "observe_only" if observe_only else "behavior",
+        "candidate_count": 0,
+        "would_support_ids": [],
+        "supported_ids": [],
+        "contested_ids": [],
+        "rejected": [],
+        "skipped_reason": None,
+        "support_basis": None,
+        "allowlist": {
+            "required_for_behavior": not observe_only,
+            "concept_configured": False,
+            "origin_configured": False,
+            "concept_allowed": True,
+            "origin_allowed": True,
+            "any_configured": False,
+        },
+        "deadline_remaining_ms": _abstention_fallback_deadline_remaining_ms(
+            turn_deadline
+        ),
+    }
+
+
+def _nonstrategy_existing_support_error_trace(turn_deadline: Any) -> dict[str, Any]:
+    trace = _nonstrategy_existing_support_base_trace(turn_deadline)
+    trace["skipped_reason"] = "support_error"
+    return trace
+
+
+def _nonstrategy_recovery_terms(text: str) -> set[str]:
+    return {
+        token
+        for token in _re.findall(r"[a-z0-9_/-]+", (text or "").lower())
+        if len(token) > 2 and token not in _NONSTRATEGY_RECOVERY_STOPWORDS
+    }
+
+
+def _nonstrategy_recovery_overlap_ratio(query: str, summary: str) -> float:
+    query_terms = _nonstrategy_recovery_terms(query)
+    if not query_terms:
+        return 0.0
+    summary_terms = _nonstrategy_recovery_terms(summary)
+    if not summary_terms:
+        return 0.0
+    return len(query_terms & summary_terms) / len(query_terms)
+
+
+def _nonstrategy_existing_support_basis(
+    query: str,
+    summary: str,
+    *,
+    min_overlap_ratio: float,
+) -> tuple[str | None, float]:
+    query_terms = _nonstrategy_recovery_terms(query)
+    summary_terms = _nonstrategy_recovery_terms(summary)
+    if not query_terms or not summary_terms:
+        return None, 0.0
+
+    identifier_terms = {
+        term for term in query_terms
+        if "_" in term or "/" in term or "-" in term
+    }
+    if identifier_terms and identifier_terms & summary_terms:
+        return "exact_identifier_overlap", 1.0
+
+    overlap_ratio = len(query_terms & summary_terms) / len(query_terms)
+    if overlap_ratio >= min_overlap_ratio:
+        return "high_required_term_overlap", overlap_ratio
+    return None, overlap_ratio
+
+
+def _nonstrategy_existing_support_allowlist(
+    raw_value: str | None,
+) -> tuple[set[str], bool]:
+    configured = raw_value is not None
+    values: set[str] = set()
+    if raw_value is None:
+        return values, configured
+    for part in str(raw_value).split(","):
+        cleaned = part.strip()[:_NONSTRATEGY_EXISTING_SUPPORT_ALLOWLIST_IDENTIFIER_LIMIT]
+        if cleaned:
+            values.add(cleaned)
+    return values, configured
+
+
+def _nonstrategy_existing_support_current_state(
+    concept_id: str,
+) -> dict[str, Any] | None:
+    try:
+        with read_snapshot_db("nonstrategy_existing_support_current_state") as conn:
+            row = conn.execute(
+                """
+                SELECT status, is_current, currency_status, staleness_state, superseded_by
+                FROM concepts
+                WHERE id = ?
+                """,
+                (concept_id,),
+            ).fetchone()
+    except Exception as exc:
+        logger.debug(
+            "RETRIEVAL-152: current-state lookup failed for %s: %s",
+            concept_id,
+            exc,
+        )
+        return None
+    if row is None:
+        return None
+    return {
+        "status": row["status"],
+        "is_current": int(row["is_current"] or 0),
+        "currency_status": (row["currency_status"] or "ACTIVE").upper(),
+        "staleness_state": (row["staleness_state"] or "").upper(),
+        "superseded_by": row["superseded_by"],
+    }
+
+
+def _nonstrategy_existing_support_degraded_context_trigger(
+    activated: list[Any],
+) -> bool:
+    for concept in activated or []:
+        currency_status = str(getattr(concept, "currency_status", "") or "").upper()
+        staleness_state = str(getattr(concept, "staleness_state", "") or "").upper()
+        status = str(getattr(concept, "status", "") or "").lower()
+        if currency_status in {"CONTESTED", "CONTRADICTED"}:
+            return True
+        if staleness_state in {"STALE", "AGING", "REVIEW"}:
+            return True
+        if getattr(concept, "superseded_by", None):
+            return True
+        if status in {"superseded", "archived", "corrupted"}:
+            return True
+    return False
+
+
+def _nonstrategy_existing_support_allowlist_trace(
+    *,
+    concept_id: str,
+    origin_id: str | None,
+    concept_raw: str | None,
+    origin_raw: str | None,
+    observe_only: bool,
+    require_allowlist: bool,
+) -> tuple[dict[str, Any], str | None]:
+    concept_values, concept_configured = _nonstrategy_existing_support_allowlist(
+        concept_raw
+    )
+    origin_values, origin_configured = _nonstrategy_existing_support_allowlist(
+        origin_raw
+    )
+    concept_allowed = not concept_configured or concept_id in concept_values
+    origin_allowed = not origin_configured or (
+        origin_id is not None and origin_id in origin_values
+    )
+    any_configured = concept_configured or origin_configured
+
+    reason = None
+    if not observe_only and require_allowlist and not any_configured:
+        reason = "support_allowlist_required"
+    elif concept_configured and not concept_allowed:
+        reason = "support_allowlist_blocked"
+    elif origin_configured and not origin_allowed:
+        reason = "support_allowlist_blocked"
+
+    return {
+        "required_for_behavior": not observe_only,
+        "required_by_config": bool(require_allowlist),
+        "concept_configured": concept_configured,
+        "origin_configured": origin_configured,
+        "concept_allowed": concept_allowed,
+        "origin_allowed": origin_allowed,
+        "any_configured": any_configured,
+    }, reason
+
+
+def _nonstrategy_recovery_trace_kas(query_intent_trace: dict | None) -> set[str]:
+    if not isinstance(query_intent_trace, dict):
+        return set()
+    kas = {str(value).lower() for value in query_intent_trace.get("inferred_kas") or []}
+    for alias in query_intent_trace.get("matched_aliases") or []:
+        if not isinstance(alias, dict):
+            continue
+        kas.update(str(value).lower() for value in alias.get("target_kas") or [])
+    return kas
+
+
+def _nonstrategy_recovery_question_class(query_intent_trace: dict | None) -> str | None:
+    if not isinstance(query_intent_trace, dict):
+        return None
+    nested = query_intent_trace.get("query_class")
+    if isinstance(nested, dict):
+        value = nested.get("question_classification")
+        if value:
+            return str(value).lower()
+    for key in ("question_classification", "question_class", "query_class"):
+        value = query_intent_trace.get(key)
+        if value and not isinstance(value, dict):
+            return str(value).lower()
+    return None
+
+
+def _nonstrategy_recovery_supported_query(
+    query: str,
+    query_intent_trace: dict | None,
+) -> bool:
+    if _abstention_fallback_query_is_strategy_lane(query, query_intent_trace):
+        return False
+    kas = _nonstrategy_recovery_trace_kas(query_intent_trace)
+    if kas & _NONSTRATEGY_RECOVERY_SUPPORTED_KAS:
+        return True
+    question_class = _nonstrategy_recovery_question_class(query_intent_trace)
+    return bool(question_class in _NONSTRATEGY_RECOVERY_SUPPORTED_QUESTION_CLASSES)
+
+
+def _nonstrategy_recovery_rejection_reason(
+    result: SearchResult,
+    *,
+    query: str,
+    existing_ids: set[str],
+    request: ConversationTurnRequest,
+    threshold: float,
+    min_overlap_ratio: float,
+    loaded_concept: Concept | None,
+) -> tuple[str | None, float]:
+    if result.concept_id in existing_ids:
+        return "already_admitted", 0.0
+    if (result.relevance_score or 0.0) < threshold:
+        return "score_below_floor", 0.0
+    if loaded_concept is None:
+        return "safety_state_unknown", 0.0
+
+    maturity = getattr(loaded_concept, "maturity", None) or "ESTABLISHED"
+    if maturity in _ABSTENTION_FALLBACK_BLOCKED_MATURITIES:
+        return "blocked_maturity", 0.0
+
+    currency_status = getattr(loaded_concept, "currency_status", None) or "ACTIVE"
+    superseded_by = getattr(loaded_concept, "superseded_by", None)
+    status = getattr(loaded_concept, "status", None) or "active"
+    if not getattr(request, "include_deprecated", False):
+        if (
+            currency_status in _ABSTENTION_FALLBACK_DEPRECATED_STATUSES
+            or superseded_by
+            or status in {"archived", "superseded", "corrupted"}
+        ):
+            return "deprecated_or_superseded", 0.0
+
+    summary = result.summary or getattr(loaded_concept, "summary", "") or ""
+    required_terms = _abstention_fallback_required_entity_terms(query)
+    summary_terms = _nonstrategy_recovery_terms(summary)
+    if required_terms and not any(term in summary_terms for term in required_terms):
+        return "entity_mismatch", 0.0
+
+    overlap_ratio = _nonstrategy_recovery_overlap_ratio(query, summary)
+    if overlap_ratio < min_overlap_ratio:
+        return "lexical_overlap_below_floor", overlap_ratio
+
+    metadata = getattr(loaded_concept, "metadata", {}) or {}
+    ka = (result.knowledge_area or metadata.get("knowledge_area") or "").lower()
+    if ka and ka not in _NONSTRATEGY_RECOVERY_SUPPORTED_KAS and overlap_ratio < 0.60:
+        return "candidate_ka_mismatch", overlap_ratio
+
+    return None, overlap_ratio
+
+
+def _bounded_lexical_support_ids(values: Any, *, limit: int = 8) -> list[str]:
+    if not isinstance(values, (list, tuple, set)):
+        return []
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if value is None:
+            continue
+        text = str(value)
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+        if len(result) >= limit:
+            break
+    return result
+
+
+def _build_lexical_evidence_support_summary(
+    trace: dict | None,
+    activated_concepts: list[Any],
+) -> dict | None:
+    try:
+        from app.core.config import LEXICAL_ABSTENTION_HANDOFF_ENABLED
+    except Exception:
+        LEXICAL_ABSTENTION_HANDOFF_ENABLED = True
+    if not LEXICAL_ABSTENTION_HANDOFF_ENABLED or not isinstance(trace, dict):
+        return None
+    if trace.get("schema_version") != "retrieval.lexical_evidence_support.v1":
+        return None
+    if trace.get("trace_authority") != "retrieval_137_lexical_admission":
+        return None
+    if not trace.get("support_present"):
+        return None
+
+    activated_ids = {
+        str(concept_id)
+        for concept in activated_concepts or []
+        if (concept_id := getattr(concept, "concept_id", None))
+    }
+    support_ids = [
+        concept_id
+        for concept_id in _bounded_lexical_support_ids(trace.get("support_ids"))
+        if concept_id in activated_ids
+    ]
+    if not support_ids:
+        return None
+
+    admitted_ids = [
+        concept_id
+        for concept_id in _bounded_lexical_support_ids(trace.get("admitted_ids"))
+        if concept_id in activated_ids
+    ]
+    contested_ids = [
+        concept_id
+        for concept_id in _bounded_lexical_support_ids(trace.get("contested_ids"))
+        if concept_id in support_ids
+    ]
+    return {
+        "schema_version": "retrieval.lexical_evidence_support_summary.v1",
+        "present": True,
+        "applied": True,
+        "support_level": "bounded_exact_lexical",
+        "trust_modifier": "caution" if contested_ids else "normal",
+        "support_ids": support_ids,
+        "admitted_ids": admitted_ids,
+        "contested_ids": contested_ids,
+        "reason": str(trace.get("reason") or "lexical_support_present")[:120],
+        "path": str(trace.get("path") or "")[:80],
+        "trace_authority": "retrieval_137_lexical_admission",
+        "runtime_eligible": True,
+    }
+
+
+def _build_semantic_recovery_support_summary(
+    trace: dict | None,
+    activated_concepts: list[Any],
+) -> dict | None:
+    if not isinstance(trace, dict):
+        return None
+    if trace.get("trigger_reason") != "cold_start_no_samples":
+        return None
+    if trace.get("reason") != "admitted":
+        return None
+
+    activated_ids = {
+        str(concept_id)
+        for concept in activated_concepts or []
+        if (concept_id := getattr(concept, "concept_id", None))
+    }
+    support_ids = [
+        concept_id
+        for concept_id in _bounded_lexical_support_ids(trace.get("admitted_ids"))
+        if concept_id in activated_ids
+    ]
+    if not support_ids:
+        return None
+
+    return {
+        "schema_version": "retrieval.context_support_summary.v1",
+        "present": True,
+        "applied": True,
+        "support_level": "bounded_semantic_recovery",
+        "trust_modifier": "normal",
+        "support_ids": support_ids,
+        "admitted_ids": support_ids,
+        "contested_ids": [],
+        "reason": "cold_start_no_samples",
+        "path": "semantic_recovery",
+        "trace_authority": _SEMANTIC_RECOVERY_SUPPORT_TRACE_AUTHORITY,
+        "runtime_eligible": True,
+    }
+
+
+def _build_context_support_summary(
+    *,
+    lexical_trace: dict | None,
+    semantic_recovery_trace: dict | None,
+    activated_concepts: list[Any],
+) -> dict | None:
+    lexical_support = _build_lexical_evidence_support_summary(
+        lexical_trace,
+        activated_concepts,
+    )
+    if lexical_support is not None:
+        return lexical_support
+    return _build_semantic_recovery_support_summary(
+        semantic_recovery_trace,
+        activated_concepts,
+    )
+
+
+def _lexical_evidence_support_applies(lexical_support: dict | None) -> bool:
+    if not isinstance(lexical_support, dict):
+        return False
+    authority = lexical_support.get("trace_authority")
+    if authority not in _ABSTENTION_SUPPORT_AUTHORITIES:
+        return False
+    if authority == _SEMANTIC_RECOVERY_SUPPORT_TRACE_AUTHORITY:
+        if lexical_support.get("runtime_eligible") is not True:
+            return False
+        if lexical_support.get("support_level") != "bounded_semantic_recovery":
+            return False
+    return lexical_support.get("applied") is True and bool(lexical_support.get("support_ids"))
+
+
+def _abstention_fallback_query_is_strategy_lane(
+    query: str,
+    query_intent_trace: dict | None,
+) -> bool:
+    normalized = f" {query.lower()} "
+    if any(term in normalized for term in _ABSTENTION_FALLBACK_STRATEGY_TERMS):
+        return True
+    if not isinstance(query_intent_trace, dict):
+        return False
+
+    inferred = set(query_intent_trace.get("inferred_kas") or [])
+    if inferred & _ABSTENTION_FALLBACK_STRATEGY_KAS:
+        return True
+
+    aliases = query_intent_trace.get("matched_aliases") or []
+    for alias in aliases:
+        if not isinstance(alias, dict):
+            continue
+        terms = {str(term).lower() for term in alias.get("canonical_terms", []) or []}
+        if any(term in terms for term in _ABSTENTION_FALLBACK_STRATEGY_TERMS):
+            return True
+    return False
+
+
+def _abstention_fallback_has_existing_strong_activation(
+    activated: list[ActivatedConcept],
+    always_on_ids: set[str],
+    threshold: float,
+) -> bool:
+    for concept in activated or []:
+        if concept.concept_id in always_on_ids:
+            continue
+        if concept.concept_id.startswith(("firmware:", "cko:")):
+            continue
+        if (concept.relevance_score or 0.0) >= threshold:
+            return True
+    return False
+
+
+def _abstention_fallback_query_mentions_process(query: str) -> bool:
+    normalized = query.lower()
+    return any(
+        term in normalized
+        for term in ("process", "workflow", "protocol", "procedure", "hygiene")
+    )
+
+
+def _abstention_fallback_term_overlap(query: str, summary: str) -> bool:
+    normalized_query = query.lower()
+    normalized_summary = summary.lower()
+    return any(
+        term in normalized_query and term in normalized_summary
+        for term in _ABSTENTION_FALLBACK_STRATEGY_TERMS
+    )
+
+
+def _abstention_fallback_required_entity_terms(query: str) -> list[str]:
+    """Return distinctive query tokens that must appear in a fallback candidate."""
+    required: list[str] = []
+    for token in _re.findall(r"\b[A-Za-z][A-Za-z0-9-]*\b", query or ""):
+        lowered = token.lower().strip("-")
+        if lowered in _ABSTENTION_FALLBACK_STRATEGY_TERMS:
+            continue
+        if lowered in {"go-to-market", "go", "to", "market"}:
+            continue
+        if any(ch.isdigit() for ch in lowered) or "-" in lowered:
+            required.append(lowered)
+    return required
+
+
+def _abstention_fallback_rejection_reason(
+    result: SearchResult,
+    *,
+    query: str,
+    existing_ids: set[str],
+    request: ConversationTurnRequest,
+    threshold: float,
+    loaded_concept: Concept | None,
+) -> str | None:
+    if result.concept_id in existing_ids:
+        return "already_admitted"
+    if (result.relevance_score or 0.0) < threshold:
+        return "score_below_floor"
+
+    safety_source = loaded_concept if loaded_concept is not None else result
+    maturity = getattr(safety_source, "maturity", None) or "ESTABLISHED"
+    if maturity in _ABSTENTION_FALLBACK_BLOCKED_MATURITIES:
+        return "blocked_maturity"
+
+    if loaded_concept is None:
+        return "safety_state_unknown"
+
+    currency_status = getattr(loaded_concept, "currency_status", None) or "ACTIVE"
+    superseded_by = getattr(loaded_concept, "superseded_by", None)
+    status = getattr(loaded_concept, "status", None) or "active"
+    if not getattr(request, "include_deprecated", False):
+        if (
+            currency_status in _ABSTENTION_FALLBACK_DEPRECATED_STATUSES
+            or superseded_by
+            or status in {"archived", "superseded", "corrupted"}
+        ):
+            return "deprecated_or_superseded"
+
+    summary_l = (result.summary or "").lower()
+    required_terms = _abstention_fallback_required_entity_terms(query)
+    if required_terms and not any(term in summary_l for term in required_terms):
+        return "entity_mismatch"
+
+    metadata = getattr(loaded_concept, "metadata", {}) or {}
+    ka = result.knowledge_area or metadata.get("knowledge_area") or ""
+    if ka in _ABSTENTION_FALLBACK_PROCESS_KAS and not _abstention_fallback_query_mentions_process(query):
+        return "process_context_only"
+    if ka not in _ABSTENTION_FALLBACK_STRATEGY_KAS and not _abstention_fallback_term_overlap(query, result.summary or ""):
+        return "ka_or_topic_mismatch"
+    return None
+
+
+def _abstention_fallback_activation_from_result(
+    result: SearchResult,
+    loaded_concept: Concept | None,
+) -> ActivatedConcept:
+    if loaded_concept is None:
+        return _activated_concept_from_search_result_fallback(result)
+    metadata = getattr(loaded_concept, "metadata", {}) or {}
+    return ActivatedConcept(
+        concept_id=result.concept_id,
+        summary=result.summary,
+        confidence=result.confidence,
+        relevance_score=round(result.relevance_score, 4),
+        knowledge_area=result.knowledge_area or metadata.get("knowledge_area", "unknown"),
+        key_evidence=[],
+        associations=getattr(loaded_concept, "associations", [])[:10],
+        shadow_expanded=False,
+        currency_status=getattr(loaded_concept, "currency_status", "ACTIVE"),
+        superseded_by=getattr(loaded_concept, "superseded_by", None),
+        staleness_state=getattr(loaded_concept, "staleness_state", None),
+        ka_relative_authority=getattr(result, "ka_relative_authority", None),
+        created_at=getattr(loaded_concept, "created_at", None),
+        valid_from=getattr(loaded_concept, "valid_from", None),
+        content_updated_at=getattr(loaded_concept, "content_updated_at", None),
+        session_id=getattr(loaded_concept, "session_id", None),
+        original_date=getattr(loaded_concept, "original_date", None),
         edit_provenance=getattr(result, "edit_provenance", None),
     )
 
@@ -2149,6 +3023,70 @@ def _trace_base_retrieval_stage(
                 if target_id in after_all_ids
             }
     trace.setdefault("stages", {})[stage] = stage_payload
+
+
+def _retrieval_candidate_flow_trace_requested(request: Any) -> bool:
+    return bool(getattr(request, "trace_candidate_flow", False))
+
+
+def _trace_activated_candidate_stage(
+    trace: dict[str, Any] | None,
+    stage: str,
+    activated_concepts: list[ActivatedConcept] | None,
+    *,
+    limit: int = _MH262_CANARY_TRACE_LIMIT,
+) -> None:
+    if trace is None:
+        return
+    concepts = activated_concepts or []
+    ids = [
+        str(getattr(concept, "concept_id"))
+        for concept in concepts[:limit]
+        if getattr(concept, "concept_id", None)
+    ]
+    trace.setdefault("stages", {})[stage] = {
+        "after_ids": ids,
+        "after_count": len(concepts),
+        "after_ids_truncated": len(concepts) > len(ids),
+    }
+
+
+_STALENESS_FILTER_PLAN_TYPES = {"goal", "decision", "observation", "constraint"}
+
+
+def _concept_lifecycle_current_for_staleness_filter(concept: Any, now: datetime) -> bool:
+    """Return whether S5.5 should preserve or forward an old v1 concept.
+
+    S5.5 is not the lifecycle-governance layer. It should remove only clearly
+    invalid records; stale, superseded, contested, and contradicted concepts must
+    reach context freshness so they can be explained, cautioned, or replaced.
+    """
+    status = str(getattr(concept, "status", "active") or "active").lower()
+    if status != "active":
+        return False
+
+    is_current = getattr(concept, "is_current", True)
+    if isinstance(is_current, str):
+        if is_current.strip().lower() in {"0", "false", "no", "n", "inactive"}:
+            return False
+    elif is_current is False or is_current == 0:
+        return False
+
+    valid_until = getattr(concept, "valid_until", None)
+    if valid_until:
+        try:
+            if isinstance(valid_until, str):
+                valid_until_dt = _ensure_aware(
+                    datetime.fromisoformat(valid_until.replace("Z", "+00:00").replace("+00:00", ""))
+                )
+            else:
+                valid_until_dt = _ensure_aware(valid_until) if isinstance(valid_until, datetime) else valid_until
+            if valid_until_dt and valid_until_dt <= now:
+                return False
+        except Exception:
+            pass
+
+    return True
 
 
 _MAB_BRIDGE_TRACE_DEFAULT_SPECS = {
@@ -4929,6 +5867,9 @@ class ConversationTurnMixin:
             if _answer_path_admission.allows_optional_phase(
                 phase,
                 enforce_standard_optional=_answer_path_admission.mode == "standard",
+                enforce_first_call_resumption_optional=(
+                    _answer_path_admission.mode == "first_call_resumption"
+                ),
             ):
                 return True
             _turn_deadline.skip(
@@ -6418,12 +7359,47 @@ class ConversationTurnMixin:
             'will', 'would', 'has', 'have', 'do', 'should', 'shall',
         })
         effective_max_concepts = request.max_concepts
+        _budget_decision_trace = None
+        _budget_trace_enabled = _bench_budget_decision_trace_enabled()
+        if _budget_trace_enabled:
+            _budget_decision_trace = {
+                "schema_version": "bench.budget_decision_trace.v1",
+                "diagnostic_only": True,
+                "requested_max_concepts": request.max_concepts,
+                "initial_effective_max_concepts": effective_max_concepts,
+                "final_effective_max_concepts": None,
+                "decisions": [],
+                "hard_cap": {"applied": False},
+            }
+
+        def _record_budget_decision(
+            stage: str,
+            before: int,
+            after: int,
+            *,
+            applied: bool,
+            reason: str,
+            **extra,
+        ):
+            if _budget_decision_trace is None:
+                return
+            decision = {
+                "stage": stage,
+                "applied": bool(applied),
+                "before": int(before),
+                "after": int(after),
+                "reason": str(reason),
+            }
+            decision.update(extra)
+            _budget_decision_trace["decisions"].append(decision)
+
         _msg_stripped = request.message.strip()
         _is_question = (
             '?' in _msg_stripped
             or _msg_stripped.split()[0].lower().rstrip('?.,!') in _INTERROGATIVE_PREFIXES
             if _msg_stripped else False
         )
+        _short_message_budget_before = effective_max_concepts
         if len(_msg_stripped) <= SHORT_MESSAGE_THRESHOLD and not _is_question:
             effective_max_concepts = min(request.max_concepts, SHORT_MESSAGE_MAX_CONCEPTS)
             logger.info(
@@ -6435,22 +7411,46 @@ class ConversationTurnMixin:
                 f"S7: Short message ({len(_msg_stripped)} chars) but detected as question — "
                 f"keeping full retrieval ({effective_max_concepts} concepts)"
             )
+        _record_budget_decision(
+            "short_message_cap",
+            _short_message_budget_before,
+            effective_max_concepts,
+            applied=effective_max_concepts != _short_message_budget_before,
+            reason=(
+                "short_non_question"
+                if len(_msg_stripped) <= SHORT_MESSAGE_THRESHOLD and not _is_question
+                else "not_short_or_question"
+            ),
+        )
 
         # RETRIEVAL-BUDGET-FLOOR-001: Minimum concept budget for question queries.
         # Benchmark showed max_concepts < 12 kills SH recall (server returns 28-37
         # concepts for factual questions; capping below 12 discards critical context).
         _QUESTION_BUDGET_FLOOR = 12
+        _question_floor_budget_before = effective_max_concepts
         if _is_question and effective_max_concepts < _QUESTION_BUDGET_FLOOR:
             logger.info(
                 f"RETRIEVAL-BUDGET-FLOOR-001: Question budget floor "
                 f"{effective_max_concepts} → {_QUESTION_BUDGET_FLOOR}"
             )
             effective_max_concepts = _QUESTION_BUDGET_FLOOR
+        _record_budget_decision(
+            "question_floor",
+            _question_floor_budget_before,
+            effective_max_concepts,
+            applied=effective_max_concepts != _question_floor_budget_before,
+            reason=(
+                "question_floor"
+                if _is_question and _question_floor_budget_before < _QUESTION_BUDGET_FLOOR
+                else "not_question_or_already_above_floor"
+            ),
+        )
 
         # --- CONFIG-001: Complexity-based retrieval scaling ---
         # Multi-hop questions and entity-rich queries need more retrieval slots.
         # Default max_concepts=8 is tuned for simple queries. Complex queries
         # (multi-hop, proper nouns, relationship questions) benefit from 2x budget.
+        _complexity_budget_before = effective_max_concepts
         _complexity_boosted = False
         _stage3_complexity_detection_start = time.perf_counter()
         _complexity_detection_min_ms = _turn_deadline.optional_minimum_ms(
@@ -6504,6 +7504,17 @@ class ConversationTurnMixin:
             "ct_subphase_complexity_detection_ms",
             _stage3_complexity_detection_start,
         )
+        _record_budget_decision(
+            "complexity_boost",
+            _complexity_budget_before,
+            effective_max_concepts,
+            applied=_complexity_boosted and effective_max_concepts != _complexity_budget_before,
+            reason=(
+                "complex_query"
+                if _complexity_boosted and effective_max_concepts != _complexity_budget_before
+                else "not_complex_or_deadline_skip_or_already_above_cap"
+            ),
+        )
 
         # --- S2: Embedding retrieval (budget: 25ms) ---
         # Fetch 2× max_concepts to leave room for filtering/reranking
@@ -6519,6 +7530,7 @@ class ConversationTurnMixin:
         # When enabled, overrides static env var checks for multihop/entity-chain.
         # When disabled, falls through to existing static behavior (zero change).
         _adaptive_config = None
+        _adaptive_router_budget_before = effective_max_concepts
         _stage3_router_start = time.perf_counter()
         try:
             from app.retrieval_router import get_retrieval_config
@@ -6537,8 +7549,20 @@ class ConversationTurnMixin:
             logger.debug(f"RETRIEVAL-060: Router init failed (non-fatal): {_ar_e}")
         finally:
             _stage3_add_ms("ct_subphase_retrieval_router_ms", _stage3_router_start)
+            _record_budget_decision(
+                "adaptive_router_boost",
+                _adaptive_router_budget_before,
+                effective_max_concepts,
+                applied=effective_max_concepts != _adaptive_router_budget_before,
+                reason=(
+                    "adaptive_top_k_multiplier"
+                    if effective_max_concepts != _adaptive_router_budget_before
+                    else "no_adaptive_multiplier"
+                ),
+            )
 
         _stage3_answer_path_start = time.perf_counter()
+        _answer_path_budget_before = effective_max_concepts
         try:
             from app.session.answer_path_admission import AnswerPathAdmission, SMALL, classify_answer_path
 
@@ -6596,7 +7620,19 @@ class ConversationTurnMixin:
             _answer_path_admission = None
         finally:
             _stage3_add_ms("ct_subphase_answer_path_classify_ms", _stage3_answer_path_start)
+        _record_budget_decision(
+            "answer_path_cap",
+            _answer_path_budget_before,
+            effective_max_concepts,
+            applied=effective_max_concepts != _answer_path_budget_before,
+            reason=(
+                "answer_path_enforced"
+                if effective_max_concepts != _answer_path_budget_before
+                else "observe_only_or_not_enforced_or_no_cap"
+            ),
+        )
 
+        _foreground_pressure_budget_before = effective_max_concepts
         if _foreground_pressure_mode in {"protected", "critical"}:
             _pressure_cap = int(
                 _env_float(
@@ -6622,6 +7658,18 @@ class ConversationTurnMixin:
                     1.0,
                     {"phase": "retrieval.pressure_concept_cap", "mode": _foreground_pressure_mode},
                 )
+        _record_budget_decision(
+            "foreground_pressure_cap",
+            _foreground_pressure_budget_before,
+            effective_max_concepts,
+            applied=effective_max_concepts != _foreground_pressure_budget_before,
+            reason=(
+                "foreground_pressure_mode"
+                if effective_max_concepts != _foreground_pressure_budget_before
+                else "no_foreground_pressure_cap"
+            ),
+            mode=_foreground_pressure_mode,
+        )
 
         # Lazy import to avoid circular dependency at module load.
         # Keep this inside the retrieval phase so cold singleton initialization is
@@ -6664,6 +7712,49 @@ class ConversationTurnMixin:
             except Exception as e:
                 logger.warning(f"RETRIEVAL-037a: Multihop gate failed (falling back): {e}")
 
+        _supersession_chain_rescue_trace: dict[str, Any] | None = None
+        _supersession_chain_protected_results: dict[str, SearchResult] = {}
+        _supersession_chain_protected_activated: dict[str, ActivatedConcept] = {}
+        _supersession_chain_restored_stages: list[dict[str, Any]] = []
+        _restore_protected_search_results_fn = None
+        _restore_protected_activated_concepts_fn = None
+
+        def _record_supersession_chain_restored(stage: str, restored_ids: list[str]) -> None:
+            if restored_ids:
+                _supersession_chain_restored_stages.append({"stage": stage, "ids": restored_ids[:3]})
+
+        def _restore_supersession_chain_search_results(
+            results: list[SearchResult],
+            *,
+            stage: str,
+            max_items: int | None = None,
+        ) -> list[SearchResult]:
+            if _restore_protected_search_results_fn is None or not _supersession_chain_protected_results:
+                return results
+            restored_results, restored_ids = _restore_protected_search_results_fn(
+                results,
+                _supersession_chain_protected_results,
+                max_items=max_items,
+            )
+            _record_supersession_chain_restored(stage, restored_ids)
+            return restored_results
+
+        def _restore_supersession_chain_activated(
+            concepts: list[ActivatedConcept],
+            *,
+            stage: str,
+            max_items: int,
+        ) -> list[ActivatedConcept]:
+            if _restore_protected_activated_concepts_fn is None or not _supersession_chain_protected_activated:
+                return concepts
+            restored_concepts, restored_ids = _restore_protected_activated_concepts_fn(
+                concepts,
+                _supersession_chain_protected_activated,
+                max_items=max_items,
+            )
+            _record_supersession_chain_restored(stage, restored_ids)
+            return restored_concepts
+
         if not _multihop_used:
             _retrieval_top_k = effective_max_concepts * 2
             if (
@@ -6701,10 +7792,79 @@ class ConversationTurnMixin:
                 except (TypeError, ValueError):
                     pass
                 search_results = retrieval_engine.search_lightweight(search_query, **_slw_kwargs)
+        try:
+            from app.core.config import get_feature_flag as _get_feature_flag
+            from app.session.supersession_chain_rescue import (
+                resolve_candidate_supersession_chains,
+                resolve_exact_supersession_head,
+                resolve_subject_supersession_chain_candidates,
+                restore_protected_activated_concepts,
+                restore_protected_search_results,
+            )
+
+            _restore_protected_search_results_fn = restore_protected_search_results
+            _restore_protected_activated_concepts_fn = restore_protected_activated_concepts
+            if _get_feature_flag("SUPERSESSION_CHAIN_RESCUE_ENABLED", False):
+                _supersession_conn = _get_connection()
+                try:
+                    _supersession_rescue = resolve_exact_supersession_head(
+                        request.message or "",
+                        conn=_supersession_conn,
+                        load_concept_fn=load_concept,
+                        enabled=True,
+                    )
+                    if (
+                        not _supersession_rescue.protected_results
+                        and _get_feature_flag("SUPERSESSION_CHAIN_SUBJECT_RESCUE_ENABLED", False)
+                        and _turn_deadline_optional("retrieval.supersession_subject_rescue", 75.0)
+                    ):
+                        _supersession_rescue = resolve_subject_supersession_chain_candidates(
+                            request.message or "",
+                            conn=_supersession_conn,
+                            load_concept_fn=load_concept,
+                            enabled=True,
+                        )
+                    if (
+                        not _supersession_rescue.protected_results
+                        and _get_feature_flag("SUPERSESSION_CHAIN_CANDIDATE_RESCUE_ENABLED", False)
+                        and _turn_deadline_optional("retrieval.supersession_candidate_rescue", 75.0)
+                    ):
+                        _supersession_rescue = resolve_candidate_supersession_chains(
+                            request.message or "",
+                            list(search_results or []),
+                            conn=_supersession_conn,
+                            load_concept_fn=load_concept,
+                            enabled=True,
+                        )
+                finally:
+                    _supersession_conn.close()
+
+                _supersession_chain_rescue_trace = _supersession_rescue.to_trace()
+                if _supersession_rescue.protected_results:
+                    _supersession_chain_protected_results.update(_supersession_rescue.protected_results)
+                    search_results = _restore_supersession_chain_search_results(
+                        list(search_results or []),
+                        stage="initial_search_results",
+                    )
+                try:
+                    from app.ops.metrics import metrics as _supersession_metrics
+                    from app.session.supersession_chain_rescue import (
+                        _supersession_chain_rescue_metric_events,
+                    )
+
+                    for _metric_name, _metric_value, _metric_labels in _supersession_chain_rescue_metric_events(
+                        _supersession_rescue
+                    ):
+                        _supersession_metrics.record(_metric_name, _metric_value, _metric_labels)
+                except Exception:
+                    pass
+        except Exception as _supersession_rescue_err:
+            logger.warning("SUPERSESSION-CHAIN-RESCUE failed (non-fatal): %s", _supersession_rescue_err)
         _t_search_lw_end = time.perf_counter()  # PERF-017: search_lightweight sub-metric
         _stage3_set_count("ct_subphase_initial_result_count", len(search_results or []))
         _base_retrieval_trace: dict[str, Any] | None = None
-        if _base_retrieval_trace_enabled():
+        _candidate_flow_trace_requested = _retrieval_candidate_flow_trace_requested(request)
+        if _base_retrieval_trace_enabled() or _candidate_flow_trace_requested:
             _base_retrieval_trace = {
                 "schema_version": "mh262.base_retrieval_trace.v1",
                 "limit": _MH262_CANARY_TRACE_LIMIT,
@@ -6722,9 +7882,21 @@ class ConversationTurnMixin:
             )
             if _slw_trace is not None:
                 _base_retrieval_trace["search_lightweight"] = _slw_trace
+            _live_admission_probe_trace = getattr(
+                retrieval_engine,
+                "last_live_initial_admission_probe_trace",
+                None,
+            )
+            if _live_admission_probe_trace is not None:
+                _base_retrieval_trace["live_initial_admission_probe"] = _live_admission_probe_trace
         _query_intent_trace_payload = getattr(
             retrieval_engine,
             "last_query_intent_trace",
+            None,
+        )
+        _lexical_evidence_support_trace = getattr(
+            retrieval_engine,
+            "last_lexical_evidence_support_trace",
             None,
         )
         try:
@@ -7373,6 +8545,11 @@ class ConversationTurnMixin:
                     _selection_boost_err,
                 )
         top_results = search_results[:effective_max_concepts]
+        top_results = _restore_supersession_chain_search_results(
+            top_results,
+            stage="initial_top_results",
+            max_items=effective_max_concepts,
+        )
         _trace_base_retrieval_stage(
             _base_retrieval_trace,
             "initial_top_results",
@@ -7516,6 +8693,11 @@ class ConversationTurnMixin:
                             _existing.values(),
                             key=_deterministic_search_result_sort_key,
                         )[:effective_max_concepts * 2]  # Allow expanded pool for downstream filtering
+                        top_results = _restore_supersession_chain_search_results(
+                            top_results,
+                            stage="requery_merge",
+                            max_items=effective_max_concepts * 2,
+                        )
                         _trace_base_retrieval_stage(
                             _base_retrieval_trace,
                             "requery_merge",
@@ -7658,7 +8840,11 @@ class ConversationTurnMixin:
                                 f"was {len(top_results)})"
                             )
                             _before_decomposition_merge = list(top_results)
-                            top_results = _merged
+                            top_results = _restore_supersession_chain_search_results(
+                                _merged,
+                                stage="decomposition_merge",
+                                max_items=max(len(_merged), effective_max_concepts),
+                            )
                             _trace_base_retrieval_stage(
                                 _base_retrieval_trace,
                                 "decomposition_merge",
@@ -8570,6 +9756,10 @@ class ConversationTurnMixin:
                             logger.debug(f"RETRIEVAL-101: Failed to load chain head {_head_id}: {_head_err}")
 
                     top_results.sort(key=lambda x: x.relevance_score, reverse=True)
+                    top_results = _restore_supersession_chain_search_results(
+                        top_results,
+                        stage="retrieval_101_chain_expansion",
+                    )
 
                 _chain_total_ms = (_chain_time.perf_counter() - _chain_t0) * 1000
                 if _chain_expanded > 0 or _chain_total_ms > 10:
@@ -9693,7 +10883,11 @@ class ConversationTurnMixin:
                         if _cp_match:
                             _cp_pruned.append(r)
                         # else: pruned (no entity overlap with chain)
-                    top_results = _cp_pruned
+                    top_results = _restore_supersession_chain_search_results(
+                        _cp_pruned,
+                        stage="chain_prune",
+                        max_items=max(len(_cp_pruned), effective_max_concepts),
+                    )
                     _cp_removed = _cp_before - len(top_results)
                     if _cp_removed:
                         logger.info(
@@ -10049,7 +11243,11 @@ class ConversationTurnMixin:
                 if len(filtered_results) >= MIN_ACTIVATION_FLOOR:
                     s29_filtered = pre_filter_count - len(filtered_results)
                     maturity_filtered_count += s29_filtered
-                    top_results = filtered_results
+                    top_results = _restore_supersession_chain_search_results(
+                        filtered_results,
+                        stage="maturity_gate",
+                        max_items=max(len(filtered_results), effective_max_concepts),
+                    )
                     if s29_filtered > 0:
                         logger.info(
                             f"W3: Maturity gate filtered {s29_filtered} concepts at S2.9 "
@@ -10189,7 +11387,11 @@ class ConversationTurnMixin:
                     _cc_final = _cc_deduped[:_cc_budget]
 
                     _cc_before = len(top_results)
-                    top_results = [r for r, _ in _cc_final]
+                    top_results = _restore_supersession_chain_search_results(
+                        [r for r, _ in _cc_final],
+                        stage="context_compiler_passthru",
+                        max_items=_CC_MAX_BUDGET,
+                    )
                     _cc_elapsed = (_cc_time.perf_counter() - _cc_t0) * 1000
 
                     _cc_details = []
@@ -10229,7 +11431,11 @@ class ConversationTurnMixin:
                         _cc_final = _cc_deduped[:_cc_budget]
 
                     _cc_before = len(top_results)
-                    top_results = [r for r, _ in _cc_final]
+                    top_results = _restore_supersession_chain_search_results(
+                        [r for r, _ in _cc_final],
+                        stage="context_compiler_compile",
+                        max_items=_CC_MAX_BUDGET,
+                    )
                     _cc_elapsed = (_cc_time.perf_counter() - _cc_t0) * 1000
 
                     _cc_details = []
@@ -10557,6 +11763,7 @@ class ConversationTurnMixin:
                     trust_signal=trust_sig,
                     age_minutes=_ta_age,
                     freshness_label=_ta_label,
+                    superseded_by=getattr(concept, "superseded_by", None),
                     currency_status=curr_status,  # RETRIEVAL-034 Layer 3
                     staleness_state=getattr(concept, "staleness_state", None),
                     ka_relative_authority=getattr(result, "ka_relative_authority", None),
@@ -10584,6 +11791,17 @@ class ConversationTurnMixin:
             )
         _stage3_add_ms("ct_subphase_activation_assembly_ms", _stage3_activation_assembly_start)
         _stage3_set_count("ct_subphase_activation_count", len(activated))
+        if _candidate_flow_trace_requested:
+            _trace_activated_candidate_stage(
+                _base_retrieval_trace,
+                "assembled_activated_concepts",
+                activated,
+            )
+        _supersession_chain_protected_activated = {
+            concept.concept_id: concept
+            for concept in activated
+            if concept.concept_id in _supersession_chain_protected_results
+        }
 
         # Append ambient principles (from S4.8) to activated list
         for ap in ambient_injected:
@@ -10602,6 +11820,7 @@ class ConversationTurnMixin:
                     associations=[],
                     age_minutes=_ta_age,
                     freshness_label=_ta_label,
+                    superseded_by=getattr(_ap_c, "superseded_by", None) if _ap_c else None,
                     currency_status=_ap_curr,  # RETRIEVAL-034 Layer 3
                 )
             )
@@ -10866,9 +12085,42 @@ class ConversationTurnMixin:
         _stage3_add_ms("ct_subphase_injection_session_local_grounding_ms", _stage3_session_local_grounding_start)
 
         _stage3_recency_baseline_start = time.perf_counter()
+        _recency_baseline_fg_config = _foreground_contract_config(
+            unit="injection.recency_baseline",
+            criticality="quality_sensitive_optional",
+            min_remaining_ms=_env_float("PITH_FOREGROUND_RECENCY_BASELINE_MIN_MS", 250.0),
+            recent_p95_limit_ms=_env_float(
+                "PITH_FOREGROUND_RECENCY_BASELINE_P95_LIMIT_MS",
+                250.0,
+            ),
+            circuit_ttl_s=_env_float(
+                "PITH_FOREGROUND_RECENCY_BASELINE_CIRCUIT_TTL_S",
+                60.0,
+            ),
+        )
+        _recency_baseline_attempted = False
         try:
             if not _turn_deadline_optional("injection.recency_baseline"):
                 raise _BudgetSkip()
+            _recency_baseline_decision = _foreground_contract_decide(
+                _recency_baseline_fg_config,
+                phase="injection.recency_baseline",
+            )
+            if _foreground_contract_should_skip(_recency_baseline_decision):
+                _record_budget_metric(
+                    "ct_stage3_optional_skip_total",
+                    1.0,
+                    {
+                        "unit": "injection.recency_baseline",
+                        "reason": getattr(
+                            _recency_baseline_decision,
+                            "reason",
+                            "foreground_contract_skip",
+                        ),
+                    },
+                )
+                raise _BudgetSkip()
+            _recency_baseline_attempted = True
             cutoff = (_utc_now() - timedelta(hours=RECENCY_WINDOW_HOURS)).isoformat()
             recent = load_recent_concepts(since_iso=cutoff, limit=5, min_confidence=RECENCY_MIN_CONFIDENCE)
 
@@ -10903,7 +12155,21 @@ class ConversationTurnMixin:
 
             recency_injected = 0
             for c in candidates[:RECENCY_MAX_INJECT]:
-                _ta_age, _ta_label = _compute_freshness(c.get("created_at"), _ta_now, _ta_session_start)
+                _recency_concept = None
+                try:
+                    _recency_concept = load_concept(c["concept_id"], track_access=False)
+                except Exception:
+                    _recency_concept = None
+                _ta_source_created_at = (
+                    getattr(_recency_concept, "created_at", None)
+                    if _recency_concept
+                    else c.get("created_at")
+                )
+                _ta_age, _ta_label = _compute_freshness(
+                    _ta_source_created_at,
+                    _ta_now,
+                    _ta_session_start,
+                )
                 activated.append(
                     ActivatedConcept(
                         concept_id=c["concept_id"],
@@ -10911,11 +12177,29 @@ class ConversationTurnMixin:
                         confidence=c["confidence"],
                         relevance_score=RECENCY_RELEVANCE_SCORE,
                         knowledge_area=c.get("knowledge_area", "general"),
-                        key_evidence=[],
-                        associations=[],
+                        key_evidence=(
+                            [str(e) for e in getattr(_recency_concept, "evidence", [])[:2]]
+                            if _recency_concept
+                            else []
+                        ),
+                        associations=(
+                            list(getattr(_recency_concept, "associations", []) or [])[:10]
+                            if _recency_concept
+                            else []
+                        ),
                         shadow_expanded=False,
                         age_minutes=_ta_age,
                         freshness_label=_ta_label,
+                        superseded_by=getattr(_recency_concept, "superseded_by", None),
+                        currency_status=getattr(_recency_concept, "currency_status", None)
+                        or c.get("currency_status"),
+                        staleness_state=getattr(_recency_concept, "staleness_state", None),
+                        ka_relative_authority=getattr(_recency_concept, "ka_relative_authority", None),
+                        created_at=getattr(_recency_concept, "created_at", None),
+                        valid_from=getattr(_recency_concept, "valid_from", None),
+                        content_updated_at=getattr(_recency_concept, "content_updated_at", None),
+                        session_id=getattr(_recency_concept, "session_id", None),
+                        original_date=getattr(_recency_concept, "original_date", None),
                     )
                 )
                 recency_existing_ids.add(c["concept_id"])
@@ -10931,6 +12215,16 @@ class ConversationTurnMixin:
         except Exception as e:
             # A-C10: Specific exception types — don't mask ImportError
             logger.warning(f"S4.9: Recency injection failed ({type(e).__name__}): {e}")
+        finally:
+            _recency_baseline_elapsed_ms = (
+                time.perf_counter() - _stage3_recency_baseline_start
+            ) * 1000.0
+            if _recency_baseline_attempted:
+                _foreground_contract_record_latency(
+                    _recency_baseline_fg_config,
+                    _recency_baseline_elapsed_ms,
+                    phase="injection.recency_baseline",
+                )
         _stage3_add_ms("ct_subphase_injection_recency_baseline_ms", _stage3_recency_baseline_start)
 
         t_injection = time.perf_counter()  # PERF-016: Phase A checkpoint
@@ -10949,7 +12243,15 @@ class ConversationTurnMixin:
         # 91-question regressions (all facts filtered as "stale").
         if BENCHMARK.enabled:
             STALE_THRESHOLD_HOURS = 999_999
-        PLAN_INDICATORS = {"goal", "decision", "observation", "constraint"}
+        try:
+            from app.core.config import get_feature_flag as _get_feature_flag
+
+            _lifecycle_aware_staleness_filter_enabled = _get_feature_flag(
+                "LIFECYCLE_AWARE_STALENESS_FILTER_ENABLED",
+                True,
+            )
+        except Exception:
+            _lifecycle_aware_staleness_filter_enabled = True
         # P1-1 fix: always-activate concepts must never be staleness-filtered
         # P0-5: firmware entries must never be staleness-filtered
         always_on_ids = {ao["concept_id"] for ao in always_on_injected} | firmware_ids
@@ -10979,7 +12281,13 @@ class ConversationTurnMixin:
                 else:
                     created_dt = _ensure_aware(created) if isinstance(created, datetime) else created
                 age_hours = (now - created_dt).total_seconds() / 3600
-                if age_hours > STALE_THRESHOLD_HOURS and concept.concept_type in PLAN_INDICATORS:
+                if age_hours > STALE_THRESHOLD_HOURS and concept.concept_type in _STALENESS_FILTER_PLAN_TYPES:
+                    if (
+                        _lifecycle_aware_staleness_filter_enabled
+                        and _concept_lifecycle_current_for_staleness_filter(concept, now)
+                    ):
+                        filtered_activated.append(ac)
+                        continue
                     staleness_filtered_count += 1
                     logger.debug(
                         f"S5.5: silently excluded stale concept '{ac.concept_id}' "
@@ -10990,7 +12298,17 @@ class ConversationTurnMixin:
                 pass  # Staleness detection is best-effort
             filtered_activated.append(ac)
 
-        activated = filtered_activated
+        activated = _restore_supersession_chain_activated(
+            filtered_activated,
+            stage="staleness_filter",
+            max_items=max(len(filtered_activated), effective_max_concepts),
+        )
+        if _candidate_flow_trace_requested:
+            _trace_activated_candidate_stage(
+                _base_retrieval_trace,
+                "post_staleness_filter",
+                activated,
+            )
 
         # VERBATIM-SURFACE A3: Observability logging
         _vf_surfaced = sum(1 for a in activated if a.verbatim_fragments)
@@ -11289,6 +12607,22 @@ class ConversationTurnMixin:
                 logger.debug(f"BENCH-014: Co-activation failed (non-fatal): {e}")
         _t_coactivation_ms = (time.perf_counter() - _t_coactivation_start) * 1000.0
 
+        _live_admission_probe_trace = getattr(
+            retrieval_engine,
+            "last_live_initial_admission_probe_trace",
+            None,
+        )
+        _semantic_recovery_trace = (
+            _live_admission_probe_trace.get("semantic_recovery")
+            if isinstance(_live_admission_probe_trace, dict)
+            else None
+        )
+        lexical_evidence_support = _build_context_support_summary(
+            lexical_trace=_lexical_evidence_support_trace,
+            semantic_recovery_trace=_semantic_recovery_trace,
+            activated_concepts=activated,
+        )
+
         # --- FIX 1: Coverage confidence + blind spot cross-reference (budget: <5ms) ---
         coverage_confidence = None
         blind_spot_match = None
@@ -11443,7 +12777,11 @@ class ConversationTurnMixin:
         # --- PRODUCT-003: Abstention signal (budget: <1ms) ---
         abstention_signal = None
         try:
-            abstention_signal = self._compute_abstention_signal(coverage_confidence, coverage_score)
+            abstention_signal = self._compute_abstention_signal(
+                coverage_confidence,
+                coverage_score,
+                lexical_support=lexical_evidence_support,
+            )
             if abstention_signal:
                 logger.info(
                     f"PRODUCT-003: Abstention recommended: level={abstention_signal['level']}, "
@@ -11458,6 +12796,163 @@ class ConversationTurnMixin:
                     pass  # Metrics are non-critical
         except Exception as e:
             logger.debug(f"PRODUCT-003: abstention_signal failed (non-fatal): {e}")
+
+        _abstention_fallback_trace = None
+        try:
+            _abstention_fallback_trace = self._maybe_run_abstention_fallback(
+                request=request,
+                raw_query=_raw_user_search_query,
+                retrieval_engine=retrieval_engine,
+                activated=activated,
+                always_on_ids=always_on_ids,
+                coverage_confidence=coverage_confidence,
+                coverage_score=coverage_score,
+                abstention_signal=abstention_signal,
+                query_intent_trace=_query_intent_trace_payload,
+                turn_deadline=_turn_deadline,
+            )
+            _fallback_admitted = _abstention_fallback_trace.pop("_admitted_concepts", [])
+            if _fallback_admitted:
+                activated.extend(_fallback_admitted)
+                activated_dicts = [
+                    {
+                        "concept_id": ac.concept_id,
+                        "summary": ac.summary,
+                        "relevance_score": ac.relevance_score,
+                        "knowledge_area": ac.knowledge_area,
+                    }
+                    for ac in activated
+                ]
+                coverage_confidence = self._compute_coverage_confidence(
+                    activated_dicts,
+                    request.message,
+                    allow_llm=False,
+                )
+                semantic_scores = [
+                    ac.relevance_score
+                    for ac in activated
+                    if ac.concept_id not in always_on_ids
+                    and ac.relevance_score is not None
+                    and ac.relevance_score > 0
+                ]
+                coverage_score = (
+                    round(sum(semantic_scores) / len(semantic_scores), 4)
+                    if semantic_scores
+                    else 0.0
+                )
+                abstention_signal = self._compute_abstention_signal(
+                    coverage_confidence,
+                    coverage_score,
+                )
+        except Exception as _abstention_fallback_error:
+            logger.debug(
+                "RETRIEVAL-130: abstention fallback failed (non-fatal): %s",
+                _abstention_fallback_error,
+            )
+            _abstention_fallback_trace = _abstention_fallback_error_trace(
+                _turn_deadline
+            )
+
+        _nonstrategy_recovery_trace = None
+        try:
+            if (
+                isinstance(_abstention_fallback_trace, dict)
+                and _abstention_fallback_trace.get("skipped_reason") == "query_not_strategy_lane"
+            ):
+                _nonstrategy_recovery_trace = self._maybe_run_nonstrategy_evidence_recovery(
+                    request=request,
+                    raw_query=_raw_user_search_query,
+                    retrieval_engine=retrieval_engine,
+                    activated=activated,
+                    always_on_ids=always_on_ids,
+                    coverage_confidence=coverage_confidence,
+                    coverage_score=coverage_score,
+                    abstention_signal=abstention_signal,
+                    query_intent_trace=_query_intent_trace_payload,
+                    lexical_support=lexical_evidence_support,
+                    turn_deadline=_turn_deadline,
+                )
+                _nonstrategy_admitted = _nonstrategy_recovery_trace.pop("_admitted_concepts", [])
+                if _nonstrategy_admitted:
+                    activated.extend(_nonstrategy_admitted)
+                    activated_dicts = [
+                        {
+                            "concept_id": ac.concept_id,
+                            "summary": ac.summary,
+                            "relevance_score": ac.relevance_score,
+                            "knowledge_area": ac.knowledge_area,
+                        }
+                        for ac in activated
+                    ]
+                    coverage_confidence = self._compute_coverage_confidence(
+                        activated_dicts,
+                        request.message,
+                        allow_llm=False,
+                    )
+                    semantic_scores = [
+                        ac.relevance_score
+                        for ac in activated
+                        if ac.concept_id not in always_on_ids
+                        and ac.relevance_score is not None
+                        and ac.relevance_score > 0
+                    ]
+                    coverage_score = (
+                        round(sum(semantic_scores) / len(semantic_scores), 4)
+                        if semantic_scores
+                        else 0.0
+                    )
+                    abstention_signal = self._compute_abstention_signal(
+                        coverage_confidence,
+                        coverage_score,
+                        lexical_support=lexical_evidence_support,
+                    )
+        except Exception as _nonstrategy_recovery_error:
+            logger.debug(
+                "RETRIEVAL-140: non-strategy evidence recovery failed (non-fatal): %s",
+                _nonstrategy_recovery_error,
+            )
+            _nonstrategy_recovery_trace = _nonstrategy_recovery_error_trace(
+                _turn_deadline
+            )
+
+        _nonstrategy_existing_support_trace = None
+        try:
+            _policy_question_classification = (
+                question_classification.get("classification")
+                if isinstance(question_classification, dict)
+                else None
+            )
+            (
+                _nonstrategy_existing_support_trace,
+                _nonstrategy_existing_support_summary,
+            ) = self._maybe_build_nonstrategy_existing_support(
+                request=request,
+                raw_query=_raw_user_search_query,
+                activated=activated,
+                always_on_ids=always_on_ids,
+                coverage_confidence=coverage_confidence,
+                coverage_score=coverage_score,
+                abstention_signal=abstention_signal,
+                query_intent_trace=_query_intent_trace_payload,
+                policy_question_classification=_policy_question_classification,
+                lexical_support=lexical_evidence_support,
+                turn_deadline=_turn_deadline,
+            )
+            if _nonstrategy_existing_support_summary:
+                lexical_evidence_support = _nonstrategy_existing_support_summary
+                abstention_signal = self._compute_abstention_signal(
+                    coverage_confidence,
+                    coverage_score,
+                    lexical_support=lexical_evidence_support,
+                )
+        except Exception as _nonstrategy_existing_support_error:
+            logger.debug(
+                "RETRIEVAL-141: non-strategy existing support failed (non-fatal): %s",
+                _nonstrategy_existing_support_error,
+            )
+            _nonstrategy_existing_support_trace = _nonstrategy_existing_support_error_trace(
+                _turn_deadline
+            )
 
         # --- FIX 3: Post-retrieval extraction request gaps (budget: <5ms) ---
         # Gap 7: Coverage-triggered extraction (depends on Fix 1 coverage_confidence)
@@ -12263,7 +13758,11 @@ class ConversationTurnMixin:
                     )
                 )
                 # Recombine: always-activate first, then regular
-                activated = always_activate + regular_activated
+                activated = _restore_supersession_chain_activated(
+                    always_activate + regular_activated,
+                    stage="first_call_budget",
+                    max_items=effective_max_concepts,
+                )
             except Exception as budget_err:
                 logger.warning(f"RC §5.5: Budget enforcement failed (non-fatal): {budget_err}")
 
@@ -12306,7 +13805,11 @@ class ConversationTurnMixin:
                                 "estimated_tokens": total_concept_tokens,
                             },
                         )
-                    activated = trimmed_activated
+                    activated = _restore_supersession_chain_activated(
+                        trimmed_activated,
+                        stage="response_budget_governor",
+                        max_items=len(trimmed_activated),
+                    )
             except Exception as perf024_err:
                 logger.warning(f"PERF-024: Budget governor failed (non-fatal): {perf024_err}")
 
@@ -12410,7 +13913,11 @@ class ConversationTurnMixin:
                         "RETRIEVAL-CHAIN-GATE-001: Chain prune skipped (non-multihop query)"
                     )
 
-                activated = activated_filtered
+                activated = _restore_supersession_chain_activated(
+                    activated_filtered,
+                    stage="conflict_prefilter",
+                    max_items=len(activated_filtered),
+                )
             except Exception as e:
                 logger.warning(f"RETRIEVAL-037b: Conflict pre-filter failed (non-fatal): {e}")
 
@@ -12447,7 +13954,12 @@ class ConversationTurnMixin:
                         return False
                 return True
 
-            activated = [ac for ac in activated if _keep_concept(ac)]
+            _noise_filtered = [ac for ac in activated if _keep_concept(ac)]
+            activated = _restore_supersession_chain_activated(
+                _noise_filtered,
+                stage="noise_reduction",
+                max_items=len(_noise_filtered),
+            )
             _post_noise = len(activated)
             if _pre_noise != _post_noise:
                 logger.info(
@@ -12684,7 +14196,22 @@ class ConversationTurnMixin:
                         _rel,
                     )
 
-                activated = sorted(activated, key=_hc_sort_key, reverse=True)[:effective_max_concepts]
+                _pre_hc_activated = list(activated) if _budget_decision_trace is not None else []
+                activated = _restore_supersession_chain_activated(
+                    sorted(activated, key=_hc_sort_key, reverse=True)[:effective_max_concepts],
+                    stage="activated_hard_cap",
+                    max_items=effective_max_concepts,
+                )
+                if _budget_decision_trace is not None:
+                    _budget_decision_trace["hard_cap"] = _bench_budget_hard_cap_trace(
+                        scope=_hc_scope,
+                        pre_count=_pre_hc,
+                        post_concepts=activated,
+                        pre_concepts=_pre_hc_activated,
+                        effective_max_concepts=effective_max_concepts,
+                        keyword_count=len(_hc_kw),
+                        max_ids=_bench_budget_trace_max_ids(),
+                    )
                 logger.info(
                     f"BENCH-034: {_hc_scope} hard cap applied: "
                     f"{_pre_hc} → {len(activated)} concepts "
@@ -13445,6 +14972,57 @@ class ConversationTurnMixin:
             origin_id=getattr(request, "origin_id", None),
             shadow_run_id=_source_set_answer_shadow_run_id(),
         )
+        _context_freshness = {"conflicts": None, "decision": None}
+        try:
+            from app.core.config import get_feature_flag
+
+            if get_feature_flag("AUTOMATIC_FRESHNESS_SUPERSESSION_UX_ENABLED", True):
+                from app.session.context_freshness import apply_context_freshness_trust
+
+                def _load_freshness_replacement(replacement_id: str) -> ActivatedConcept | None:
+                    concept = load_concept(replacement_id, track_access=False)
+                    if not concept:
+                        return None
+                    return ActivatedConcept(
+                        concept_id=concept.id,
+                        summary=concept.summary,
+                        confidence=concept.confidence,
+                        relevance_score=0.0,
+                        knowledge_area=getattr(concept, "knowledge_area", None) or "general",
+                        key_evidence=[str(e) for e in getattr(concept, "evidence", [])[:2]],
+                        associations=list(getattr(concept, "associations", []) or [])[:10],
+                        shadow_expanded=False,
+                        superseded_by=getattr(concept, "superseded_by", None),
+                        currency_status=getattr(concept, "currency_status", "ACTIVE"),
+                        staleness_state=getattr(concept, "staleness_state", None),
+                        ka_relative_authority=getattr(concept, "ka_relative_authority", None),
+                        created_at=getattr(concept, "created_at", None),
+                        valid_from=getattr(concept, "valid_from", None),
+                        content_updated_at=getattr(concept, "content_updated_at", None),
+                        session_id=getattr(concept, "session_id", None),
+                        original_date=getattr(concept, "original_date", None),
+                    )
+
+                _context_freshness = apply_context_freshness_trust(
+                    activated,
+                    load_replacement_concept_fn=_load_freshness_replacement,
+                    include_deprecated=getattr(request, "include_deprecated", False),
+                    suppress_confirmed_superseded=True,
+                    query_text=request.message or search_query,
+                    admit_missing_replacement_heads=True,
+                    max_replacement_loads=5,
+                    required_context_ids={ao["concept_id"] for ao in always_on_injected},
+                )
+                activated = _context_freshness.get("activated_concepts", activated)
+        except Exception as exc:
+            logger.warning("CONTEXT-FRESHNESS failed: %s", exc)
+            try:
+                from app.ops.metrics import metrics as _freshness_metrics
+
+                _freshness_metrics.record("context_freshness.failure_count", 1.0)
+            except Exception:
+                pass
+
         if _canary_retrieval_trace is not None:
             _canary_retrieval_trace["turn_admission"]["final_activated_ids"] = [
                 ac.concept_id for ac in activated
@@ -13523,6 +15101,9 @@ class ConversationTurnMixin:
                 )
                 _terminal_conflict_trace_payload = None
 
+        if _budget_decision_trace is not None:
+            _budget_decision_trace["final_effective_max_concepts"] = effective_max_concepts
+
         if _decision_shadow_result and (
             _decision_shadow_result.trace.added_ids
             or _decision_shadow_result.trace.stop_reason in CAP_STOP_REASONS
@@ -13555,6 +15136,12 @@ class ConversationTurnMixin:
         try:
             from app.retrieval.policy_trace import build_retrieval_policy_trace
 
+            if _candidate_flow_trace_requested:
+                _trace_activated_candidate_stage(
+                    _base_retrieval_trace,
+                    "final_activated_concepts",
+                    activated,
+                )
             _retrieval_policy_trace_payload = build_retrieval_policy_trace(
                 adaptive_config=_adaptive_config,
                 answer_path_admission=_answer_path_admission,
@@ -13567,15 +15154,143 @@ class ConversationTurnMixin:
                 requested_max_concepts=request.max_concepts,
                 effective_max_concepts=effective_max_concepts,
                 activated_concepts=activated,
+                candidate_stages=(
+                    _base_retrieval_trace.get("stages")
+                    if _candidate_flow_trace_requested and isinstance(_base_retrieval_trace, dict)
+                    else None
+                ),
             )
             if _query_intent_trace_exposed and _query_intent_trace_payload:
                 _retrieval_policy_trace_payload["query_intent_trace"] = _query_intent_trace_payload
+            if _abstention_fallback_trace is not None:
+                _retrieval_policy_trace_payload["fallback_before_abstention"] = _abstention_fallback_trace
+            if _nonstrategy_recovery_trace is not None:
+                _retrieval_policy_trace_payload["nonstrategy_evidence_recovery"] = _nonstrategy_recovery_trace
+                admission_trace = _retrieval_policy_trace_payload.setdefault("admission", {})
+                if isinstance(admission_trace, dict):
+                    admission_trace["nonstrategy_recovery_applied"] = bool(
+                        _nonstrategy_recovery_trace.get("admitted_ids")
+                        and _nonstrategy_recovery_trace.get("mode") == "behavior"
+                    )
+            if _nonstrategy_existing_support_trace is not None:
+                _retrieval_policy_trace_payload["nonstrategy_existing_support"] = (
+                    _nonstrategy_existing_support_trace
+                )
+                admission_trace = _retrieval_policy_trace_payload.setdefault("admission", {})
+                if isinstance(admission_trace, dict):
+                    admission_trace["nonstrategy_existing_support_applied"] = bool(
+                        _nonstrategy_existing_support_trace.get("supported_ids")
+                        and _nonstrategy_existing_support_trace.get("mode") == "behavior"
+                    )
+            if (
+                _supersession_chain_rescue_trace is not None
+                and isinstance(_retrieval_policy_trace_payload, dict)
+            ):
+                _supersession_chain_rescue_trace["restored_stages"] = _supersession_chain_restored_stages[:8]
+                _supersession_chain_rescue_trace["final_activated"] = any(
+                    concept.concept_id in _supersession_chain_protected_results
+                    for concept in activated
+                )
+                _retrieval_policy_trace_payload["supersession_chain_rescue"] = _supersession_chain_rescue_trace
+            if lexical_evidence_support is not None and isinstance(_retrieval_policy_trace_payload, dict):
+                _retrieval_policy_trace_payload["lexical_evidence_support"] = lexical_evidence_support
+                admission_trace = _retrieval_policy_trace_payload.setdefault("admission", {})
+                if isinstance(admission_trace, dict):
+                    admission_trace["lexical_support_applied"] = bool(
+                        lexical_evidence_support.get("applied")
+                    )
+                    admission_trace["support_trace_authority"] = str(
+                        lexical_evidence_support.get("trace_authority") or ""
+                    )[:80]
+                    admission_trace["support_scope_applied"] = bool(
+                        lexical_evidence_support.get("runtime_eligible")
+                        and lexical_evidence_support.get("support_ids")
+                    )
+            if _candidate_flow_trace_requested and isinstance(_retrieval_policy_trace_payload, dict):
+                try:
+                    _semantic_warm_readiness = retrieval_engine.semantic_warm_readiness_snapshot()
+                except Exception:
+                    _semantic_warm_readiness = None
+                if isinstance(_semantic_warm_readiness, dict):
+                    _retrieval_policy_trace_payload["semantic_warm_readiness"] = (
+                        _semantic_warm_readiness
+                    )
+                _live_admission_probe_trace = getattr(
+                    retrieval_engine,
+                    "last_live_initial_admission_probe_trace",
+                    None,
+                )
+                if _live_admission_probe_trace is not None:
+                    _retrieval_policy_trace_payload["live_initial_admission_probe"] = (
+                        _live_admission_probe_trace
+                    )
         except Exception as _rpt_e:
             logger.warning(
                 "RETRIEVAL-POLICY-TRACE: failed (non-fatal): %s",
                 _rpt_e,
             )
             _retrieval_policy_trace_payload = None
+
+        _current_state_arbitration = {"conflicts": [], "decision": None}
+        try:
+            from app.core.config import get_feature_flag
+
+            if get_feature_flag("CURRENT_STATE_ARBITRATION_ENABLED", True):
+                from app.session.current_state_arbitration import arbitrate_current_state
+
+                _current_state_arbitration = arbitrate_current_state(
+                    message=request.message or search_query,
+                    activated_concepts=activated,
+                    resume_context=resume_context,
+                    working_context=working_context,
+                    active_workstream=active_workstream,
+                    workstream_activation=workstream_activation,
+                    current_state_evidence=request.current_state_evidence,
+                )
+        except Exception as exc:
+            logger.warning("CURRENT_STATE_ARBITRATION failed: %s", exc)
+            try:
+                from app.ops.metrics import metrics as _csa_metrics
+
+                _csa_metrics.record("current_state_arbitration.failure_count", 1.0)
+            except Exception:
+                pass
+
+        _context_resolution_summary = None
+        try:
+            from app.core.config import get_feature_flag
+
+            if get_feature_flag("CONTEXT_RESOLUTION_SUMMARY_ENABLED", True):
+                from app.session.context_resolution_summary import build_context_resolution_summary
+
+                _context_resolution_summary = build_context_resolution_summary(
+                    activated_concepts=activated,
+                    context_freshness_decision=_context_freshness.get("decision"),
+                    context_freshness_conflicts=_context_freshness.get("conflicts"),
+                    context_trust_decision=_current_state_arbitration.get("decision"),
+                    context_trust_conflicts=_current_state_arbitration.get("conflicts") or None,
+                    abstention_signal=abstention_signal,
+                    coverage_score=coverage_score,
+                    coverage_confidence=coverage_confidence,
+                    lexical_support=lexical_evidence_support,
+                )
+        except Exception as exc:
+            logger.warning("CONTEXT-RESOLUTION-SUMMARY failed: %s", exc)
+            _context_resolution_summary = None
+
+        try:
+            from app.session.context_trust_outcome import classify_context_trust_outcome
+
+            _context_trust_outcome = classify_context_trust_outcome(
+                context_resolution_summary=_context_resolution_summary,
+                retrieval_policy_trace=_retrieval_policy_trace_payload,
+            )
+            if isinstance(_context_resolution_summary, dict):
+                _context_resolution_summary["context_trust_outcome"] = _context_trust_outcome
+            if isinstance(_retrieval_policy_trace_payload, dict):
+                _retrieval_policy_trace_payload["context_trust_outcome"] = _context_trust_outcome
+        except Exception as exc:
+            logger.warning("CONTEXT-TRUST-OUTCOME failed: %s", exc)
 
         response = ConversationTurnResponse(
             activated_concepts=activated,
@@ -13599,6 +15314,7 @@ class ConversationTurnMixin:
             governance_summary=governance_summary,
             source_set_trace=_source_set_trace_payload,
             canary_retrieval_trace=_canary_retrieval_trace,
+            budget_decision_trace=_budget_decision_trace,
             retrieval_policy_trace=_retrieval_policy_trace_payload,
             latency_components_ms=_latency_components_payload,
             locomo_candidate_boundary_trace=_locomo_candidate_boundary_trace,
@@ -13669,6 +15385,11 @@ class ConversationTurnMixin:
             working_context=working_context,
             active_workstream=active_workstream,
             workstream_activation=workstream_activation,
+            context_trust_conflicts=_current_state_arbitration.get("conflicts") or None,
+            context_trust_decision=_current_state_arbitration.get("decision"),
+            context_freshness_conflicts=_context_freshness.get("conflicts"),
+            context_freshness_decision=_context_freshness.get("decision"),
+            context_resolution_summary=_context_resolution_summary,
             turn_ingestion_warning=_turn_ingestion_warning,
             # RETRIEVAL-037d: Chain hint from multihop decomposition
             chain_hint=self._build_chain_hint(_multihop_used, _multihop_clauses, _per_hop_concepts),
@@ -14387,6 +16108,544 @@ class ConversationTurnMixin:
             return None
 
     # --- FIX 1a: Coverage confidence metric ---
+    def _maybe_run_abstention_fallback(
+        self,
+        *,
+        request: ConversationTurnRequest,
+        raw_query: str,
+        retrieval_engine: Any,
+        activated: list[ActivatedConcept],
+        always_on_ids: set[str],
+        coverage_confidence: dict | None,
+        coverage_score: float | None,
+        abstention_signal: dict | None,
+        query_intent_trace: dict | None,
+        turn_deadline: Any,
+    ) -> dict[str, Any]:
+        del coverage_score  # Triggering is based on the hard abstention signal, not score tuning.
+        trace: dict[str, Any] = {
+            "schema_version": "retrieval_abstention_fallback.v1",
+            "attempted": False,
+            "triggered": False,
+            "trigger_reason": None,
+            "source": "same_profile_search",
+            "query_hash": None,
+            "candidate_count": 0,
+            "top_score": None,
+            "admitted_ids": [],
+            "rejected": [],
+            "skipped_reason": None,
+            "latency_ms": None,
+            "deadline_remaining_ms": _abstention_fallback_deadline_remaining_ms(
+                turn_deadline
+            ),
+        }
+
+        enabled = _abstention_fallback_env_bool("PITH_ABSTENTION_FALLBACK_ENABLED", True)
+        threshold = _abstention_fallback_env_float(
+            "PITH_ABSTENTION_FALLBACK_MIN_SCORE",
+            0.55,
+            0.0,
+            1.0,
+        )
+        if not enabled:
+            trace["skipped_reason"] = "feature_disabled"
+            return trace
+        if not _abstention_fallback_is_hard(coverage_confidence, abstention_signal):
+            trace["skipped_reason"] = "not_hard_abstention"
+            return trace
+
+        trace["triggered"] = True
+        trace["trigger_reason"] = (
+            abstention_signal.get("reason") if isinstance(abstention_signal, dict) else None
+        )
+        if not _abstention_fallback_query_is_strategy_lane(raw_query or "", query_intent_trace):
+            trace["skipped_reason"] = "query_not_strategy_lane"
+            return trace
+        if _abstention_fallback_has_existing_strong_activation(
+            activated,
+            always_on_ids,
+            threshold,
+        ):
+            trace["skipped_reason"] = "already_has_strong_candidate"
+            return trace
+
+        min_remaining_ms = _abstention_fallback_env_float(
+            "PITH_TURN_DEADLINE_MIN_ABSTENTION_FALLBACK_MS",
+            500.0,
+            0.0,
+            5000.0,
+        )
+        if hasattr(turn_deadline, "can_start") and not turn_deadline.can_start(
+            "retrieval.abstention_fallback",
+            min_remaining_ms=min_remaining_ms,
+        ):
+            if hasattr(turn_deadline, "skip"):
+                turn_deadline.skip(
+                    "retrieval.abstention_fallback",
+                    "deadline_before_start",
+                    priority="required_degraded",
+                    min_remaining_ms=min_remaining_ms,
+                )
+            trace["skipped_reason"] = "deadline_before_start"
+            trace["deadline_remaining_ms"] = _abstention_fallback_deadline_remaining_ms(
+                turn_deadline
+            )
+            return trace
+
+        max_results = _abstention_fallback_env_int(
+            "PITH_ABSTENTION_FALLBACK_MAX_RESULTS",
+            8,
+            1,
+            20,
+        )
+        admit_limit = _abstention_fallback_env_int(
+            "PITH_ABSTENTION_FALLBACK_ADMIT_LIMIT",
+            3,
+            1,
+            8,
+        )
+
+        started = time.perf_counter()
+        trace["attempted"] = True
+        trace["query_hash"] = hashlib.sha256((raw_query or "").encode("utf-8")).hexdigest()[:16]
+        results = retrieval_engine.search(
+            SearchQuery(query=raw_query or "", max_results=max_results, min_confidence=0.0),
+            agent_id=(
+                getattr(request, "agent_id", "default")
+                if getattr(request, "agent_id", "default") != "default"
+                else None
+            ),
+            scope=getattr(request, "scope", "global"),
+        )
+        trace["latency_ms"] = round((time.perf_counter() - started) * 1000.0, 2)
+        trace["candidate_count"] = len(results or [])
+        trace["top_score"] = (
+            round(max((result.relevance_score or 0.0) for result in results), 4)
+            if results
+            else None
+        )
+
+        concept_map = load_concepts_batch([result.concept_id for result in results or []])
+        existing_ids = {concept.concept_id for concept in activated or []}
+        admitted: list[ActivatedConcept] = []
+        for result in results or []:
+            loaded = concept_map.get(result.concept_id)
+            reason = _abstention_fallback_rejection_reason(
+                result,
+                query=raw_query or "",
+                existing_ids=existing_ids,
+                request=request,
+                threshold=threshold,
+                loaded_concept=loaded,
+            )
+            if reason is not None:
+                trace["rejected"].append(
+                    {
+                        "id": result.concept_id,
+                        "score": (
+                            round(result.relevance_score, 4)
+                            if result.relevance_score is not None
+                            else None
+                        ),
+                        "reason": reason,
+                    }
+                )
+                continue
+            admitted_concept = _abstention_fallback_activation_from_result(result, loaded)
+            admitted.append(admitted_concept)
+            existing_ids.add(result.concept_id)
+            trace["admitted_ids"].append(result.concept_id)
+            if len(admitted) >= admit_limit:
+                break
+
+        trace["_admitted_concepts"] = admitted
+        return trace
+
+    def _maybe_run_nonstrategy_evidence_recovery(
+        self,
+        *,
+        request: ConversationTurnRequest,
+        raw_query: str,
+        retrieval_engine: Any,
+        activated: list[ActivatedConcept],
+        always_on_ids: set[str],
+        coverage_confidence: dict | None,
+        coverage_score: float | None,
+        abstention_signal: dict | None,
+        query_intent_trace: dict | None,
+        lexical_support: dict | None,
+        turn_deadline: Any,
+    ) -> dict[str, Any]:
+        del coverage_score  # Triggering is based on hard abstention, not score tuning.
+        try:
+            from app.core import config as _config
+
+            enabled = bool(getattr(_config, "NONSTRATEGY_EVIDENCE_RECOVERY_ENABLED", False))
+            observe_only = bool(getattr(_config, "NONSTRATEGY_EVIDENCE_RECOVERY_OBSERVE_ONLY", True))
+            max_results = int(getattr(_config, "NONSTRATEGY_EVIDENCE_RECOVERY_MAX_RESULTS", 5))
+            admit_limit = int(getattr(_config, "NONSTRATEGY_EVIDENCE_RECOVERY_ADMIT_LIMIT", 1))
+            threshold = float(getattr(_config, "NONSTRATEGY_EVIDENCE_RECOVERY_MIN_SCORE", 0.55))
+            min_overlap_ratio = float(
+                getattr(_config, "NONSTRATEGY_EVIDENCE_RECOVERY_MIN_OVERLAP_RATIO", 0.45)
+            )
+            min_remaining_ms = float(
+                getattr(_config, "NONSTRATEGY_EVIDENCE_RECOVERY_MIN_REMAINING_MS", 750.0)
+            )
+        except Exception:
+            enabled = False
+            observe_only = True
+            max_results = 5
+            admit_limit = 1
+            threshold = 0.55
+            min_overlap_ratio = 0.45
+            min_remaining_ms = 750.0
+
+        trace = _nonstrategy_recovery_base_trace(
+            turn_deadline,
+            observe_only=observe_only,
+        )
+        if not enabled:
+            trace["skipped_reason"] = "feature_disabled"
+            return trace
+        if not _abstention_fallback_is_hard(coverage_confidence, abstention_signal):
+            trace["skipped_reason"] = "not_hard_abstention"
+            return trace
+        if _lexical_evidence_support_applies(lexical_support):
+            trace["skipped_reason"] = "existing_exact_lexical_support"
+            return trace
+        if not _nonstrategy_recovery_supported_query(raw_query or "", query_intent_trace):
+            trace["skipped_reason"] = "unsupported_query_class"
+            return trace
+
+        trace["triggered"] = True
+        trace["trigger_reason"] = (
+            abstention_signal.get("reason") if isinstance(abstention_signal, dict) else None
+        )
+
+        if hasattr(turn_deadline, "can_start") and not turn_deadline.can_start(
+            "retrieval.nonstrategy_evidence_recovery",
+            min_remaining_ms=min_remaining_ms,
+        ):
+            if hasattr(turn_deadline, "skip"):
+                turn_deadline.skip(
+                    "retrieval.nonstrategy_evidence_recovery",
+                    "deadline_before_start",
+                    priority="required_degraded",
+                    min_remaining_ms=min_remaining_ms,
+                )
+            trace["skipped_reason"] = "deadline_before_start"
+            trace["deadline_remaining_ms"] = _abstention_fallback_deadline_remaining_ms(
+                turn_deadline
+            )
+            return trace
+
+        started = time.perf_counter()
+        trace["attempted"] = True
+        trace["query_hash"] = hashlib.sha256((raw_query or "").encode("utf-8")).hexdigest()[:16]
+        results = retrieval_engine.search(
+            SearchQuery(query=raw_query or "", max_results=max_results, min_confidence=0.0),
+            agent_id=(
+                getattr(request, "agent_id", "default")
+                if getattr(request, "agent_id", "default") != "default"
+                else None
+            ),
+            scope=getattr(request, "scope", "global"),
+        )
+        trace["latency_ms"] = round((time.perf_counter() - started) * 1000.0, 2)
+        trace["candidate_count"] = len(results or [])
+        trace["top_score"] = (
+            round(max((result.relevance_score or 0.0) for result in results), 4)
+            if results
+            else None
+        )
+
+        concept_map = load_concepts_batch([result.concept_id for result in results or []])
+        existing_ids = {concept.concept_id for concept in activated or []}
+        admitted: list[ActivatedConcept] = []
+        for result in results or []:
+            loaded = concept_map.get(result.concept_id)
+            reason, overlap_ratio = _nonstrategy_recovery_rejection_reason(
+                result,
+                query=raw_query or "",
+                existing_ids=existing_ids,
+                request=request,
+                threshold=threshold,
+                min_overlap_ratio=min_overlap_ratio,
+                loaded_concept=loaded,
+            )
+            if reason is not None:
+                trace["rejected"].append(
+                    {
+                        "id": result.concept_id,
+                        "score": (
+                            round(result.relevance_score, 4)
+                            if result.relevance_score is not None
+                            else None
+                        ),
+                        "reason": reason,
+                        "overlap_ratio": round(overlap_ratio, 4),
+                    }
+                )
+                continue
+
+            if (getattr(loaded, "currency_status", None) or "ACTIVE") == "CONTESTED":
+                trace["contested_ids"].append(result.concept_id)
+
+            admitted_concept = _abstention_fallback_activation_from_result(result, loaded)
+            trace["would_admit_ids"].append(result.concept_id)
+            if not observe_only:
+                admitted.append(admitted_concept)
+                trace["admitted_ids"].append(result.concept_id)
+                existing_ids.add(result.concept_id)
+            if len(trace["would_admit_ids"]) >= admit_limit:
+                break
+
+        if not trace["would_admit_ids"]:
+            trace["skipped_reason"] = "no_safe_candidate"
+        if admitted:
+            trace["_admitted_concepts"] = admitted
+        return trace
+
+    def _maybe_build_nonstrategy_existing_support(
+        self,
+        *,
+        request: ConversationTurnRequest,
+        raw_query: str,
+        activated: list[ActivatedConcept],
+        always_on_ids: set[str],
+        coverage_confidence: dict | None,
+        coverage_score: float | None,
+        abstention_signal: dict | None,
+        query_intent_trace: dict | None,
+        policy_question_classification: str | None,
+        lexical_support: dict | None,
+        turn_deadline: Any,
+    ) -> tuple[dict[str, Any], dict | None]:
+        del coverage_score  # Triggering is based on hard abstention, not score tuning.
+        try:
+            from app.core import config as _config
+
+            enabled = bool(getattr(_config, "NONSTRATEGY_EXISTING_SUPPORT_ENABLED", False))
+            observe_only = bool(getattr(_config, "NONSTRATEGY_EXISTING_SUPPORT_OBSERVE_ONLY", True))
+            min_overlap_ratio = float(
+                getattr(_config, "NONSTRATEGY_EXISTING_SUPPORT_MIN_OVERLAP_RATIO", 0.75)
+            )
+            min_remaining_ms = float(
+                getattr(_config, "NONSTRATEGY_EXISTING_SUPPORT_MIN_REMAINING_MS", 250.0)
+            )
+            concept_allowlist_raw = getattr(
+                _config, "NONSTRATEGY_EXISTING_SUPPORT_CONCEPT_ALLOWLIST", None
+            )
+            origin_allowlist_raw = getattr(
+                _config, "NONSTRATEGY_EXISTING_SUPPORT_ORIGIN_ALLOWLIST", None
+            )
+            require_allowlist = bool(
+                getattr(_config, "NONSTRATEGY_EXISTING_SUPPORT_REQUIRE_ALLOWLIST", False)
+            )
+        except Exception:
+            enabled = False
+            observe_only = True
+            min_overlap_ratio = 0.75
+            min_remaining_ms = 250.0
+            concept_allowlist_raw = None
+            origin_allowlist_raw = None
+            require_allowlist = True
+
+        trace = _nonstrategy_existing_support_base_trace(
+            turn_deadline,
+            observe_only=observe_only,
+        )
+        if not enabled:
+            trace["skipped_reason"] = "feature_disabled"
+            return trace, None
+        hard_abstention_trigger = _abstention_fallback_is_hard(
+            coverage_confidence,
+            abstention_signal,
+        )
+        degraded_context_trigger = _nonstrategy_existing_support_degraded_context_trigger(
+            activated,
+        )
+        if not hard_abstention_trigger and not degraded_context_trigger:
+            trace["skipped_reason"] = "not_hard_abstention_or_degraded_context"
+            return trace, None
+        if _lexical_evidence_support_applies(lexical_support):
+            trace["skipped_reason"] = "existing_exact_lexical_support"
+            return trace, None
+        if _abstention_fallback_query_is_strategy_lane(raw_query or "", query_intent_trace):
+            trace["skipped_reason"] = "unsupported_query_class"
+            return trace, None
+        if hasattr(turn_deadline, "can_start") and not turn_deadline.can_start(
+            "retrieval.nonstrategy_existing_support",
+            min_remaining_ms=min_remaining_ms,
+        ):
+            if hasattr(turn_deadline, "skip"):
+                turn_deadline.skip(
+                    "retrieval.nonstrategy_existing_support",
+                    "deadline_before_start",
+                    priority="required_degraded",
+                    min_remaining_ms=min_remaining_ms,
+                )
+            trace["skipped_reason"] = "deadline_before_start"
+            trace["deadline_remaining_ms"] = _abstention_fallback_deadline_remaining_ms(
+                turn_deadline
+            )
+            return trace, None
+
+        supported_by_query_intent = _nonstrategy_recovery_supported_query(
+            raw_query or "",
+            query_intent_trace,
+        )
+        policy_question_class = str(policy_question_classification or "").lower()
+        supported_by_policy_class = (
+            policy_question_class in _NONSTRATEGY_RECOVERY_SUPPORTED_QUESTION_CLASSES
+        )
+
+        trace["attempted"] = True
+        trace["triggered"] = True
+        trace["trigger_reason"] = (
+            abstention_signal.get("reason") if isinstance(abstention_signal, dict) else None
+        ) or ("degraded_activated_context" if degraded_context_trigger else None)
+
+        supported_ids: list[str] = []
+        contested_ids: list[str] = []
+        top_basis: str | None = None
+        candidates = [
+            concept
+            for concept in activated or []
+            if getattr(concept, "concept_id", None)
+            and getattr(concept, "concept_id", None) not in always_on_ids
+            and (getattr(concept, "relevance_score", 0.0) or 0.0) > 0.0
+        ]
+        trace["candidate_count"] = len(candidates)
+
+        for concept in candidates:
+            concept_id = str(concept.concept_id)
+            summary = getattr(concept, "summary", "") or ""
+            basis, overlap_ratio = _nonstrategy_existing_support_basis(
+                raw_query or "",
+                summary,
+                min_overlap_ratio=min_overlap_ratio,
+            )
+            ka = str(getattr(concept, "knowledge_area", "") or "").lower()
+            current_state = (
+                _nonstrategy_existing_support_current_state(concept_id)
+                if basis is not None
+                else None
+            )
+            current_status = str(
+                (current_state or {}).get("status") or ""
+            ).lower()
+            current_is_current = int((current_state or {}).get("is_current") or 0)
+            current_currency_status = str(
+                (current_state or {}).get("currency_status") or "ACTIVE"
+            ).upper()
+            current_staleness_state = str(
+                (current_state or {}).get("staleness_state") or ""
+            ).upper()
+            current_superseded_by = (current_state or {}).get("superseded_by")
+            candidate_ka_support_allowed = (
+                basis == "exact_identifier_overlap"
+                or (
+                    basis == "high_required_term_overlap"
+                    and ka in _NONSTRATEGY_RECOVERY_SUPPORTED_KAS
+                )
+            )
+
+            reason = None
+            if basis is None:
+                reason = "support_overlap_below_floor"
+            elif current_state is None or current_status != "active" or current_is_current != 1:
+                reason = "current_state_unavailable_or_not_current"
+            elif (
+                current_currency_status in _ABSTENTION_FALLBACK_DEPRECATED_STATUSES
+                or current_superseded_by
+            ):
+                reason = "deprecated_or_superseded"
+            elif (
+                not supported_by_query_intent
+                and not supported_by_policy_class
+                and not candidate_ka_support_allowed
+            ):
+                reason = "unsupported_query_class"
+            elif ka and ka not in _NONSTRATEGY_RECOVERY_SUPPORTED_KAS and basis != "exact_identifier_overlap":
+                reason = "candidate_ka_mismatch"
+            else:
+                allowlist_trace, allowlist_reason = (
+                    _nonstrategy_existing_support_allowlist_trace(
+                        concept_id=concept_id,
+                        origin_id=getattr(request, "origin_id", None),
+                        concept_raw=concept_allowlist_raw,
+                        origin_raw=origin_allowlist_raw,
+                        observe_only=observe_only,
+                        require_allowlist=require_allowlist,
+                    )
+                )
+                trace["allowlist"] = allowlist_trace
+                unallowlisted_behavior = (
+                    not observe_only
+                    and not bool(allowlist_trace.get("any_configured"))
+                    and allowlist_reason is None
+                )
+                if (
+                    unallowlisted_behavior
+                    and (
+                        current_currency_status in {"CONTESTED", "CONTRADICTED"}
+                        or current_staleness_state in {"STALE", "AGING", "REVIEW"}
+                    )
+                ):
+                    reason = "support_candidate_degraded_unallowlisted"
+                elif allowlist_reason is not None:
+                    reason = allowlist_reason
+
+            if reason is not None:
+                trace["rejected"].append(
+                    {
+                        "id": concept_id,
+                        "score": round(concept.relevance_score, 4),
+                        "reason": reason,
+                        "overlap_ratio": round(overlap_ratio, 4),
+                    }
+                )
+                continue
+
+            trace["would_support_ids"].append(concept_id)
+            top_basis = top_basis or basis
+            trace["support_reason"] = (
+                "existing_high_overlap_supported_ka"
+                if basis == "high_required_term_overlap"
+                else "existing_activated_support_recognized"
+            )
+            if current_currency_status == "CONTESTED":
+                contested_ids.append(concept_id)
+                trace["contested_ids"].append(concept_id)
+            if not observe_only:
+                supported_ids.append(concept_id)
+                trace["supported_ids"].append(concept_id)
+            break
+
+        trace["support_basis"] = top_basis
+        if not trace["would_support_ids"]:
+            trace["skipped_reason"] = "no_existing_safe_support"
+            return trace, None
+        if observe_only:
+            return trace, None
+
+        return trace, {
+            "schema_version": "retrieval.lexical_evidence_support_summary.v1",
+            "present": True,
+            "applied": True,
+            "support_level": "activated_nonstrategy_support",
+            "trust_modifier": "caution" if contested_ids else "normal",
+            "support_ids": supported_ids,
+            "admitted_ids": [],
+            "contested_ids": contested_ids,
+            "reason": str(trace.get("support_reason") or "existing_activated_support_recognized"),
+            "path": "conversation_turn.activated_context",
+            "trace_authority": _NONSTRATEGY_EXISTING_SUPPORT_TRACE_AUTHORITY,
+            "runtime_eligible": True,
+        }
+
     def _compute_coverage_confidence(
         self,
         activated: list,
@@ -14620,6 +16879,7 @@ class ConversationTurnMixin:
     def _compute_abstention_signal(
         coverage_confidence: dict | None,
         coverage_score: float | None,
+        lexical_support: dict | None = None,
     ) -> dict | None:
         """Synthesize coverage signals into an explicit abstention recommendation.
 
@@ -14642,9 +16902,12 @@ class ConversationTurnMixin:
             return None  # Coverage adequate — no abstention
 
         level = coverage_confidence.get("level") if coverage_confidence else None
+        lexical_support_applies = _lexical_evidence_support_applies(lexical_support)
 
         # Hard abstain: nothing relevant found
         if level in ("no_results", "no_strong_match"):
+            if lexical_support_applies:
+                return None
             top_score = coverage_confidence.get("top_score", 0.0) if coverage_confidence else 0.0
             return {
                 "should_abstain": True,
@@ -14661,6 +16924,8 @@ class ConversationTurnMixin:
         # the "barely relevant" band that the 0.30 threshold missed.
         SOFT_ABSTAIN_SCORE_THRESHOLD = 0.40
         if level == "sparse_coverage" and coverage_score is not None and coverage_score < SOFT_ABSTAIN_SCORE_THRESHOLD:
+            if lexical_support_applies:
+                return None
             return {
                 "should_abstain": True,
                 "confidence": round(0.50 + (0.20 * (1.0 - coverage_score / SOFT_ABSTAIN_SCORE_THRESHOLD)), 4),
@@ -14677,6 +16942,8 @@ class ConversationTurnMixin:
         # fell through all checks without triggering abstention.
         ADEQUATE_BUT_WEAK_THRESHOLD = 0.40
         if coverage_confidence is None and coverage_score is not None and coverage_score < ADEQUATE_BUT_WEAK_THRESHOLD:
+            if lexical_support_applies:
+                return None
             return {
                 "should_abstain": True,
                 "confidence": round(0.45 + (0.20 * (1.0 - coverage_score / ADEQUATE_BUT_WEAK_THRESHOLD)), 4),
@@ -14686,6 +16953,8 @@ class ConversationTurnMixin:
 
         # Edge case: no coverage_confidence but very low score
         if coverage_score is not None and coverage_score < 0.15:
+            if lexical_support_applies:
+                return None
             return {
                 "should_abstain": True,
                 "confidence": 0.65,
