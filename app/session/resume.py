@@ -434,7 +434,17 @@ class ResumeMixin:
         """
         try:
             # Find prior session's snapshot
-            snapshot = load_resume_snapshot()
+            from app.session.binding import current_managed_episode_context
+
+            managed_context = current_managed_episode_context()
+            if managed_context is not None:
+                if managed_context.prior_session_id is None:
+                    return None, None, False
+                snapshot = load_resume_snapshot(
+                    prior_session_id=managed_context.prior_session_id,
+                )
+            else:
+                snapshot = load_resume_snapshot()
             if not snapshot:
                 return None, None, False
 

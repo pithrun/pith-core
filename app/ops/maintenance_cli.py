@@ -23,6 +23,15 @@ from pathlib import Path
 
 from app.core.file_lock import lock_file_exclusive, unlock_file
 
+
+def _configure_console_output() -> None:
+    """Avoid UnicodeEncodeError on Windows consoles that default to cp1252."""
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(errors="replace")
+
+
 # INFRA-003: Load .env for feature flag overrides (PITH_FF_* env vars).
 # python-dotenv is in requirements.txt. If missing, falls back to launchd env vars.
 try:
@@ -446,6 +455,7 @@ def cmd_uninstall(args):
 
 
 def main():
+    _configure_console_output()
     parser = argparse.ArgumentParser(description="Pith Maintenance — autonomous cognitive lifecycle")
     sub = parser.add_subparsers(dest="command")
 

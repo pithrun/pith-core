@@ -24,10 +24,13 @@ import asyncio
 import functools
 import json
 import logging
+import math
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from typing import TypedDict
 
 from app.core.constants import GOV_EVENT_CONTRADICTION_REVIEW
 from app.core.datetime_utils import _ensure_aware, _utc_now, _utc_now_iso
@@ -86,6 +89,29 @@ def _reflection_long_step_min_budget(phase_timeout_seconds: int | float) -> floa
 REFLECTION_TIMEOUT_SAFETY_MARGIN_SECONDS = _reflection_timeout_safety_margin(PHASE_TIMEOUT_SECONDS)
 REFLECTION_LONG_STEP_MIN_BUDGET_SECONDS = _reflection_long_step_min_budget(PHASE_TIMEOUT_SECONDS)
 ORPHANED_SUPERSESSION_SENTINEL = "__orphaned_supersession__"
+MAINTENANCE_OUTCOME_SCHEMA_VERSION = 1
+MAINTENANCE_OUTCOME_MAX_OPERATIONS = 64
+MAINTENANCE_OUTCOME_STATES = (
+    "healthy",
+    "warning",
+    "critical",
+    "skipped",
+    "deferred",
+    "never_run",
+)
+_MAINTENANCE_OUTCOME_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
+
+
+class MaintenanceOperationOutcome(TypedDict, total=False):
+    """Bounded operator-facing outcome for one configured maintenance operation."""
+
+    id: str
+    kind: str
+    phase_number: int
+    selected: bool
+    state: str
+    reason_code: str
+    elapsed_seconds: float
 
 
 @dataclass
@@ -99,8 +125,13 @@ class MaintenanceReport:
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     dry_run: bool = False
+    selected_phase_numbers: list[int] = field(default_factory=list)
+    operation_outcomes: dict[str, MaintenanceOperationOutcome] = field(default_factory=dict)
+    attributed_failure_count: int = 0
+    unattributed_failure_count: int = 0
 
     def to_dict(self) -> dict:
+        outcome_health = build_maintenance_outcome_health(self)
         return {
             "started_at": self.started_at,
             "completed_at": self.completed_at,
@@ -110,7 +141,8 @@ class MaintenanceReport:
             "errors": self.errors,
             "warnings": self.warnings,
             "dry_run": self.dry_run,
-            "success": len(self.errors) == 0,
+            "success": not self.errors and outcome_health["overall_state"] != "critical",
+            "outcome_health": outcome_health,
         }
 
     def _duration(self) -> float:
@@ -150,14 +182,14 @@ async def phase1_scheduled_tasks(conn=None, dry_run: bool = False) -> dict:
             degraded = get_degraded_tasks(conn)
             return {"dry_run": True, "tasks_due": degraded}
 
-    results = await task_runner.run_scheduled_tasks()
+    results = await task_runner.run_scheduled_tasks(complete_pass=True)
 
     # STABILITY-036: Per-task reporting — surface success/failure counts
     # so maintenance heartbeat and health endpoint show granular status.
     task_errors = []
     for task_type, result in results.items():
         status = result.get("status", "unknown")
-        if status in ("timeout", "failed", "cancelled"):
+        if status in ("timeout", "failed", "cancelled", "error", "already_running"):
             task_errors.append(f"{task_type}: {status} — {result.get('error', 'unknown')}")
     tasks_deferred = sum(1 for r in results.values() if r.get("status") == "deferred_budget")
 
@@ -286,9 +318,9 @@ async def phase2_4_auto_associate(conn, dry_run: bool = False) -> dict:
     from app.cognitive.association import auto_associate_batch
     from app.core.models import AutoAssociateBatchRequest
 
-    request = AutoAssociateBatchRequest(dry_run=dry_run)
+    request = AutoAssociateBatchRequest(selection_mode="unlinked", dry_run=dry_run)
     try:
-        result = auto_associate_batch(request)
+        result = auto_associate_batch(request, invocation_source="maintenance")
         return result.model_dump() if hasattr(result, "model_dump") else {"status": "completed"}
     except Exception as e:
         logger.error("Auto-association failed: %s", e, exc_info=True)
@@ -315,7 +347,7 @@ async def phase2_5_contradiction_sweep(conn, dry_run: bool = False) -> dict:
         resolve_type_ranked,
     )
 
-    t0 = time.time()
+    t0 = time.monotonic()
     BUDGET_SECONDS = 10.0
     PAIR_CAP = 50
 
@@ -340,11 +372,12 @@ async def phase2_5_contradiction_sweep(conn, dry_run: bool = False) -> dict:
     ka_groups = defaultdict(list)
     for r in rows:
         ka = r[6] or "general"
-        ka_groups[ka].append(r)
+        ka_groups[ka].append((r, set((r[1] or "").lower().split())))
 
     resolved = 0
     flagged_review = 0
     pairs_checked = 0
+    pairs_inspected = 0
     skipped_budget = False
 
     for ka, group in ka_groups.items():
@@ -356,17 +389,22 @@ async def phase2_5_contradiction_sweep(conn, dry_run: bool = False) -> dict:
                 if pairs_checked >= PAIR_CAP:
                     skipped_budget = True
                     break
-                if (time.time() - t0) > BUDGET_SECONDS:
+                if (time.monotonic() - t0) > BUDGET_SECONDS:
                     skipped_budget = True
                     break
 
-                a, b = group[i], group[j]
-                a_words = set((a[1] or "").lower().split())
-                b_words = set((b[1] or "").lower().split())
+                (a, a_words), (b, b_words) = group[i], group[j]
+                pairs_inspected += 1
                 if not a_words or not b_words:
                     continue
 
-                similarity = len(a_words & b_words) / len(a_words | b_words)
+                a_size, b_size = len(a_words), len(b_words)
+                # Jaccard cannot exceed smaller/larger set size. Preserve the
+                # exact predicate while avoiding impossible intersections.
+                if min(a_size, b_size) / max(a_size, b_size) < SUPERSESSION_SIMILARITY_THRESHOLD:
+                    continue
+                intersection = len(a_words & b_words)
+                similarity = intersection / (a_size + b_size - intersection)
                 if similarity < SUPERSESSION_SIMILARITY_THRESHOLD:
                     continue
 
@@ -442,10 +480,11 @@ async def phase2_5_contradiction_sweep(conn, dry_run: bool = False) -> dict:
     return {
         "eligible_concepts": len(rows),
         "pairs_checked": pairs_checked,
+        "pairs_inspected": pairs_inspected,
         "resolved": resolved,
         "flagged_for_review": flagged_review,
         "budget_exceeded": skipped_budget,
-        "elapsed_seconds": round(time.time() - t0, 2),
+        "elapsed_seconds": round(time.monotonic() - t0, 2),
     }
 
 
@@ -499,9 +538,7 @@ def _migrate_desynced_supersessions(conn) -> dict:
 
     for concept_id, confidence, superseded_by in rows:
         try:
-            superseder_ok = conn.execute(
-                "SELECT 1 FROM concepts WHERE id = ?", (superseded_by,)
-            ).fetchone()
+            superseder_ok = conn.execute("SELECT 1 FROM concepts WHERE id = ?", (superseded_by,)).fetchone()
             if not superseder_ok:
                 stats["skipped"] += 1
                 continue
@@ -659,7 +696,10 @@ async def _phase2_8_currency_actuator(conn, dry_run: bool = False) -> dict:
     if total > 0:
         logger.info(
             "CURRENCY-ACTUATOR summary: T1=%d T2=%d T3=%d (total=%d)",
-            stats["tier1"], stats["tier2"], stats["tier3"], total,
+            stats["tier1"],
+            stats["tier2"],
+            stats["tier3"],
+            total,
         )
     return stats
 
@@ -671,6 +711,7 @@ async def _phase2_9_pbc_reconcile(conn, dry_run: bool = False) -> dict:
     should be promoted to currency_status='CONTESTED' if not already CONTRADICTED/CONTESTED.
     """
     from app.governance.lifecycle_remediation import protects_lifecycle_remediated_current_head
+    from app.storage import apply_current_governance_currency_conn
 
     rows = conn.execute(
         """SELECT DISTINCT c.id, c.status, c.is_current, c.superseded_by,
@@ -679,29 +720,47 @@ async def _phase2_9_pbc_reconcile(conn, dry_run: bool = False) -> dict:
            JOIN concepts c ON c.id = g.concept_id
            WHERE g.details LIKE '%PRESENT_BOTH_CONTESTED%'"""
     ).fetchall()
-    protected_ids = [r["id"] for r in rows if protects_lifecycle_remediated_current_head(r)]
+    eligible_rows = [
+        row
+        for row in rows
+        if row["status"] == "active"
+        and int(row["is_current"] or 0) == 1
+        and not str(row["superseded_by"] or "").strip()
+    ]
+    ineligible = len(rows) - len(eligible_rows)
+    protected_ids = [r["id"] for r in eligible_rows if protects_lifecycle_remediated_current_head(r)]
     ids = [
         r["id"]
-        for r in rows
-        if r["id"] not in protected_ids
-        and r["currency_status"] not in {"CONTRADICTED", "CONTESTED"}
+        for r in eligible_rows
+        if r["id"] not in protected_ids and r["currency_status"] not in {"CONTRADICTED", "CONTESTED"}
     ]
     if ids and not dry_run:
-        conn.execute(
-            f"""UPDATE concepts SET currency_status='CONTESTED'
-                WHERE id IN ({','.join('?' * len(ids))})""",
-            ids,
+        updated = sum(
+            apply_current_governance_currency_conn(
+                conn,
+                concept_id,
+                "CONTESTED",
+                excluded_current_statuses=("CONTESTED", "CONTRADICTED"),
+            )
+            for concept_id in ids
         )
-        updated = conn.execute("SELECT changes()").fetchone()[0]
     else:
         updated = len(ids) if dry_run else 0
+    ineligible_or_raced = ineligible + (0 if dry_run else len(ids) - updated)
     logger.info(
-        "MAINT-004 PBC reconcile: %d concepts → CONTESTED, %d protected current heads (dry_run=%s)",
+        "MAINT-004 PBC reconcile: %d concepts → CONTESTED, %d protected current heads, "
+        "%d ineligible or raced (dry_run=%s)",
         updated,
         len(protected_ids),
+        ineligible_or_raced,
         dry_run,
     )
-    return {"pbc_reconciled": updated, "pbc_current_head_protected": len(protected_ids), "status": "ok"}
+    return {
+        "pbc_reconciled": updated,
+        "pbc_current_head_protected": len(protected_ids),
+        "pbc_ineligible_or_raced": ineligible_or_raced,
+        "status": "ok",
+    }
 
 
 async def _phase2_10_ghost_superseder_cleanup(conn, dry_run: bool = False) -> dict:
@@ -732,9 +791,7 @@ async def _phase2_10_ghost_superseder_cleanup(conn, dry_run: bool = False) -> di
         fixed = conn.execute("SELECT changes()").fetchone()[0]
     elif ghost_count and dry_run:
         fixed = ghost_count
-    logger.info(
-        "DATA-063 ghost-superseder cleanup: %d concepts fixed (dry_run=%s)", fixed, dry_run
-    )
+    logger.info("DATA-063 ghost-superseder cleanup: %d concepts fixed (dry_run=%s)", fixed, dry_run)
     return {"ghost_superseders_fixed": fixed, "status": "ok"}
 
 
@@ -763,11 +820,9 @@ async def phase3_experiments(conn=None, dry_run: bool = False) -> dict:
     # making the outer timeout ineffective. concepts_only=dry_run preserves the
     # pre-fix dry_run behavior (fast path: load concepts only, skip assocs/TFIDFCache).
     loop = asyncio.get_running_loop()
-    concepts, associations, assoc_counts, salience_ranks, tfidf_cache = (
-        await loop.run_in_executor(
-            None,
-            functools.partial(_load_experiment_corpus, concepts_only=dry_run),
-        )
+    concepts, associations, assoc_counts, salience_ranks, tfidf_cache = await loop.run_in_executor(
+        None,
+        functools.partial(_load_experiment_corpus, concepts_only=dry_run),
     )
 
     if dry_run:
@@ -1016,11 +1071,12 @@ async def phase3_5_evaluate_experiments(conn=None, dry_run: bool = False) -> dic
                     # [EXP-018-A] Auth circuit breaker: disable LLM for remaining experiments
                     try:
                         from app.features.experiment_llm import is_llm_auth_failed
+
                         if is_llm_auth_failed():
                             logger.error(
-                                "EXP-018: Auth failure confirmed — disabling LLM for remaining "
-                                "%d experiments this run",
-                                len(stuck) - (llm_resolved + auto_completed + not_meaningful + marked_insufficient + errors + 1),
+                                "EXP-018: Auth failure confirmed — disabling LLM for remaining %d experiments this run",
+                                len(stuck)
+                                - (llm_resolved + auto_completed + not_meaningful + marked_insufficient + errors + 1),
                             )
                             llm_available = False
                     except ImportError:
@@ -1076,6 +1132,25 @@ async def phase3_5_evaluate_experiments(conn=None, dry_run: bool = False) -> dic
 # =============================================================================
 
 
+def _maintenance_index_integrity(engine, *, dry_run: bool) -> dict:
+    """Reconcile derived index drift, then independently check the actual result."""
+    before = engine.verify_index_integrity()
+    if dry_run or before.get("is_healthy") is True:
+        return before
+    repair = engine.repair_index_drift(integrity=before)
+    after = engine.verify_index_integrity()
+    return {
+        **after,
+        "repair": {
+            "initial_ghosts": before.get("ghosts"),
+            "initial_orphans": before.get("orphans"),
+            "ghosts_removed": repair.get("ghosts_removed", 0),
+            "orphans_added": repair.get("orphans_added", 0),
+            "status": repair.get("status"),
+        },
+    }
+
+
 async def phase5_health_report(conn, dry_run: bool = False) -> dict:
     """Generate comprehensive health report and flag degradation.
 
@@ -1112,7 +1187,7 @@ async def phase5_health_report(conn, dry_run: bool = False) -> dict:
     try:
         from app.retrieval import retrieval_engine
 
-        index_integrity = retrieval_engine.verify_index_integrity()
+        index_integrity = _maintenance_index_integrity(retrieval_engine, dry_run=dry_run)
     except Exception as idx_err:
         index_integrity = {"error": str(idx_err)}
 
@@ -1421,7 +1496,8 @@ async def phase5_4_metrics_retention(
 
 
 async def phase5_5_governance_retention(
-    conn, dry_run: bool = False,
+    conn,
+    dry_run: bool = False,
     retention_days: int = 90,
     recal_retention_days: int = 7,
     contradiction_retention_days: int = 30,
@@ -1454,14 +1530,19 @@ async def phase5_5_governance_retention(
     cutoff_90d = _iso_cutoff(retention_days)
 
     tier1_types = (GOV_EVENT_CONFIDENCE_RECALIBRATION, GOV_EVENT_CONFIDENCE_RECALIBRATION_SUMMARY)
-    tier2_types = (GOV_EVENT_CONTRADICTION_DETECTED, GOV_EVENT_GRAPH_CONTRADICTION_SIGNAL,
-                   GOV_EVENT_CONTRADICTION_PHASE_2_COMPLETED)
+    tier2_types = (
+        GOV_EVENT_CONTRADICTION_DETECTED,
+        GOV_EVENT_GRAPH_CONTRADICTION_SIGNAL,
+        GOV_EVENT_CONTRADICTION_PHASE_2_COMPLETED,
+    )
 
     result = {
         "retention_days": retention_days,
         "recal_retention_days": recal_retention_days,
         "contradiction_retention_days": contradiction_retention_days,
-        "tier1_deleted": 0, "tier2_deleted": 0, "tier3_deleted": 0,
+        "tier1_deleted": 0,
+        "tier2_deleted": 0,
+        "tier3_deleted": 0,
     }
 
     if dry_run:
@@ -1521,7 +1602,9 @@ async def phase5_5_governance_retention(
         conn.commit()
         logger.info(
             "MAINT-038/056: governance retention — tier1(7d)=%d, tier2(30d)=%d, tier3(90d)=%d",
-            result["tier1_deleted"], result["tier2_deleted"], result["tier3_deleted"],
+            result["tier1_deleted"],
+            result["tier2_deleted"],
+            result["tier3_deleted"],
         )
     result["deleted"] = total  # backward compat key
     return result
@@ -1588,7 +1671,8 @@ async def phase5_7_incremental_vacuum(conn, dry_run: bool = False) -> dict:
                 "MAINT-030: auto_vacuum=%d (need 2 for incremental_vacuum), "
                 "%d freelist pages cannot be reclaimed. "
                 "Run: PRAGMA auto_vacuum=2; VACUUM; to enable.",
-                auto_vacuum_mode, freelist_before,
+                auto_vacuum_mode,
+                freelist_before,
             )
         result["skipped"] = "auto_vacuum not set to incremental (2)"
         return result
@@ -1604,7 +1688,8 @@ async def phase5_7_incremental_vacuum(conn, dry_run: bool = False) -> dict:
         if result["pages_freed"] > 0:
             logger.info(
                 "MAINT-030: incremental_vacuum freed %d pages (%d remain)",
-                result["pages_freed"], freelist_after,
+                result["pages_freed"],
+                freelist_after,
             )
 
     return result
@@ -1701,8 +1786,11 @@ async def phase6_promotion_sweep(conn=None, dry_run: bool = False) -> dict:
                 save_concept(concept)
                 m3_capped += 1
         if m3_capped > 0:
-            logger.info("STABILITY-027: M3 sweep capped %d quarantined concepts to %.1f",
-                        m3_capped, PSIS_QUARANTINE_CONFIDENCE_CAP)
+            logger.info(
+                "STABILITY-027: M3 sweep capped %d quarantined concepts to %.1f",
+                m3_capped,
+                PSIS_QUARANTINE_CONFIDENCE_CAP,
+            )
     except Exception as e:
         logger.warning("STABILITY-027: M3 sweep failed (non-fatal): %s", e)
 
@@ -1731,7 +1819,8 @@ async def _phase2_11_association_quality(conn, dry_run: bool = False) -> dict:
 
     try:
         # Query associations with utility data for both endpoints
-        rows = conn.execute("""
+        rows = conn.execute(
+            """
             SELECT a.source, a.target, a.mechanism,
                    cs.utility_score AS src_utility, cs.utility_samples AS src_samples,
                    cs.knowledge_area AS src_ka,
@@ -1741,7 +1830,9 @@ async def _phase2_11_association_quality(conn, dry_run: bool = False) -> dict:
             JOIN concepts cs ON cs.id = a.source AND cs.status = 'active' AND cs.is_current = 1
             JOIN concepts ct ON ct.id = a.target AND ct.status = 'active' AND ct.is_current = 1
             WHERE cs.utility_samples >= ? AND ct.utility_samples >= ?
-        """, (MIN_UTILITY_SAMPLES, MIN_UTILITY_SAMPLES)).fetchall()
+        """,
+            (MIN_UTILITY_SAMPLES, MIN_UTILITY_SAMPLES),
+        ).fetchall()
 
         if not rows:
             return {"status": "ok", "edges_evaluated": 0, "message": "no edges with sufficient utility data"}
@@ -1767,19 +1858,27 @@ async def _phase2_11_association_quality(conn, dry_run: bool = False) -> dict:
 
             # Weak edge: one endpoint high utility (>0.6), other low (<0.3)
             if (src_util > 0.6 and tgt_util < 0.3) or (tgt_util > 0.6 and src_util < 0.3):
-                weak_edges.append({
-                    "source": r["source"], "target": r["target"],
-                    "src_utility": round(src_util, 3), "tgt_utility": round(tgt_util, 3),
-                    "mechanism": r["mechanism"],
-                })
+                weak_edges.append(
+                    {
+                        "source": r["source"],
+                        "target": r["target"],
+                        "src_utility": round(src_util, 3),
+                        "tgt_utility": round(tgt_util, 3),
+                        "mechanism": r["mechanism"],
+                    }
+                )
 
         result = {
             "status": "ok",
             "edges_evaluated": len(rows),
             "weak_edge_count": len(weak_edges),
             "mean_utility_diff": round(sum(utility_diffs) / len(utility_diffs), 4) if utility_diffs else 0,
-            "same_ka_mean_utility": round(sum(same_ka_utilities) / len(same_ka_utilities), 4) if same_ka_utilities else None,
-            "cross_ka_mean_utility": round(sum(cross_ka_utilities) / len(cross_ka_utilities), 4) if cross_ka_utilities else None,
+            "same_ka_mean_utility": round(sum(same_ka_utilities) / len(same_ka_utilities), 4)
+            if same_ka_utilities
+            else None,
+            "cross_ka_mean_utility": round(sum(cross_ka_utilities) / len(cross_ka_utilities), 4)
+            if cross_ka_utilities
+            else None,
             "same_ka_edges": len(same_ka_utilities),
             "cross_ka_edges": len(cross_ka_utilities),
         }
@@ -1817,9 +1916,7 @@ def _ensure_alert_table(mconn) -> None:
     """)
     # Ensure exactly one row exists
     if mconn.execute("SELECT COUNT(*) FROM backup_alert_state").fetchone()[0] == 0:
-        mconn.execute(
-            "INSERT INTO backup_alert_state (id, consecutive_alerts) VALUES (1, 0)"
-        )
+        mconn.execute("INSERT INTO backup_alert_state (id, consecutive_alerts) VALUES (1, 0)")
     mconn.commit()
 
 
@@ -1850,11 +1947,14 @@ def _maybe_send_backup_alert(data_dir, backup_result: dict) -> None:
 
         if status == "ok":
             # Reset cooldown on success
-            mconn.execute("""
+            mconn.execute(
+                """
                 UPDATE backup_alert_state
                 SET consecutive_alerts = 0, last_status = 'ok', updated_utc = ?
                 WHERE id = 1
-            """, (_utc_now_iso(),))
+            """,
+                (_utc_now_iso(),),
+            )
             mconn.commit()
             mconn.close()
             return
@@ -1878,11 +1978,14 @@ def _maybe_send_backup_alert(data_dir, backup_result: dict) -> None:
         _fire_webhook(webhook_url, backup_result)
 
         # Update cooldown state
-        mconn.execute("""
+        mconn.execute(
+            """
             UPDATE backup_alert_state
             SET last_alert_utc = ?, consecutive_alerts = ?, last_status = ?, updated_utc = ?
             WHERE id = 1
-        """, (_utc_now_iso(), consecutive + 1, status, _utc_now_iso()))
+        """,
+            (_utc_now_iso(), consecutive + 1, status, _utc_now_iso()),
+        )
         mconn.commit()
         mconn.close()
 
@@ -1894,16 +1997,18 @@ def _fire_webhook(url: str, backup_result: dict) -> None:
     """POST backup alert payload to webhook URL. 5s timeout, fire-and-forget."""
     import urllib.request
 
-    payload = json.dumps({
-        "event": "pith_backup_alert",
-        "status": backup_result.get("status", "unknown"),
-        "error": backup_result.get("error"),
-        "elapsed_seconds": backup_result.get("elapsed_seconds"),
-        "backup_size_bytes": backup_result.get("backup_size_bytes"),
-        "concept_count": backup_result.get("concept_count"),
-        "integrity": backup_result.get("integrity"),
-        "timestamp": _utc_now_iso(),
-    }).encode("utf-8")
+    payload = json.dumps(
+        {
+            "event": "pith_backup_alert",
+            "status": backup_result.get("status", "unknown"),
+            "error": backup_result.get("error"),
+            "elapsed_seconds": backup_result.get("elapsed_seconds"),
+            "backup_size_bytes": backup_result.get("backup_size_bytes"),
+            "concept_count": backup_result.get("concept_count"),
+            "integrity": backup_result.get("integrity"),
+            "timestamp": _utc_now_iso(),
+        }
+    ).encode("utf-8")
 
     req = urllib.request.Request(
         url,
@@ -1924,6 +2029,7 @@ async def _phase7_concept_synthesis(conn=None, dry_run: bool = False) -> dict:
         return {"status": "dry_run", "phase": "concept_synthesis"}
     try:
         from app.cognitive.synthesis_llm import run_synthesis
+
         return await run_synthesis()
     except Exception as e:
         logger.warning(f"Phase 7 concept_synthesis failed (non-fatal): {e}")
@@ -1939,21 +2045,52 @@ async def phase8_backup(conn=None, dry_run: bool = False) -> dict:
     Backup destination: {data_dir}/pith_backup.db
     Strategy: pages=-1 (single-shot copy), ~2-5s for 500MB DB on SSD.
     """
-    import sqlite3 as _sqlite3
-
     from app.core.profile import resolve_data_dir
+    from app.ops.backup_health import (
+        BACKUP_HEALTH_SNAPSHOT_NAME,
+        build_backup_health_snapshot,
+        measure_backup_capacity,
+        read_backup_health_snapshot,
+        write_backup_health_snapshot,
+    )
 
     data_dir = resolve_data_dir()
     source_path = data_dir / "pith.db"
     backup_path = data_dir / "pith_backup.db"
     tmp_path = data_dir / "pith_backup.db.tmp"
+    snapshot_path = data_dir / BACKUP_HEALTH_SNAPSHOT_NAME
+    capacity = measure_backup_capacity(source_path, data_dir)
+
+    previous_verified = None
+    try:
+        previous_snapshot = read_backup_health_snapshot(snapshot_path)
+        candidate = previous_snapshot.get("last_verified")
+        if isinstance(candidate, dict) and candidate.get("backup_path") == str(backup_path):
+            previous_verified = candidate
+    except (OSError, ValueError):
+        previous_verified = None
 
     result = {
         "phase": "backup",
         "source": str(source_path),
         "destination": str(backup_path),
         "dry_run": dry_run,
+        "capacity": capacity,
     }
+
+    def _publish_failure(reason_code: str) -> None:
+        completed_at = _utc_now()
+        snapshot = build_backup_health_snapshot(
+            sampled_at=completed_at,
+            last_attempt={
+                "at": completed_at.isoformat(),
+                "state": "critical",
+                "reason_code": reason_code,
+            },
+            last_verified=previous_verified,
+            capacity=capacity,
+        )
+        write_backup_health_snapshot(snapshot_path, snapshot)
 
     if dry_run:
         result["status"] = "dry_run"
@@ -1961,13 +2098,77 @@ async def phase8_backup(conn=None, dry_run: bool = False) -> dict:
         return result
 
     if not source_path.exists():
-        result["status"] = "skipped"
-        result["reason"] = "source DB does not exist"
-        logger.warning("OPS-152: Backup skipped — %s does not exist", source_path)
+        result.update(
+            {
+                "status": "error",
+                "reason_code": "backup_source_missing",
+                "error": "source DB does not exist",
+            }
+        )
+        try:
+            _publish_failure("backup_source_missing")
+        except Exception as publish_error:
+            result.update(
+                {
+                    "reason_code": "backup_health_publish_failed",
+                    "attempt_reason_code": "backup_source_missing",
+                    "error": f"backup health publication failed: {publish_error}",
+                }
+            )
+            logger.error("OPS-575: Backup-health publication failed: %s", publish_error, exc_info=True)
+        logger.warning("OPS-152: Backup failed — %s does not exist", source_path)
+        _maybe_send_backup_alert(data_dir, result)
+        return result
+
+    capacity_operation = capacity["operations"][0]
+    if capacity["state"] == "unknown":
+        result.update(
+            {
+                "status": "error",
+                "reason_code": "capacity_measurement_failed",
+                "error": "backup capacity could not be measured",
+            }
+        )
+        try:
+            _publish_failure("capacity_measurement_failed")
+        except Exception as publish_error:
+            result.update(
+                {
+                    "reason_code": "backup_health_publish_failed",
+                    "attempt_reason_code": "capacity_measurement_failed",
+                    "error": f"backup health publication failed: {publish_error}",
+                }
+            )
+            logger.error("OPS-575: Backup-health publication failed: %s", publish_error, exc_info=True)
+        _maybe_send_backup_alert(data_dir, result)
+        return result
+
+    if capacity_operation["admissible"] is not True:
+        result.update(
+            {
+                "status": "error",
+                "reason_code": "insufficient_headroom",
+                "error": "insufficient disk headroom for maintenance backup",
+            }
+        )
+        try:
+            _publish_failure("insufficient_headroom")
+        except Exception as publish_error:
+            result.update(
+                {
+                    "reason_code": "backup_health_publish_failed",
+                    "attempt_reason_code": "insufficient_headroom",
+                    "error": f"backup health publication failed: {publish_error}",
+                }
+            )
+            logger.error("OPS-575: Backup-health publication failed: %s", publish_error, exc_info=True)
+        _maybe_send_backup_alert(data_dir, result)
         return result
 
     t0 = time.monotonic()
     try:
+        import sqlite3 as _sqlite3
+
         # Open source as read-only to avoid interfering with maintenance conn
         src = _sqlite3.connect(f"file:{source_path}?mode=ro", uri=True)
         try:
@@ -1988,25 +2189,89 @@ async def phase8_backup(conn=None, dry_run: bool = False) -> dict:
             src.close()
 
         elapsed = round(time.monotonic() - t0, 2)
-        backup_size = backup_path.stat().st_size
-
         # Integrity quick-check on the backup
         verify_conn = _sqlite3.connect(f"file:{backup_path}?mode=ro", uri=True)
         try:
             integrity = verify_conn.execute("PRAGMA quick_check").fetchone()[0]
-            concept_count = verify_conn.execute(
-                "SELECT COUNT(*) FROM concepts WHERE is_current = 1"
-            ).fetchone()[0]
+            concept_count = verify_conn.execute("SELECT COUNT(*) FROM concepts WHERE is_current = 1").fetchone()[0]
         finally:
             verify_conn.close()
 
-        result.update({
-            "status": "ok",
-            "elapsed_seconds": elapsed,
+        if integrity != "ok":
+            result.update(
+                {
+                    "status": "error",
+                    "reason_code": "backup_integrity_failed",
+                    "error": "backup integrity check failed",
+                    "elapsed_seconds": elapsed,
+                    "integrity": integrity,
+                    "concept_count": concept_count,
+                }
+            )
+            try:
+                _publish_failure("backup_integrity_failed")
+            except Exception as publish_error:
+                result.update(
+                    {
+                        "reason_code": "backup_health_publish_failed",
+                        "attempt_reason_code": "backup_integrity_failed",
+                        "error": f"backup health publication failed: {publish_error}",
+                    }
+                )
+                logger.error("OPS-575: Backup-health publication failed: %s", publish_error, exc_info=True)
+            logger.error("OPS-152: Backup integrity check failed: %s", integrity)
+            _maybe_send_backup_alert(data_dir, result)
+            return result
+
+        backup_stat = backup_path.stat()
+        backup_size = backup_stat.st_size
+        completed_at = _utc_now()
+        verified = {
+            "at": completed_at.isoformat(),
+            "backup_path": str(backup_path),
             "backup_size_bytes": backup_size,
+            "backup_mtime_ns": backup_stat.st_mtime_ns,
             "concept_count": concept_count,
-            "integrity": integrity,
-        })
+            "integrity": "ok",
+        }
+        snapshot = build_backup_health_snapshot(
+            sampled_at=completed_at,
+            last_attempt={
+                "at": completed_at.isoformat(),
+                "state": "healthy",
+                "reason_code": "verified",
+            },
+            last_verified=verified,
+            capacity=capacity,
+        )
+        try:
+            write_backup_health_snapshot(snapshot_path, snapshot)
+        except Exception as publish_error:
+            result.update(
+                {
+                    "status": "error",
+                    "reason_code": "backup_health_publish_failed",
+                    "error": f"backup health publication failed: {publish_error}",
+                    "elapsed_seconds": elapsed,
+                    "backup_size_bytes": backup_size,
+                    "concept_count": concept_count,
+                    "integrity": integrity,
+                }
+            )
+            logger.error("OPS-575: Backup-health publication failed: %s", publish_error, exc_info=True)
+            _maybe_send_backup_alert(data_dir, result)
+            return result
+
+        result.update(
+            {
+                "status": "ok",
+                "reason_code": "verified",
+                "elapsed_seconds": elapsed,
+                "backup_size_bytes": backup_size,
+                "concept_count": concept_count,
+                "integrity": integrity,
+            }
+        )
         logger.info(
             "OPS-152: Backup complete — %d concepts, %.1f MB, %ss, integrity=%s",
             concept_count,
@@ -2020,12 +2285,27 @@ async def phase8_backup(conn=None, dry_run: bool = False) -> dict:
 
     except Exception as e:
         elapsed = round(time.monotonic() - t0, 2)
-        result.update({
-            "status": "error",
-            "error": str(e),
-            "elapsed_seconds": elapsed,
-        })
+        result.update(
+            {
+                "status": "error",
+                "reason_code": "backup_failed",
+                "error": str(e),
+                "elapsed_seconds": elapsed,
+            }
+        )
         logger.error("OPS-152: Backup failed after %ss: %s", elapsed, e, exc_info=True)
+
+        try:
+            _publish_failure("backup_failed")
+        except Exception as publish_error:
+            result.update(
+                {
+                    "reason_code": "backup_health_publish_failed",
+                    "attempt_reason_code": "backup_failed",
+                    "error": f"backup health publication failed: {publish_error}",
+                }
+            )
+            logger.error("OPS-575: Backup-health publication failed: %s", publish_error, exc_info=True)
 
         # Alert on backup failure too
         _maybe_send_backup_alert(data_dir, result)
@@ -2072,6 +2352,7 @@ ALL_PHASES = {
     8: ("backup", phase8_backup),  # OPS-152
     9: ("fts_verbatim_repair", _phase9_fts_verbatim_repair),  # DATA-069
 }
+
 
 # Sub-phases that auto-run after their parent phase
 async def phase5_10_checkpoint_gc(conn=None, dry_run: bool = False) -> dict:
@@ -2134,6 +2415,382 @@ _NO_CONN_STEPS = {
 }
 
 
+def _maintenance_operation_inventory() -> list[dict]:
+    """Return the canonical bounded inventory in execution order."""
+    inventory = []
+    for phase_number, (operation_id, _phase_fn) in sorted(ALL_PHASES.items()):
+        inventory.append({"id": operation_id, "kind": "phase", "phase_number": phase_number})
+        inventory.extend(
+            {"id": sub_id, "kind": "subphase", "phase_number": phase_number}
+            for sub_id, _sub_fn in _SUB_PHASES.get(phase_number, [])
+        )
+    return inventory
+
+
+def _positive_result_value(value) -> bool:
+    """Return whether a result field represents at least one failure/event."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value > 0
+    if isinstance(value, (str, list, tuple, set, dict)):
+        return len(value) > 0
+    return value is not None
+
+
+def _classify_maintenance_result(operation_id: str, result: dict) -> tuple[str, str]:
+    """Map an internal result shape to a controlled outcome state and reason."""
+    if not isinstance(result, dict):
+        return "warning", "invalid_result"
+
+    if result.get("dry_run") is True:
+        return "skipped", "dry_run"
+
+    status = str(result.get("status") or "").strip().lower()
+
+    if operation_id == "scheduled_tasks":
+        failed = _positive_result_value(result.get("tasks_failed"))
+        deferred = _positive_result_value(result.get("tasks_deferred"))
+        if failed:
+            return "critical", "nested_task_failure"
+        if deferred:
+            return "critical", "tasks_incomplete"
+
+    if operation_id == "reflection":
+        if result.get("budget_paused"):
+            return "deferred", "paused_cap_progressing"
+        if result.get("budget_deferred"):
+            return "deferred", "budget_deferred"
+        if result.get("budget_aborted"):
+            return "warning", "budget_aborted"
+        summary = result.get("reflection_summary")
+        if isinstance(summary, dict) and summary.get("status") == "skipped":
+            return "skipped", "no_reflection_work"
+
+    if operation_id == "health_report":
+        integrity = result.get("index_integrity")
+        if not isinstance(integrity, dict) or not integrity:
+            return "warning", "index_integrity_missing"
+        if _positive_result_value(integrity.get("error")):
+            return "critical", "index_integrity_error"
+        if integrity.get("is_healthy") is not True:
+            return "critical", "index_integrity_drift"
+        if _positive_result_value(result.get("degraded_tasks")):
+            return "warning", "degraded_tasks"
+        if _positive_result_value(result.get("bg_task_failure_alerts")):
+            return "warning", "background_task_failures"
+        checkpoint_health = result.get("checkpoint_health")
+        if isinstance(checkpoint_health, dict) and _positive_result_value(checkpoint_health.get("error")):
+            return "warning", "checkpoint_health_error"
+
+    if operation_id == "experiments":
+        nested_statuses = {
+            str(value.get("status") or "").strip().lower() for value in result.values() if isinstance(value, dict)
+        }
+        if any(nested in {"timeout", "error", "failed", "cancelled"} for nested in nested_statuses):
+            return "warning", "partial_experiment_failure"
+        if _positive_result_value(result.get("archive_error")):
+            return "warning", "experiment_archive_failure"
+
+    if operation_id == "concept_synthesis":
+        if status == "completed" and _positive_result_value(result.get("llm_failures")):
+            return "warning", "partial_llm_failure"
+        if status == "skipped":
+            reason = str(result.get("reason") or "").strip().lower()
+            reason_codes = {
+                "feature_flag_disabled": "feature_flag_disabled",
+                "no_api_key": "no_api_key",
+                "circuit_breaker_tripped": "circuit_breaker_tripped",
+                "no_candidates": "no_candidates",
+            }
+            return "skipped", reason_codes.get(reason, "policy_skip")
+
+    if operation_id == "backup":
+        if status == "skipped":
+            return "critical", "backup_source_missing"
+        if status == "error":
+            return "critical", "backup_failed"
+        if status == "ok":
+            integrity = result.get("integrity")
+            if integrity is None:
+                return "warning", "backup_integrity_missing"
+            if str(integrity).strip().lower() != "ok":
+                return "critical", "backup_integrity_failed"
+            return "healthy", "completed"
+
+    if _positive_result_value(result.get("error")) or _positive_result_value(result.get("errors")):
+        return "critical", "reported_error"
+    if result.get("budget_exceeded"):
+        return "warning", "budget_exceeded"
+    if _positive_result_value(result.get("skipped")):
+        return "skipped", "policy_skip"
+    if status in {"error", "errors", "failed", "failure", "timeout", "cancelled"}:
+        return "critical", "reported_failure"
+    if "deferred" in status:
+        return "deferred", "deferred"
+    if "skipped" in status or status in {"disabled", "dry_run", "recording_disabled_purge_only"}:
+        return "skipped", "policy_skip"
+    if status in {"ok", "healthy", "success", "completed", "no_desynced_rows"} or not status:
+        return "healthy", "completed"
+    return "warning", "unrecognized_status"
+
+
+def _record_maintenance_outcome(
+    report: MaintenanceReport,
+    *,
+    operation_id: str,
+    kind: str,
+    phase_number: int,
+    result: dict | None = None,
+    state: str | None = None,
+    reason_code: str | None = None,
+    elapsed_seconds: float | None = None,
+    report_error: bool = False,
+) -> None:
+    """Record one internal outcome without copying the source result payload."""
+    if state is None or reason_code is None:
+        state, reason_code = _classify_maintenance_result(operation_id, result or {})
+    if state not in MAINTENANCE_OUTCOME_STATES:
+        state, reason_code = "warning", "invalid_outcome_state"
+    record: MaintenanceOperationOutcome = {
+        "id": operation_id,
+        "kind": kind,
+        "phase_number": phase_number,
+        "selected": True,
+        "state": state,
+        "reason_code": reason_code,
+    }
+    if (
+        isinstance(elapsed_seconds, (int, float))
+        and not isinstance(elapsed_seconds, bool)
+        and math.isfinite(float(elapsed_seconds))
+        and elapsed_seconds >= 0
+    ):
+        record["elapsed_seconds"] = round(float(elapsed_seconds), 3)
+    report.operation_outcomes[operation_id] = record
+    if report_error:
+        report.attributed_failure_count += 1
+
+
+def _outcome_counts(operations: list[dict]) -> dict[str, int]:
+    counts = {state: 0 for state in MAINTENANCE_OUTCOME_STATES}
+    for operation in operations:
+        counts[operation["state"]] += 1
+    return counts
+
+
+def _overall_outcome_state(operations: list[dict], *, unattributed_failures: int) -> str:
+    """Derive aggregate state from selected records and projection failures."""
+    if unattributed_failures > 0:
+        return "critical"
+    selected_states = [operation["state"] for operation in operations if operation["selected"]]
+    precedence = ("critical", "warning", "deferred", "healthy", "skipped", "never_run")
+    return next((state for state in precedence if state in selected_states), "never_run")
+
+
+def empty_maintenance_outcome_health(reason_code: str, *, critical: bool = False) -> dict:
+    """Return a stable cold-start/legacy projection for the configured inventory."""
+    full_inventory = _maintenance_operation_inventory()
+    inventory = full_inventory[:MAINTENANCE_OUTCOME_MAX_OPERATIONS]
+    truncated = len(full_inventory) > len(inventory)
+    failure_count = int(critical or truncated)
+    operations = [
+        {
+            **item,
+            "selected": False,
+            "state": "never_run",
+            "reason_code": reason_code,
+        }
+        for item in inventory
+    ]
+    return {
+        "schema_version": MAINTENANCE_OUTCOME_SCHEMA_VERSION,
+        "overall_state": "critical" if failure_count else "never_run",
+        "run_scope": "unknown",
+        "operation_count": len(operations),
+        "selected_count": 0,
+        "unattributed_failure_count": failure_count,
+        "truncated": truncated,
+        "counts": _outcome_counts(operations),
+        "operations": operations,
+    }
+
+
+def build_maintenance_outcome_health(report: MaintenanceReport) -> dict:
+    """Build the versioned, bounded outcome-health projection for a report."""
+    full_inventory = _maintenance_operation_inventory()
+    inventory = full_inventory[:MAINTENANCE_OUTCOME_MAX_OPERATIONS]
+    selected_phases = set(report.selected_phase_numbers)
+    operations = []
+    missing_selected = 0
+
+    parent_ids = {item["phase_number"]: item["id"] for item in inventory if item["kind"] == "phase"}
+    for item in inventory:
+        selected = item["phase_number"] in selected_phases
+        recorded = report.operation_outcomes.get(item["id"])
+        if not selected:
+            operation = {
+                **item,
+                "selected": False,
+                "state": "never_run",
+                "reason_code": "not_selected",
+            }
+        elif recorded is not None:
+            operation = {key: value for key, value in recorded.items() if key != "selected"}
+            operation["selected"] = True
+        else:
+            parent = report.operation_outcomes.get(parent_ids.get(item["phase_number"], ""))
+            blocked = item["kind"] == "subphase" and parent and parent.get("state") == "critical"
+            operation = {
+                **item,
+                "selected": True,
+                "state": "never_run",
+                "reason_code": "blocked_by_parent" if blocked else "not_recorded",
+            }
+            if not blocked:
+                missing_selected += 1
+        operations.append(operation)
+
+    truncated = len(full_inventory) > len(inventory)
+    unattributed = (
+        max(
+            report.unattributed_failure_count,
+            len(report.errors) - report.attributed_failure_count,
+        )
+        + missing_selected
+        + int(truncated)
+    )
+    counts = _outcome_counts(operations)
+    overall_state = _overall_outcome_state(operations, unattributed_failures=unattributed)
+
+    all_phase_numbers = set(ALL_PHASES)
+    run_scope = "full" if selected_phases == all_phase_numbers else "partial"
+    return {
+        "schema_version": MAINTENANCE_OUTCOME_SCHEMA_VERSION,
+        "overall_state": overall_state,
+        "run_scope": run_scope,
+        "operation_count": len(operations),
+        "selected_count": sum(1 for operation in operations if operation["selected"]),
+        "unattributed_failure_count": unattributed,
+        "truncated": truncated,
+        "counts": counts,
+        "operations": operations,
+    }
+
+
+def validate_maintenance_outcome_health(value: object) -> dict | None:
+    """Return a current contract unchanged when it is structurally valid."""
+    if not isinstance(value, dict):
+        return None
+    required_top = {
+        "schema_version",
+        "overall_state",
+        "run_scope",
+        "operation_count",
+        "selected_count",
+        "unattributed_failure_count",
+        "truncated",
+        "counts",
+        "operations",
+    }
+    if set(value) != required_top or value.get("schema_version") != MAINTENANCE_OUTCOME_SCHEMA_VERSION:
+        return None
+    if value.get("overall_state") not in MAINTENANCE_OUTCOME_STATES:
+        return None
+    if value.get("run_scope") not in {"full", "partial", "unknown"}:
+        return None
+    operations = value.get("operations")
+    if not isinstance(operations, list) or len(operations) > MAINTENANCE_OUTCOME_MAX_OPERATIONS:
+        return None
+
+    expected_inventory = _maintenance_operation_inventory()[:MAINTENANCE_OUTCOME_MAX_OPERATIONS]
+    observed_inventory = [
+        {
+            "id": operation.get("id"),
+            "kind": operation.get("kind"),
+            "phase_number": operation.get("phase_number"),
+        }
+        for operation in operations
+        if isinstance(operation, dict)
+    ]
+    if observed_inventory != expected_inventory:
+        return None
+
+    operation_keys = {"id", "kind", "phase_number", "selected", "state", "reason_code"}
+    seen_ids = set()
+    for operation in operations:
+        if not isinstance(operation, dict) or not operation_keys.issubset(operation):
+            return None
+        if set(operation) - (operation_keys | {"elapsed_seconds"}):
+            return None
+        operation_id = operation.get("id")
+        reason_code = operation.get("reason_code")
+        if not isinstance(operation_id, str) or not _MAINTENANCE_OUTCOME_ID_RE.fullmatch(operation_id):
+            return None
+        if operation_id in seen_ids:
+            return None
+        seen_ids.add(operation_id)
+        if not isinstance(reason_code, str) or not _MAINTENANCE_OUTCOME_ID_RE.fullmatch(reason_code):
+            return None
+        if operation.get("kind") not in {"phase", "subphase"}:
+            return None
+        phase_number = operation.get("phase_number")
+        if isinstance(phase_number, bool) or not isinstance(phase_number, int) or not 1 <= phase_number <= 999:
+            return None
+        if not isinstance(operation.get("selected"), bool):
+            return None
+        if operation.get("state") not in MAINTENANCE_OUTCOME_STATES:
+            return None
+        if "elapsed_seconds" in operation:
+            elapsed = operation["elapsed_seconds"]
+            if (
+                isinstance(elapsed, bool)
+                or not isinstance(elapsed, (int, float))
+                or not math.isfinite(float(elapsed))
+                or elapsed < 0
+            ):
+                return None
+
+    counts = value.get("counts")
+    if not isinstance(counts, dict) or set(counts) != set(MAINTENANCE_OUTCOME_STATES):
+        return None
+    actual_counts = _outcome_counts(operations)
+    if any(isinstance(counts[state], bool) or not isinstance(counts[state], int) for state in counts):
+        return None
+    if counts != actual_counts:
+        return None
+    integer_fields = ("operation_count", "selected_count", "unattributed_failure_count")
+    if any(isinstance(value.get(key), bool) or not isinstance(value.get(key), int) for key in integer_fields):
+        return None
+    if value["operation_count"] != len(operations):
+        return None
+    if value["selected_count"] != sum(1 for operation in operations if operation["selected"]):
+        return None
+    if value["unattributed_failure_count"] < 0 or not isinstance(value.get("truncated"), bool):
+        return None
+    expected_unattributed = value["unattributed_failure_count"] + int(value["truncated"])
+    if value["overall_state"] != _overall_outcome_state(
+        operations,
+        unattributed_failures=expected_unattributed,
+    ):
+        return None
+    if value["run_scope"] == "full" and value["selected_count"] != value["operation_count"]:
+        return None
+    if value["run_scope"] == "unknown" and value["selected_count"] != 0:
+        return None
+    return value
+
+
+def normalize_maintenance_outcome_health(value: object, *, missing_reason: str) -> dict:
+    """Normalize absent or malformed heartbeat outcome data to a safe contract."""
+    if value is None:
+        return empty_maintenance_outcome_health(missing_reason)
+    validated = validate_maintenance_outcome_health(value)
+    if validated is not None:
+        return validated
+    return empty_maintenance_outcome_health("invalid_outcome_contract", critical=True)
+
+
 async def _run_maintenance_step(step_fn, *, dry_run: bool = False):
     """Run one maintenance phase or sub-phase with step-local ownership."""
     if step_fn in _NO_CONN_STEPS:
@@ -2184,8 +2841,10 @@ async def run_maintenance(
     )
 
     phases_to_run = sorted(set(phases or list(ALL_PHASES.keys())))
+    report.selected_phase_numbers = [phase_num for phase_num in phases_to_run if phase_num in ALL_PHASES]
     for phase_num in phases_to_run:
         if phase_num not in ALL_PHASES:
+            report.unattributed_failure_count += 1
             report.errors.append(f"Unknown phase: {phase_num}")
             continue
 
@@ -2206,6 +2865,14 @@ async def run_maintenance(
                 "elapsed_seconds": elapsed,
                 **result,
             }
+            _record_maintenance_outcome(
+                report,
+                operation_id=phase_name,
+                kind="phase",
+                phase_number=phase_num,
+                result=result,
+                elapsed_seconds=elapsed,
+            )
             _append_partial_failure_warnings(
                 report,
                 phase_num=phase_num,
@@ -2216,8 +2883,7 @@ async def run_maintenance(
                 abort_reason = result.get("abort_reason", "unknown")
                 last_step = result.get("abort_stage") or result.get("last_completed_step") or "unknown"
                 warning_msg = (
-                    f"Phase {phase_num} ({phase_name}) aborted before timeout: "
-                    f"{abort_reason} after {last_step}"
+                    f"Phase {phase_num} ({phase_name}) aborted before timeout: {abort_reason} after {last_step}"
                 )
                 report.warnings.append(warning_msg)
                 logger.warning(warning_msg)
@@ -2255,20 +2921,48 @@ async def run_maintenance(
                         "elapsed_seconds": sub_elapsed,
                         **sub_result,
                     }
+                    _record_maintenance_outcome(
+                        report,
+                        operation_id=sub_name,
+                        kind="subphase",
+                        phase_number=phase_num,
+                        result=sub_result,
+                        elapsed_seconds=sub_elapsed,
+                    )
                     logger.info(f"Maintenance sub-phase ({sub_name}): done in {sub_elapsed}s")
                 except TimeoutError:
                     sub_err = f"Sub-phase ({sub_name}) TIMED OUT after {PHASE_TIMEOUT_SECONDS}s"
+                    _record_maintenance_outcome(
+                        report,
+                        operation_id=sub_name,
+                        kind="subphase",
+                        phase_number=phase_num,
+                        state="critical",
+                        reason_code="timeout",
+                        elapsed_seconds=PHASE_TIMEOUT_SECONDS,
+                        report_error=True,
+                    )
                     report.errors.append(sub_err)
                     logger.error(sub_err)
                 except Exception as sub_e:
                     sub_err = f"Sub-phase ({sub_name}) failed: {str(sub_e)}"
+                    _record_maintenance_outcome(
+                        report,
+                        operation_id=sub_name,
+                        kind="subphase",
+                        phase_number=phase_num,
+                        state="critical",
+                        reason_code="exception",
+                        elapsed_seconds=round(time.monotonic() - t1, 2),
+                        report_error=True,
+                    )
                     report.errors.append(sub_err)
                     logger.error(sub_err, exc_info=True)
 
         except TimeoutError:
             error_msg = f"Phase {phase_num} ({phase_name}) TIMED OUT after {PHASE_TIMEOUT_SECONDS}s"
+            elapsed = round(time.monotonic() - t0, 2) if "t0" in locals() else PHASE_TIMEOUT_SECONDS
             if phase_name == "reflection":
-                elapsed = round(time.monotonic() - t0, 2) if "t0" in locals() else PHASE_TIMEOUT_SECONDS
                 report.results[phase_name] = {
                     "elapsed_seconds": elapsed,
                     "budget_aborted": True,
@@ -2282,10 +2976,30 @@ async def run_maintenance(
                         "phase_timings": {},
                     },
                 }
+            _record_maintenance_outcome(
+                report,
+                operation_id=phase_name,
+                kind="phase",
+                phase_number=phase_num,
+                state="critical",
+                reason_code="timeout",
+                elapsed_seconds=elapsed,
+                report_error=True,
+            )
             report.errors.append(error_msg)
             logger.error(error_msg)
         except Exception as e:
             error_msg = f"Phase {phase_num} ({phase_name}) failed: {str(e)}"
+            _record_maintenance_outcome(
+                report,
+                operation_id=phase_name,
+                kind="phase",
+                phase_number=phase_num,
+                state="critical",
+                reason_code="exception",
+                elapsed_seconds=round(time.monotonic() - t0, 2),
+                report_error=True,
+            )
             report.errors.append(error_msg)
             logger.error(error_msg, exc_info=True)
 
@@ -2305,16 +3019,19 @@ def _write_heartbeat(report: MaintenanceReport, *, source: str = "manual") -> No
 
         data_dir = str(resolve_data_dir())
         heartbeat_path = os.path.join(data_dir, "maintenance_heartbeat.json")
+        outcome_health = build_maintenance_outcome_health(report)
         heartbeat = {
             "source": source,
             "last_run": _utc_now_iso(),
-            "status": "ok" if not report.errors else "errors",
+            "status": "errors" if report.errors or outcome_health["overall_state"] == "critical" else "ok",
+            "dry_run": report.dry_run,
             "phases_completed": len(report.phases_run),
             "phases_failed": len(report.errors),
             "phases_warned": len(report.warnings),
             "duration_seconds": report._duration(),
             "errors": report.errors[:5],  # Cap at 5 for file size
             "warnings": report.warnings[:5],
+            "outcome_health": outcome_health,
         }
         reflection_result = report.results.get("reflection")
         if reflection_result:
@@ -2350,8 +3067,23 @@ def _write_heartbeat(report: MaintenanceReport, *, source: str = "manual") -> No
                 "progress_state": progress_state,
             }
         os.makedirs(os.path.dirname(heartbeat_path), exist_ok=True)
-        with open(heartbeat_path, "w") as f:
-            json.dump(heartbeat, f, indent=2)
+        # Partial and dry runs are activity, never proof of full maintenance.
+        # Atomic replacement prevents readers seeing a half-written snapshot.
+        import tempfile
+
+        paths = [heartbeat_path]
+        if not report.dry_run and outcome_health["run_scope"] == "full":
+            paths.insert(0, os.path.join(data_dir, "maintenance_full_heartbeat.json"))
+        for path in paths:
+            tmp_path = None
+            try:
+                with tempfile.NamedTemporaryFile(mode="w", dir=data_dir, delete=False) as f:
+                    tmp_path = f.name
+                    json.dump(heartbeat, f, indent=2)
+                os.replace(tmp_path, path)
+            finally:
+                if tmp_path and os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
         logger.info(f"Heartbeat written to {heartbeat_path}")
     except Exception as e:
         logger.warning(f"Failed to write heartbeat (non-fatal): {e}")

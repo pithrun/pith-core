@@ -676,13 +676,23 @@ class LifecycleMixin:
         self.current_session.ended_at = _utc_now_iso()
         self.current_session.status = "ended"
 
-        # Persist to SQLite
-        update_session(
-            self.current_session.session_id,
-            ended_at=self.current_session.ended_at,
-            status="ended",
-            learning_event_count=self.current_session.learning_event_count,
-        )
+        # Managed terminal fields are owned exclusively by the binding gateway.
+        # The close runner supplies an exact permit for non-lifecycle counters,
+        # then finalizes status/phase/ended_at with its generation-fenced CAS.
+        from app.storage.session_bindings import current_managed_session_write_permit
+
+        if current_managed_session_write_permit() is None:
+            update_session(
+                self.current_session.session_id,
+                ended_at=self.current_session.ended_at,
+                status="ended",
+                learning_event_count=self.current_session.learning_event_count,
+            )
+        else:
+            update_session(
+                self.current_session.session_id,
+                learning_event_count=self.current_session.learning_event_count,
+            )
 
         # Flush access tracker
         from app.storage import access_tracker

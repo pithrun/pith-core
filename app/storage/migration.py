@@ -16,6 +16,7 @@ import sqlite3
 
 from app.core.config import BENCHMARK_READONLY
 from app.core.datetime_utils import _utc_now_iso
+from app.storage.utils import FTS_VERBATIM_SENTINEL_CONCEPT_IDS
 
 logger = logging.getLogger(__name__)
 
@@ -1150,7 +1151,11 @@ def migrate_fts_parity_data064(conn):
     concepts_cleaned = orphan_result.rowcount
 
     # Phase 3: Remove orphaned fts_verbatim (superseded/retired/deleted concepts)
-    verbatim_result = conn.execute("""
+    sentinel_placeholders = ", ".join(
+        "?" for _ in FTS_VERBATIM_SENTINEL_CONCEPT_IDS
+    )
+    verbatim_result = conn.execute(
+        f"""
         DELETE FROM fts_verbatim
         WHERE (
             concept_id IN (SELECT id FROM concepts)
@@ -1160,10 +1165,15 @@ def migrate_fts_parity_data064(conn):
             )
         )
         OR (
-            concept_id NOT IN (SELECT id FROM concepts)
-            AND concept_id NOT IN ('first_turn_orphan', 'orphan_verbatim')
+            (concept_id IS NULL OR concept_id NOT IN (SELECT id FROM concepts))
+            AND (
+                concept_id IS NULL
+                OR concept_id NOT IN ({sentinel_placeholders})
+            )
         )
-    """)
+        """,
+        FTS_VERBATIM_SENTINEL_CONCEPT_IDS,
+    )
     verbatim_cleaned = verbatim_result.rowcount
 
     conn.commit()

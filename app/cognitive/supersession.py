@@ -891,54 +891,14 @@ def execute_supersession(
     except Exception as ev_err:
         logger.warning("SUPER-012: evidence addition failed for %s: %s", old_concept_id, ev_err)
 
-    # MAINT-034: Robust index eviction with retry and ghost verification.
-    # Silent failures create ghost entries that pollute retrieval until restart.
-    from app.retrieval import retrieval_engine  # A2: Hoisted above retry loop
+    # MAINT-034 / MAINT-096: bounded exact-ID eviction and persisted verification.
+    from app.retrieval import evict_lifecycle_concept
 
-    _eviction_success = False
-    for _eviction_attempt in range(2):  # Max 2 attempts (original + 1 retry)
-        try:
-            retrieval_engine.remove_concept(old_concept_id, persist=True)
-            _eviction_success = True
-            logger.debug(
-                "MAINT-034: Evicted %s from retrieval index (attempt %d)",
-                old_concept_id,
-                _eviction_attempt + 1,
-            )
-            break
-        except Exception as idx_err:
-            if _eviction_attempt == 0:
-                logger.warning(
-                    "MAINT-034: Index eviction failed for %s (attempt 1, retrying): %s",
-                    old_concept_id,
-                    idx_err,
-                )
-            else:
-                logger.error(
-                    "MAINT-034: Index eviction FAILED for %s after 2 attempts — ghost entry remains: %s",
-                    old_concept_id,
-                    idx_err,
-                )
-
-    # MAINT-034: Ghost verification — confirm concept is no longer in index
-    if _eviction_success:
-        try:
-            if hasattr(retrieval_engine.index, "contains_active_concept"):
-                _still_in_index = retrieval_engine.index.contains_active_concept(old_concept_id)
-            else:
-                _idx = retrieval_engine.index.concept_id_to_idx.get(old_concept_id)
-                _deleted = getattr(retrieval_engine.index, "deleted_indices", set())
-                _still_in_index = _idx is not None and _idx not in _deleted
-            if _still_in_index:
-                logger.error(
-                    "MAINT-034: GHOST DETECTED — %s still in index after successful remove_concept()",
-                    old_concept_id,
-                )
-                _eviction_success = False
-        except Exception:
-            pass  # concept_id_to_idx may not exist on all index backends — skip verification
-
-    result.index_evicted = _eviction_success
+    result.index_evicted = evict_lifecycle_concept(
+        old_concept_id,
+        persist=True,
+        source="execute_supersession",
+    )
 
     # SUPER-013: Content carry-forward — transfer qualifying evidence from old→new
     EVIDENCE_CARRY_FORWARD_MIN_WEIGHT = 0.5

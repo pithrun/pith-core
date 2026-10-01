@@ -54,6 +54,7 @@ BINARY_EXTENSIONS = {
     ".jpeg",
     ".mov",
     ".mp4",
+    ".mcpb",
     ".pdf",
     ".png",
     ".so",
@@ -65,7 +66,9 @@ BINARY_EXTENSIONS = {
 
 ALLOWED_CHANGED_BINARY_PATHS = {
     "demo/demo.gif",
+    "integrations/claude-desktop-extension/pith-claude-1.0.7.mcpb",
     "pith-server-latest.tar.gz",
+    "pith-server-latest.zip",
 }
 
 PUBLIC_DOC_PATHS = {
@@ -79,11 +82,15 @@ PUBLIC_DOC_PATHS = {
 
 PUBLIC_INSTALLER_AND_RELEASE_PATHS = {
     "scripts/install.sh",
+    "scripts/install.ps1",
     "scripts/migrate_from_docker.sh",
     "scripts/configure_clients.py",
     "pith-server-latest.tar.gz",
     "pith-server-latest.sha256",
+    "pith-server-latest.zip",
+    "pith-server-latest.zip.sha256",
     "install.sh",
+    "install.ps1",
     ".github/workflows/release-validation.yml",
     ".github/scripts/public_safety_scan.py",
 }

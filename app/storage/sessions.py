@@ -5,6 +5,7 @@ Extracted from storage/__init__.py during Item 2b decomposition.
 """
 import json
 import logging
+import sqlite3
 
 import app.storage.connection as _conn
 from app.core.datetime_utils import _utc_now_iso
@@ -12,6 +13,100 @@ from app.storage.connection import read_snapshot_db
 from app.storage.utils import validate_agent_id
 
 logger = logging.getLogger(__name__)
+
+_MANAGED_MUTABLE_FIELDS = frozenset(
+    {
+        "concepts_created",
+        "concepts_evolved",
+        "data",
+        "last_learning_at",
+        "last_previous_response",
+        "learning_event_count",
+    }
+)
+_MANAGED_PROTECTED_FIELDS = frozenset(
+    {
+        "binding_generation",
+        "binding_hash",
+        "last_activity_at",
+        "lifecycle_phase",
+    }
+)
+_MANAGED_DENIAL_REASONS = frozenset(
+    {
+        "field_denied",
+        "generation_mismatch",
+        "permit_missing",
+    }
+)
+
+
+def _deny_managed_write(reason: str) -> None:
+    """Raise a typed denial and emit only bounded-cardinality telemetry."""
+
+    from app.storage.session_bindings import ManagedSessionWriteDenied
+
+    bounded_reason = reason if reason in _MANAGED_DENIAL_REASONS else "field_denied"
+    try:
+        from app.core.metrics_facade import metrics
+
+        metrics.record(
+            "managed_session_write_denied",
+            1.0,
+            labels={"reason": bounded_reason},
+        )
+    except Exception:
+        logger.debug("managed session write denial metric failed", exc_info=True)
+    raise ManagedSessionWriteDenied(f"managed session write denied: {bounded_reason}")
+
+
+def _authorize_managed_helper_update(
+    *,
+    binding_hash: str,
+    binding_generation: int,
+    fields: set[str],
+) -> None:
+    """Require exact episode authority for allowlisted non-lifecycle fields."""
+
+    from app.storage.session_bindings import current_managed_session_write_permit
+
+    if not fields <= _MANAGED_MUTABLE_FIELDS:
+        _deny_managed_write("field_denied")
+    permit = current_managed_session_write_permit()
+    if permit is None:
+        _deny_managed_write("permit_missing")
+    if (
+        permit.binding_hash != binding_hash
+        or permit.binding_generation != binding_generation
+    ):
+        _deny_managed_write("generation_mismatch")
+
+
+def _load_session_authority(
+    conn: sqlite3.Connection,
+    session_id: str,
+) -> tuple[object | None, bool]:
+    """Load managed authority, tolerating pre-migration legacy-only schemas."""
+
+    try:
+        return (
+            conn.execute(
+                "SELECT binding_hash, binding_generation FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone(),
+            True,
+        )
+    except sqlite3.OperationalError as exc:
+        if "no such column: binding_" not in str(exc).lower():
+            raise
+        return (
+            conn.execute(
+                "SELECT NULL, NULL FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone(),
+            False,
+        )
+
 
 def save_session(
     session_id: str,
@@ -70,14 +165,90 @@ def update_session(session_id: str, **kwargs) -> bool:
         "last_previous_response",  # SESSION-009: dropout recovery
     }
     updates = {k: v for k, v in kwargs.items() if k in allowed}
-    if not updates:
+    protected_fields = set(kwargs) & _MANAGED_PROTECTED_FIELDS
+    if not updates and not protected_fields:
         return False
 
     set_clause = ", ".join(f"{k} = ?" for k in updates)
-    values = list(updates.values()) + [session_id]
 
     with _conn._db() as conn:
-        cursor = conn.execute(f"UPDATE sessions SET {set_clause} WHERE id = ?", values)
+        row, managed_schema = _load_session_authority(conn, session_id)
+        if row is None:
+            return False
+        binding_hash = row[0]
+        binding_generation = row[1]
+        if binding_hash is None:
+            if not updates:
+                return False
+            legacy_predicate = " AND binding_hash IS NULL" if managed_schema else ""
+            cursor = conn.execute(
+                f"UPDATE sessions SET {set_clause} WHERE id = ?{legacy_predicate}",
+                [*updates.values(), session_id],
+            )
+        else:
+            try:
+                generation = int(binding_generation)
+            except (TypeError, ValueError):
+                _deny_managed_write("generation_mismatch")
+            _authorize_managed_helper_update(
+                binding_hash=str(binding_hash),
+                binding_generation=generation,
+                fields=set(updates) | protected_fields,
+            )
+            cursor = conn.execute(
+                f"""UPDATE sessions SET {set_clause}
+                    WHERE id = ? AND binding_hash = ? AND binding_generation = ?""",
+                [*updates.values(), session_id, binding_hash, generation],
+            )
+    return cursor.rowcount > 0
+
+
+def mark_session_reflection_completed(session_id: str, *, reflected_at: str) -> bool:
+    """Atomically merge the reflection marker under exact managed authority."""
+
+    with _conn._db() as conn:
+        authority_row, managed_schema = _load_session_authority(conn, session_id)
+        if authority_row is None:
+            return False
+        binding_hash = authority_row[0]
+        binding_generation = authority_row[1]
+        row = conn.execute(
+            "SELECT data FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        data: dict = {}
+        if row is not None and row[0]:
+            try:
+                loaded = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+                if isinstance(loaded, dict):
+                    data = loaded
+            except (json.JSONDecodeError, TypeError):
+                data = {}
+        data["reflection_completed"] = True
+        data["reflection_completed_at"] = reflected_at
+        serialized = json.dumps(data)
+
+        if binding_hash is None:
+            legacy_predicate = " AND binding_hash IS NULL" if managed_schema else ""
+            cursor = conn.execute(
+                f"UPDATE sessions SET data = ? WHERE id = ?{legacy_predicate}",
+                (serialized, session_id),
+            )
+        else:
+            try:
+                generation = int(binding_generation)
+            except (TypeError, ValueError):
+                _deny_managed_write("generation_mismatch")
+            _authorize_managed_helper_update(
+                binding_hash=str(binding_hash),
+                binding_generation=generation,
+                fields={"data"},
+            )
+            cursor = conn.execute(
+                """UPDATE sessions SET data = ?
+                   WHERE id = ? AND binding_hash = ? AND binding_generation = ?""",
+                (serialized, session_id, binding_hash, generation),
+            )
     return cursor.rowcount > 0
 
 
@@ -132,8 +303,31 @@ def record_session_learning_commit(
     learned_at = learned_at or _utc_now_iso()
     if learning_event_delta is None:
         learning_event_delta = concepts_created_delta + concepts_evolved_delta
-    where_clause = "WHERE id = ? AND status = 'active'" if require_active else "WHERE id = ?"
     with _conn._db() as conn:
+        authority_row, _managed_schema = _load_session_authority(conn, session_id)
+        if authority_row is None:
+            return None
+        binding_hash = authority_row[0]
+        binding_generation = authority_row[1]
+        where_clause = "WHERE id = ? AND status = 'active'" if require_active else "WHERE id = ?"
+        where_values: list[object] = [session_id]
+        if binding_hash is not None:
+            try:
+                generation = int(binding_generation)
+            except (TypeError, ValueError):
+                _deny_managed_write("generation_mismatch")
+            _authorize_managed_helper_update(
+                binding_hash=str(binding_hash),
+                binding_generation=generation,
+                fields={
+                    "concepts_created",
+                    "concepts_evolved",
+                    "learning_event_count",
+                    "last_learning_at",
+                },
+            )
+            where_clause += " AND binding_hash = ? AND binding_generation = ?"
+            where_values.extend((binding_hash, generation))
         cursor = conn.execute(
             f"""UPDATE sessions
                SET concepts_created = COALESCE(concepts_created, 0) + ?,
@@ -146,7 +340,7 @@ def record_session_learning_commit(
                 concepts_evolved_delta,
                 learning_event_delta,
                 learned_at,
-                session_id,
+                *where_values,
             ),
         )
         if cursor.rowcount <= 0:
@@ -248,13 +442,14 @@ def recover_interrupted_sessions(started_before: str | None = None) -> int:
         if started_before is not None:
             cursor = conn.execute(
                 "UPDATE sessions SET status = 'interrupted', ended_at = ? "
-                "WHERE status = 'active' AND started_at < ?",
+                "WHERE status = 'active' AND binding_hash IS NULL AND started_at < ?",
                 (now, started_before),
             )
         else:
             # Legacy path: interrupt ALL active sessions (backward compat)
             cursor = conn.execute(
-                "UPDATE sessions SET status = 'interrupted', ended_at = ? WHERE status = 'active'",
+                "UPDATE sessions SET status = 'interrupted', ended_at = ? "
+                "WHERE status = 'active' AND binding_hash IS NULL",
                 (now,),
             )
     count = cursor.rowcount

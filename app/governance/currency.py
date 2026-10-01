@@ -351,6 +351,23 @@ def determine_currency_status(
     return STATUS_ACTIVE
 
 
+def _prepare_currency_concept_data(
+    data_json: str | None,
+    content_updated_at: str | None,
+) -> dict:
+    """Parse stored concept data and apply the authoritative content timestamp."""
+    try:
+        parsed = json.loads(data_json) if data_json else {}
+    except (json.JSONDecodeError, TypeError):
+        parsed = {}
+
+    if not isinstance(parsed, dict):
+        raise ValueError("currency concept data must be a JSON object")
+    if content_updated_at:
+        parsed["content_updated_at"] = content_updated_at
+    return parsed
+
+
 def batch_compute_currency(conn: sqlite3.Connection, concept_ids: list[str] | None = None) -> int:
     """Recompute and cache currency scores for concepts.
 
@@ -363,19 +380,30 @@ def batch_compute_currency(conn: sqlite3.Connection, concept_ids: list[str] | No
     """
     now = _utc_now_iso()
 
-    if concept_ids:
+    requested = None if concept_ids is None else len(concept_ids)
+    if concept_ids is not None:
+        if not concept_ids:
+            logger.info("Currency batch recompute: requested=0 eligible=0 skipped_ineligible=0 updated=0")
+            return 0
         placeholders = ",".join("?" for _ in concept_ids)
         rows = conn.execute(
             f"""SELECT id, concept_type, last_accessed, knowledge_area,
                        currency_status, data, content_updated_at
-                FROM concepts WHERE id IN ({placeholders})""",
+                FROM concepts
+                WHERE id IN ({placeholders})
+                  AND status = 'active'
+                  AND is_current = 1
+                  AND (superseded_by IS NULL OR superseded_by = '')""",
             concept_ids,
         ).fetchall()
     else:
         rows = conn.execute(
             """SELECT id, concept_type, last_accessed, knowledge_area,
                       currency_status, data, content_updated_at
-               FROM concepts WHERE status != 'deleted'"""
+               FROM concepts
+               WHERE status = 'active'
+                 AND is_current = 1
+                 AND (superseded_by IS NULL OR superseded_by = '')"""
         ).fetchall()
 
     updated = 0
@@ -386,17 +414,7 @@ def batch_compute_currency(conn: sqlite3.Connection, concept_ids: list[str] | No
         karea = row[3]
         curr_status = row[4] or STATUS_ACTIVE
 
-        try:
-            cdata = json.loads(row[5]) if row[5] else {}
-        except (json.JSONDecodeError, TypeError):
-            cdata = {}
-
-        # Inject content_updated_at from SQL column into cdata dict.
-        # This column is NOT in the JSON blob (only top-level DB column),
-        # so it must be explicitly selected and injected for AR anchor.
-        # See: CURRENCY_AR_ANCHOR_DESIGN_v1.md §Change 2.5
-        if len(row) > 6 and row[6]:
-            cdata["content_updated_at"] = row[6]
+        cdata = _prepare_currency_concept_data(row[5], row[6])
 
         score = compute_currency_score(cid, ctype, cdata, last_acc, karea, conn)
         new_status = determine_currency_status(score, curr_status, concept_type=ctype)
@@ -415,5 +433,13 @@ def batch_compute_currency(conn: sqlite3.Connection, concept_ids: list[str] | No
         updated += 1
 
     conn.commit()
-    logger.info("Currency batch recompute: %d concepts updated", updated)
+    eligible = len(rows)
+    skipped_ineligible = 0 if requested is None else max(0, requested - eligible)
+    logger.info(
+        "Currency batch recompute: requested=%s eligible=%d skipped_ineligible=%d updated=%d",
+        "all_current" if requested is None else requested,
+        eligible,
+        skipped_ineligible,
+        updated,
+    )
     return updated

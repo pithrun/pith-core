@@ -766,7 +766,14 @@ def record_correction(
         for cid in affected_concept_ids:
             try:
                 # Read current data JSON to merge change_type into it
-                _row = conn.execute("SELECT data FROM concepts WHERE id = ? AND is_current = 1", (cid,)).fetchone()
+                _row = conn.execute(
+                    """SELECT data FROM concepts
+                       WHERE id = ?
+                         AND status = 'active'
+                         AND is_current = 1
+                         AND (superseded_by IS NULL OR superseded_by = '')""",
+                    (cid,),
+                ).fetchone()
                 if _row:
                     try:
                         _cdata = json.loads(_row[0]) if _row[0] else {}
@@ -777,19 +784,15 @@ def record_correction(
                         f"User correction detected (confidence={correction.detection_confidence:.2f})"
                     )
                     # KA-006: Route through write gateway for column sync
-                    from app.storage import update_concept_data
+                    from app.storage import apply_current_governance_currency_conn, update_concept_data
 
-                    update_concept_data(
-                        conn, cid, _cdata, extra_sets="currency_status = ?", extra_params=("CONTESTED",)
-                    )
-                else:
-                    # Concept not found — just try setting currency_status
-                    conn.execute(
-                        """UPDATE concepts
-                           SET currency_status = 'CONTESTED',
-                               updated_at = ?
-                           WHERE id = ?""",
-                        (now, cid),
+                    update_concept_data(conn, cid, _cdata)
+                    apply_current_governance_currency_conn(
+                        conn,
+                        cid,
+                        "CONTESTED",
+                        excluded_current_statuses=("CONTESTED", "CONTRADICTED"),
+                        now=now,
                     )
             except Exception as e:
                 logger.warning("Failed to mark concept %s as CONTESTED: %s", cid, e)
@@ -1213,4 +1216,3 @@ def queue_correction_evolution(
 
     except Exception as e:
         logger.warning("COGGOV-012: Correction evolution failed: %s", e)
-

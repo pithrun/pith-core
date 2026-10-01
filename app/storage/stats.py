@@ -7,14 +7,233 @@ Extracted from storage/__init__.py during Item 2b decomposition.
 import logging
 import math
 import sqlite3
+import time
+from collections.abc import Callable
 from contextlib import nullcontext
 from datetime import UTC
 
+from app.core.config import HEALTH_FRESHNESS_HALF_LIFE_DAYS
 from app.core.datetime_utils import _utc_now_iso
 from app.storage import concepts as _concepts_mod
 from app.storage.connection import diagnostic_read_db, read_snapshot_db
+from app.storage.utils import FTS_VERBATIM_SENTINEL_CONCEPT_IDS
 
 logger = logging.getLogger(__name__)
+
+
+def _health_freshness_expression() -> str:
+    return """
+        COALESCE(AVG(
+            exp(
+                (-ln(2.0) / ?) *
+                MAX(
+                    COALESCE(
+                        julianday('now') -
+                        julianday(COALESCE(NULLIF(last_organic_access, ''), NULLIF(last_accessed, ''), created_at)),
+                        0.0
+                    ),
+                    0.0
+                )
+            )
+        ), 0.0) AS freshness
+    """
+
+
+def _build_fast_health_federation_status(conn: sqlite3.Connection) -> dict | None:
+    table = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='federation_events'").fetchone()
+    if not table:
+        return None
+
+    row = conn.execute("""
+        SELECT
+            (SELECT COUNT(*) FROM federation_events WHERE created_at > datetime('now', '-24 hours')) AS recent_events,
+            (SELECT COUNT(*) FROM federation_events WHERE consumed = 0) AS unconsumed,
+            (SELECT COUNT(*) FROM federation_events) AS total_events
+    """).fetchone()
+    total_events = int(row["total_events"] or 0) if row else 0
+    unconsumed = int(row["unconsumed"] or 0) if row else 0
+    if total_events > 0 and unconsumed == total_events:
+        bridge_status = "no_consumer"
+    elif unconsumed >= 1000:
+        bridge_status = "backpressure"
+    elif unconsumed > 0:
+        bridge_status = "lagging"
+    else:
+        bridge_status = "healthy"
+    return {
+        "events_emitted_24h": int(row["recent_events"] or 0) if row else 0,
+        "events_unconsumed": unconsumed,
+        "events_total": total_events,
+        "bridge_status": bridge_status,
+        "bridge_healthy": bridge_status in ("healthy", "lagging"),
+    }
+
+
+def _run_bounded_fts_parity(
+    conn: sqlite3.Connection | None,
+    *,
+    budget_ms: int,
+    label: str,
+    collect: Callable[[sqlite3.Connection], dict],
+) -> dict:
+    """Run one parity section under a shared SQLite progress deadline."""
+    started = time.perf_counter()
+    safe_budget_ms = max(1, int(budget_ms))
+    deadline = started + safe_budget_ms / 1000
+
+    def _progress_timeout() -> int:
+        return 1 if time.perf_counter() > deadline else 0
+
+    context = nullcontext(conn) if conn is not None else diagnostic_read_db(label)
+    with context as active_conn:
+        try:
+            active_conn.set_progress_handler(_progress_timeout, 100000)
+            result = collect(active_conn)
+        except sqlite3.OperationalError as err:
+            if "interrupted" not in str(err).lower():
+                raise
+            return {
+                "status": "unavailable",
+                "error": "budget_exceeded",
+                "budget_ms": safe_budget_ms,
+                "elapsed_ms": round((time.perf_counter() - started) * 1000, 3),
+            }
+        finally:
+            active_conn.set_progress_handler(None, 0)
+
+    result["budget_ms"] = safe_budget_ms
+    result["elapsed_ms"] = round((time.perf_counter() - started) * 1000, 3)
+    return result
+
+
+def get_fts_concepts_parity(
+    conn: sqlite3.Connection | None = None,
+    *,
+    budget_ms: int = 1000,
+) -> dict:
+    """Return exact, bounded active/current concept FTS membership parity."""
+
+    def _collect(active_conn: sqlite3.Connection) -> dict:
+        canonical_count = active_conn.execute(
+            "SELECT COUNT(*) FROM concepts WHERE status = 'active' AND is_current = 1"
+        ).fetchone()[0]
+        fts_count = active_conn.execute("SELECT COUNT(*) FROM fts_concepts_content").fetchone()[0]
+        missing_count = active_conn.execute("""
+            SELECT COUNT(*) FROM (
+                SELECT id FROM concepts WHERE status = 'active' AND is_current = 1
+                EXCEPT
+                SELECT c0 FROM fts_concepts_content
+            )
+        """).fetchone()[0]
+        extra_count = active_conn.execute("""
+            SELECT COUNT(*) FROM (
+                SELECT c0 FROM fts_concepts_content
+                EXCEPT
+                SELECT id FROM concepts WHERE status = 'active' AND is_current = 1
+            )
+        """).fetchone()[0]
+        duplicate_count = active_conn.execute("""
+            SELECT COALESCE(SUM(row_count - 1), 0)
+            FROM (
+                SELECT c0, COUNT(*) AS row_count
+                FROM fts_concepts_content
+                GROUP BY c0
+                HAVING COUNT(*) > 1
+            )
+        """).fetchone()[0]
+        defects = int(missing_count) + int(extra_count) + int(duplicate_count)
+        return {
+            "canonical_count": int(canonical_count),
+            "fts_count": int(fts_count),
+            "missing_count": int(missing_count),
+            "extra_count": int(extra_count),
+            "duplicate_count": int(duplicate_count),
+            "drift_pct": round(min(100.0, 100 * defects / max(int(canonical_count), 1)), 1),
+            "status": "healthy" if defects == 0 else "degraded",
+        }
+
+    return _run_bounded_fts_parity(
+        conn,
+        budget_ms=budget_ms,
+        label="fts_concepts_parity",
+        collect=_collect,
+    )
+
+
+def get_fts_verbatim_parity(
+    conn: sqlite3.Connection | None = None,
+    *,
+    budget_ms: int = 1000,
+) -> dict:
+    """Return exact, bounded current-conversation verbatim FTS parity."""
+    sentinels = FTS_VERBATIM_SENTINEL_CONCEPT_IDS
+
+    def _collect(active_conn: sqlite3.Connection) -> dict:
+        canonical_sql = """
+            SELECT vf.id
+            FROM verbatim_fragments vf
+            JOIN concepts c ON c.id = vf.concept_id
+            WHERE vf.fragment_type = 'conversation'
+              AND vf.content IS NOT NULL
+              AND c.status = 'active'
+              AND c.is_current = 1
+        """
+        non_sentinel = "(c1 IS NULL OR c1 NOT IN (?, ?))"
+        canonical_count = active_conn.execute(
+            f"SELECT COUNT(*) FROM ({canonical_sql})"
+        ).fetchone()[0]
+        fts_count = active_conn.execute(
+            f"SELECT COUNT(*) FROM fts_verbatim_content WHERE {non_sentinel}",
+            sentinels,
+        ).fetchone()[0]
+        missing_count = active_conn.execute(
+            f"""SELECT COUNT(*) FROM (
+                    {canonical_sql}
+                    EXCEPT
+                    SELECT c0 FROM fts_verbatim_content
+                )"""
+        ).fetchone()[0]
+        extra_count = active_conn.execute(
+            f"""SELECT COUNT(*) FROM (
+                    SELECT c0 FROM fts_verbatim_content WHERE {non_sentinel}
+                    EXCEPT
+                    {canonical_sql}
+                )""",
+            sentinels,
+        ).fetchone()[0]
+        duplicate_count = active_conn.execute(
+            f"""SELECT COALESCE(SUM(row_count - 1), 0)
+                FROM (
+                    SELECT c0, COUNT(*) AS row_count
+                    FROM fts_verbatim_content
+                    WHERE {non_sentinel}
+                    GROUP BY c0
+                    HAVING COUNT(*) > 1
+                )""",
+            sentinels,
+        ).fetchone()[0]
+        sentinel_count = active_conn.execute(
+            "SELECT COUNT(*) FROM fts_verbatim_content WHERE c1 IN (?, ?)",
+            sentinels,
+        ).fetchone()[0]
+        defects = int(missing_count) + int(extra_count) + int(duplicate_count)
+        return {
+            "canonical_count": int(canonical_count),
+            "fts_count": int(fts_count),
+            "missing_count": int(missing_count),
+            "extra_count": int(extra_count),
+            "duplicate_count": int(duplicate_count),
+            "sentinel_count": int(sentinel_count),
+            "drift_pct": round(min(100.0, 100 * defects / max(int(canonical_count), 1)), 1),
+            "status": "healthy" if defects == 0 else "degraded",
+        }
+
+    return _run_bounded_fts_parity(
+        conn,
+        budget_ms=budget_ms,
+        label="fts_verbatim_parity",
+        collect=_collect,
+    )
 
 
 def get_pith_stats_fast(conn: sqlite3.Connection | None = None) -> dict:
@@ -60,24 +279,39 @@ def get_pith_health_fast(conn: sqlite3.Connection | None = None) -> dict:
     """Bounded cognitive health summary for default status surfaces."""
     context = nullcontext(conn) if conn is not None else diagnostic_read_db("pith_health_fast")
     with context as conn:
-        row = conn.execute("""
+        row = conn.execute(
+            f"""
             SELECT
                 COUNT(*) as total_concepts,
                 COALESCE(AVG(confidence), 0.0) as avg_confidence,
                 COALESCE(AVG(stability), 0.0) as avg_stability,
-                SUM(CASE WHEN maturity = 'ESTABLISHED' THEN 1 ELSE 0 END) as established_count
+                SUM(CASE WHEN maturity = 'ESTABLISHED' THEN 1 ELSE 0 END) as established_count,
+                {_health_freshness_expression()}
             FROM concepts
             WHERE status = 'active'
+        """,
+            (max(0.1, HEALTH_FRESHNESS_HALF_LIFE_DAYS),),
+        ).fetchone()
+        orphan_row = conn.execute("""
+            SELECT COUNT(*) as cnt FROM concepts c
+            WHERE c.status = 'active'
+              AND NOT EXISTS (
+                SELECT 1 FROM associations a WHERE a.source = c.id OR a.target = c.id
+              )
         """).fetchone()
+        federation_status = _build_fast_health_federation_status(conn)
 
     total = row["total_concepts"] if row else 0
     avg_confidence = float(row["avg_confidence"] or 0.0) if row else 0.0
     avg_stability = float(row["avg_stability"] or 0.0) if row else 0.0
     established = int(row["established_count"] or 0) if row else 0
     maturity_health = established / max(total, 1)
+    orphan_count = int(orphan_row["cnt"] or 0) if orphan_row else 0
+    connectivity = (total - orphan_count) / max(total, 1)
+    freshness = float(row["freshness"] or 0.0) if row else 0.0
     health_score = round(0.4 * avg_confidence + 0.4 * avg_stability + 0.2 * maturity_health, 4)
 
-    return {
+    payload = {
         "status": "healthy" if total else "empty",
         "score_model": "fast_v1",
         "health_score": health_score,
@@ -87,7 +321,19 @@ def get_pith_health_fast(conn: sqlite3.Connection | None = None) -> dict:
         "avg_stability": round(avg_stability, 4),
         "established_concepts": established,
         "maturity_health": round(maturity_health, 4),
+        "health_factors_model": "observability_v1",
+        "health_factors_population": "active",
+        "health_factors": {
+            "confidence": round(avg_confidence, 4),
+            "stability": round(avg_stability, 4),
+            "maturity": round(maturity_health, 4),
+            "connectivity": round(connectivity, 4),
+            "freshness": round(freshness, 4),
+        },
     }
+    if federation_status is not None:
+        payload["federation_status"] = federation_status
+    return payload
 
 
 def _pct(part: int | float | None, total: int | float | None) -> float:
@@ -219,7 +465,9 @@ def _build_currency_health(conn: sqlite3.Connection) -> dict:
             "contradicted_pct": contradicted_pct,
         },
         "recompute_freshness": {
-            "status": "CRITICAL" if recompute_older_7d_pct > 5.0 else ("DEGRADED" if recompute_older_7d > 0 else "HEALTHY"),
+            "status": "CRITICAL"
+            if recompute_older_7d_pct > 5.0
+            else ("DEGRADED" if recompute_older_7d > 0 else "HEALTHY"),
             "older_than_24h": active_row["recompute_older_24h"] or 0,
             "older_than_7d": recompute_older_7d,
         },
@@ -313,7 +561,9 @@ def compute_concept_integrity(conn: sqlite3.Connection) -> dict:
             COUNT(*) as total_active,
             SUM(CASE WHEN json_valid(data) AND json_extract(data, '$.metadata.is_factual') = 1
                 THEN 1 ELSE 0 END) as factual_count,
-            SUM(CASE WHEN valid_from IS NOT NULL AND valid_from != ''
+            SUM(CASE WHEN json_valid(data)
+                AND json_extract(data, '$.metadata.is_factual') = 1
+                AND valid_from IS NOT NULL AND valid_from != ''
                 THEN 1 ELSE 0 END) as has_valid_from
         FROM concepts
         WHERE status = 'active' AND is_current = 1

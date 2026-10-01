@@ -6,6 +6,7 @@ are preserved without requiring a client upgrade.
 from __future__ import annotations
 
 from typing import Any, Optional
+
 from pydantic import BaseModel, Field
 
 
@@ -71,6 +72,7 @@ class ConversationTurnResponse(_PithModel):
     """Full response from conversation_turn."""
     activated_concepts: list[Concept] = Field(default_factory=list)
     activation_count: int = 0
+    request_id: Optional[str] = None
     bind_status: Optional[str] = None
     binding_source: Optional[str] = None
     resolved_session_id: Optional[str] = None
@@ -87,6 +89,8 @@ class ConversationTurnResponse(_PithModel):
     context_freshness_decision: Optional[dict[str, Any]] = None
     retrieval_policy_trace: Optional[dict[str, Any]] = None
     context_resolution_summary: Optional[dict[str, Any]] = None
+    chain_answer: Optional[str] = None
+    chain_answer_diagnostics: Optional[dict[str, Any]] = None
     processing_time_ms: float = 0.0
 
 

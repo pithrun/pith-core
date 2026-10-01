@@ -38,7 +38,7 @@ FEATURE_FLAGS = {
     # Phase 2 — Temporal + Epistemic (ENABLED — Phase 2 implementation complete)
     "EPISTEMIC_CAPS_ENABLED": True,  # Epistemic authority caps
     "T1_RETROACTIVE_REFLECTION_ENABLED": False,  # REFLECT-021: disabled, 0/13 productive cycles
-    "T3_SESSION_END_REFLECTION_ENABLED": False,   # REFLECT-021: disabled, 0/21 productive cycles
+    "T3_SESSION_END_REFLECTION_ENABLED": False,  # REFLECT-021: disabled, 0/21 productive cycles
     "NONLOSSY_EVOLUTION_ENABLED": True,  # Non-lossy invalidation
     "TEMPORAL_CURRENCY_ENABLED": True,  # Temporal decay
     "EPISODES_ENABLED": True,  # Episode recording
@@ -63,7 +63,7 @@ FEATURE_FLAGS = {
     "CONTEXT_PRIORITY_HINTS_ENABLED": True,  # CTX Phase 1: Priority metadata on activated concepts
     "COMPACTION_DETECTION_ENABLED": True,  # CTX Phase 2: Heuristic compaction detection + re-injection
     "COMPACTION_SURVIVAL_FORMAT": True,  # CTX Phase 3: Structured tags for compaction survival (enabled Sprint 23E — 12-event baseline sufficient)
-    "AUTO_CHECKPOINT_ENABLED": True,   # SESSION-004: Auto-save checkpoint at URGE+ context pressure and compaction
+    "AUTO_CHECKPOINT_ENABLED": True,  # SESSION-004: Auto-save checkpoint at URGE+ context pressure and compaction
     "WORKING_CONTEXT_ENABLED": True,  # CONTEXT-001: Structured working context every turn
     # Phase 4 — Memory Integrity Phase 4 (P4-PREREQ + P4a/b/c)
     "CONSTRAINT_ASSEMBLY_ENABLED": True,  # P4-PREREQ: Enable constraint_set population
@@ -83,9 +83,9 @@ FEATURE_FLAGS = {
     # Currency Actuator — Signal→Action gap fix (CURRENCY_STATUS_ACTUATOR_SPEC)
     "CURRENCY_ACTUATOR_ENABLED": True,  # Phase 2.8: currency_status → status actuator sweep
     # Dynamic Knowledge Areas (KA-ARCH-001)
-    "DYNAMIC_KA_ENABLED": True,         # Gates provisional KA creation in normalize_knowledge_area
-    "KA_AUTO_BOOST_ENABLED": False,     # Gates auto-inference KA boost in search_lightweight + _apply_ka_boost
-    "KA_CROSS_SESSION_SUPPLEMENT": True, # RETRIEVAL-032: KA-scoped supplement for cross-session coverage
+    "DYNAMIC_KA_ENABLED": True,  # Gates provisional KA creation in normalize_knowledge_area
+    "KA_AUTO_BOOST_ENABLED": False,  # Gates auto-inference KA boost in search_lightweight + _apply_ka_boost
+    "KA_CROSS_SESSION_SUPPLEMENT": True,  # RETRIEVAL-032: KA-scoped supplement for cross-session coverage
     "QUERY_INTENT_EXPANSION_ENABLED": True,  # Retrieval-only alias/query expansion
     "QUERY_INTENT_RESCUE_ENABLED": True,  # Sparse-result re-query with expanded variants
     "QUERY_INTENT_TRACE_ENABLED": True,  # Trace matched aliases/variants in retrieval diagnostics
@@ -135,6 +135,7 @@ FEATURE_FLAGS = {
     "AUTOMATIC_FRESHNESS_SUPERSESSION_UX_ENABLED": True,  # SUPER-018: read-time stale/superseded context annotation
     "LIFECYCLE_AWARE_STALENESS_FILTER_ENABLED": True,  # RETRIEVAL-150: S5.5 preserves lifecycle-current/caution context
     "CONTEXT_RESOLUTION_SUMMARY_ENABLED": True,  # SUPER-020: response-level trust/currentness summary
+    "AUTHORITY_CHAIN_ANSWER_ENABLED": True,  # Authority Chain v1: deterministic launch/public-copy answer synthesis
     "SUPERSESSION_CHAIN_RESCUE_ENABLED": False,  # Exact superseded-ID current-head admission rescue
     "SUPERSESSION_CHAIN_CANDIDATE_RESCUE_ENABLED": False,  # SUPER-019: bounded candidate-backed supersession arbitration
     "SUPERSESSION_CHAIN_SUBJECT_RESCUE_ENABLED": False,  # RETRIEVAL-133: natural-language lifecycle-chain candidate discovery
@@ -151,10 +152,10 @@ FEATURE_FLAGS = {
     "COMMAND_PRODUCER_FOREGROUND_APPEND_ENABLED": False,
     "COMMAND_LOG_STRESS_MODE": False,
     # COGGOV-006/007/008: Auto-correction pipeline (DISABLED — E2E test revealed data corruption bugs)
-    "COGGOV_006_AI_SELF_CORRECTION": True,   # Layer 5 detection is safe (corroboration only, 0.65 cap)
+    "COGGOV_006_AI_SELF_CORRECTION": True,  # Layer 5 detection is safe (corroboration only, 0.65 cap)
     "COGGOV_007_CORRECTION_EVOLUTION": True,  # COGGOV-012 D+a: zero-extraction, evidence-append only. Safe.
     "COGGOV_013_CORRECTION_SUPERSESSION": True,  # COGGOV-013: correction-triggered supersession. Enabled Day 1 rollout.
-    "COGGOV_008_SESSION_INJECTION": False,    # Disabled pending 007 fix — injection without safe evolution is risk
+    "COGGOV_008_SESSION_INJECTION": False,  # Disabled pending 007 fix — injection without safe evolution is risk
     # INGEST-057: Cosine-gated summary replacement in evolve path
     # Phase 1 rollout: OFF (canary). Enable after histogram calibration of thresholds.
     "REPLACEMENT_GATE_ENABLED": False,
@@ -262,12 +263,15 @@ def _env_float_clamped(name: str, *, default: float, low: float, high: float) ->
 
 def get_feedback_db_lock_timeout_s() -> float:
     """Short optional-write DB lock budget for feedback persistence."""
-    return _env_int_clamped(
-        "PITH_FEEDBACK_DB_LOCK_TIMEOUT_MS",
-        default=50,
-        low=0,
-        high=30000,
-    ) / 1000.0
+    return (
+        _env_int_clamped(
+            "PITH_FEEDBACK_DB_LOCK_TIMEOUT_MS",
+            default=50,
+            low=0,
+            high=30000,
+        )
+        / 1000.0
+    )
 
 
 def get_feedback_db_slow_log_ms() -> int:
@@ -305,22 +309,28 @@ def get_autolearn_maintenance_sync_drain_enabled() -> bool:
 
 def get_autolearn_maintenance_enqueue_timeout_s() -> float:
     """Short optional-write DB lock budget for maintenance enqueue."""
-    return _env_int_clamped(
-        "PITH_AUTOLEARN_MAINTENANCE_ENQUEUE_TIMEOUT_MS",
-        default=50,
-        low=0,
-        high=30000,
-    ) / 1000.0
+    return (
+        _env_int_clamped(
+            "PITH_AUTOLEARN_MAINTENANCE_ENQUEUE_TIMEOUT_MS",
+            default=50,
+            low=0,
+            high=30000,
+        )
+        / 1000.0
+    )
 
 
 def get_autolearn_subject_key_timeout_s() -> float:
     """Short optional-write DB lock budget for inline subject-key dedup."""
-    return _env_int_clamped(
-        "PITH_AUTOLEARN_SUBJECT_KEY_TIMEOUT_MS",
-        default=50,
-        low=0,
-        high=30000,
-    ) / 1000.0
+    return (
+        _env_int_clamped(
+            "PITH_AUTOLEARN_SUBJECT_KEY_TIMEOUT_MS",
+            default=50,
+            low=0,
+            high=30000,
+        )
+        / 1000.0
+    )
 
 
 def get_autolearn_maintenance_batch_size() -> int:
@@ -427,6 +437,7 @@ def get_autolearn_maintenance_supervisor_max_wall_seconds() -> int:
 # Tier 0 = No LLM (no API key), Tier 1 = Commodity (Haiku), Tier 2 = Frontier (opt-in)
 # =============================================================================
 
+
 def get_llm_tier() -> int:
     """Detect available LLM tier from environment.
 
@@ -492,8 +503,12 @@ MIN_EVIDENCE_CHANGE = 1
 # Phase A4 calibration may adjust these values.
 # Override via env vars for benchmarking (defaults preserve production behaviour).
 EMBEDDING_SKIP_THRESHOLD = float(os.environ.get("PITH_EMBEDDING_SKIP_THRESHOLD", "0.85"))  # Near-duplicate: skip
-EMBEDDING_EVOLVE_THRESHOLD = float(os.environ.get("PITH_EMBEDDING_EVOLVE_THRESHOLD", "0.55"))  # Related/paraphrase: evolve
-CROSS_KA_EVOLVE_THRESHOLD = float(os.environ.get("PITH_CROSS_KA_EVOLVE_THRESHOLD", "0.75"))  # INGEST-007: Cross-KA merge guard
+EMBEDDING_EVOLVE_THRESHOLD = float(
+    os.environ.get("PITH_EMBEDDING_EVOLVE_THRESHOLD", "0.55")
+)  # Related/paraphrase: evolve
+CROSS_KA_EVOLVE_THRESHOLD = float(
+    os.environ.get("PITH_CROSS_KA_EVOLVE_THRESHOLD", "0.75")
+)  # INGEST-007: Cross-KA merge guard
 
 # INGEST-057: Cosine-gated replacement thresholds for evolve-path summary replacement.
 # Tier 1 (>= STRONG): full "newest wins" replacement authority.
@@ -576,7 +591,9 @@ QUARANTINE_RELEASE_AGE_DAYS = 7
 QUARANTINE_RELEASE_CAP = 200  # Max releases per reflection cycle (raised from 50, EVIDENCE_QUARANTINE_SPEC Fix 2)
 
 # Temporal promotion settings (MATURITY-003 Part D)
-TEMPORAL_MATURITY_AGE_DAYS = 14  # MATURITY-005: Lowered from 30d — was dead gate, only 1/812 provisionals ever reached 30d
+TEMPORAL_MATURITY_AGE_DAYS = (
+    14  # MATURITY-005: Lowered from 30d — was dead gate, only 1/812 provisionals ever reached 30d
+)
 TEMPORAL_MATURITY_MIN_EVIDENCE = 1
 TEMPORAL_MATURITY_MIN_ACCESS = 3
 TEMPORAL_MATURITY_RECENCY_DAYS = 30  # MATURITY-004: Widened from 14d (was dead intersection with 30d age gate)
@@ -643,7 +660,9 @@ CASCADE_CORRECTION_THRESHOLD = -0.3  # Confidence drop to trigger cascade
 CASCADE_SUPERSESSION_MAGNITUDE = 0.5  # Default magnitude for supersession cascades
 CASCADE_MAX_DEMOTE = 0.15  # A5: Max per-concept confidence reduction from cascade
 CASCADE_ALERT_THRESHOLD = 100  # NITS-001: cascade_alert fires when count exceeds this
-CIRCUIT_BREAKER_ALERT_THRESHOLD = 10  # MONITOR-072: cb_alert fires when trip count exceeds this (per dashboard query window)
+CIRCUIT_BREAKER_ALERT_THRESHOLD = (
+    10  # MONITOR-072: cb_alert fires when trip count exceeds this (per dashboard query window)
+)
 
 # CASCADE-001: Positive Reinforcement Thresholds and Limits
 REINFORCEMENT_ENABLED = True  # Feature flag for positive cascade
@@ -666,6 +685,8 @@ EDGE_LLM_MODEL = "claude-haiku-4-5-20251001"  # Anthropic direct (NOT migrated t
 
 # PERF-001: Tier 3 LLM extraction
 TIER3_LLM_MODEL = "google/gemini-2.0-flash-001"  # COST-001: switched from Anthropic direct to OpenRouter
+# MAINT-101: Maintenance must not depend on a retired provider endpoint.
+MAINTENANCE_LLM_MODEL = os.environ.get("PITH_MAINTENANCE_LLM_MODEL", "google/gemini-2.5-flash-lite")
 TIER3_MAX_CONCEPTS_PER_CALL = 3  # Cap LLM output to prevent flooding
 TIER3_MIN_CONVERSATION_LENGTH = 200  # Skip short exchanges (< ~50 words)
 TIER3_COOLDOWN_SECONDS = 10  # Minimum interval between Tier 3 calls
@@ -704,7 +725,9 @@ KA_LLM_TIMEOUT_MS = 3000  # Generous for batch processing (not hot path)
 KA_LLM_CONFIDENCE_THRESHOLD = 0.65  # Slightly lower than edge (0.7) — KA is simpler (24-way vs 10-way)
 # DEBT-113: KA_LLM_BATCH_SIZE removed — unused (TaskConfig uses its own batch_size)
 KA_LLM_MAX_PER_RUN = 25  # STABILITY-013: Reduced from 100 (backlog burn-down complete). 25 is sufficient for steady-state (~5-10 new concepts/session)
-KA_PROVISIONAL_MAX = 200  # EUNOMIA-007/A5: Circuit breaker — disable DYNAMIC_KA_ENABLED when provisional KA count exceeds this threshold
+KA_PROVISIONAL_MAX = (
+    200  # EUNOMIA-007/A5: Circuit breaker — disable DYNAMIC_KA_ENABLED when provisional KA count exceeds this threshold
+)
 
 # =============================================================================
 # Phase 3 — Drift Detection (WS2)
@@ -810,10 +833,10 @@ CURRENCY_HALF_LIFE_DEFAULT = 30  # Fallback for unknown types
 # These override CURRENCY_HALF_LIVES when is_factual=true in the data blob.
 # Identity/relational facts rarely change; role/activity facts change more often.
 FACTUAL_TEMPORAL_HALF_LIVES = {
-    "identity": 365,    # Name, nationality, age — very durable
+    "identity": 365,  # Name, nationality, age — very durable
     "relational": 365,  # Family, relationships — durable social facts
-    "role": 120,        # Job, employer, title — changes ~annually
-    "activity": 45,     # Hobbies, projects, current work — changes often
+    "role": 120,  # Job, employer, title — changes ~annually
+    "activity": 45,  # Hobbies, projects, current work — changes often
 }
 
 # Currency score component weights (must sum to 1.0)
@@ -838,7 +861,9 @@ assert abs(_currency_weight_sum - 1.0) < 0.001, f"CURRENCY_*_WEIGHT values must 
 # =============================================================================
 
 PIN_BUDGET = 10  # Max always-activate concepts (10 x ~50 tokens = ~500 tokens)
-CONTEXT_BUDGET_MAIN = int(os.environ.get("PITH_CONTEXT_BUDGET_MAIN", 40))  # Primary context allocation (raised from 20 per RETRIEVAL-058)
+CONTEXT_BUDGET_MAIN = int(
+    os.environ.get("PITH_CONTEXT_BUDGET_MAIN", 40)
+)  # Primary context allocation (raised from 20 per RETRIEVAL-058)
 CONTEXT_BUDGET_SHADOW = 3  # Shadow expansion (graph walk + association)
 OVERFLOW_SUMMARY_MAX = 5  # Max concepts summarized in overflow (noise control)
 
@@ -896,6 +921,7 @@ VACUUM_FREELIST_THRESHOLD_PAGES = 5000  # MAINT-039: run full VACUUM when freeli
 # All defaults are production-safe (False/off). The from_env() factory reads
 # env vars for backward compatibility with existing benchmark scripts.
 
+
 @dataclass(frozen=True)
 class BenchmarkIngestionMode:
     """Benchmark-specific ingestion bypass configuration.
@@ -906,6 +932,7 @@ class BenchmarkIngestionMode:
     SAFETY: All defaults are production-safe (False/off). Construct via
     from_env() to read environment variables, or pass explicit values.
     """
+
     enabled: bool = False
 
     # BENCHMARK-001: Skip garbage detection.
@@ -963,25 +990,19 @@ class BenchmarkIngestionMode:
         if not enabled:
             return cls()  # all defaults = production-safe
 
-        skip_dedup = os.environ.get(
-            "PITH_BENCHMARK_DEDUP_BYPASS",
-            os.environ.get("PITH_BENCHMARK_MODE", "false")
-        ).lower() == "true"
+        skip_dedup = (
+            os.environ.get("PITH_BENCHMARK_DEDUP_BYPASS", os.environ.get("PITH_BENCHMARK_MODE", "false")).lower()
+            == "true"
+        )
 
-        allow_contradictions = os.environ.get(
-            "PITH_BENCHMARK_ALLOW_CONTRADICTIONS", "false"
-        ).lower() == "true"
+        allow_contradictions = os.environ.get("PITH_BENCHMARK_ALLOW_CONTRADICTIONS", "false").lower() == "true"
 
         # PARITY: write-contra bypass defaults to "false", NOT to BENCHMARK_MODE.
         # This matches original line 8913 behavior. In practice, all benchmark
         # .env files explicitly set PITH_BENCHMARK_DEDUP_BYPASS, so this
         # inconsistency with skip_dedup never manifests.
-        skip_write_contradictions = os.environ.get(
-            "PITH_BENCHMARK_DEDUP_BYPASS", "false"
-        ).lower() == "true"
-        cap_debug_logging = os.environ.get(
-            "PITH_BENCHMARK_CAP_DEBUG", "true"
-        ).lower() == "true"
+        skip_write_contradictions = os.environ.get("PITH_BENCHMARK_DEDUP_BYPASS", "false").lower() == "true"
+        cap_debug_logging = os.environ.get("PITH_BENCHMARK_CAP_DEBUG", "true").lower() == "true"
 
         return cls(
             enabled=True,
@@ -1008,7 +1029,9 @@ BENCHMARK = BenchmarkIngestionMode.from_env()
 BENCHMARK_READONLY = os.environ.get("PITH_BENCHMARK_READONLY", "false").lower() == "true"
 BENCHMARK_DISABLE_EVOLVE = os.environ.get("PITH_DISABLE_EVOLVE", "false").lower() == "true"
 
-AUTOLEARN_BUDGET_MS = int(os.environ.get("PITH_AUTOLEARN_BUDGET_MS", str(BENCHMARK.autolearn_budget_ms)))  # ARCH-D03/D06/PERF-036: Base time budget.
+AUTOLEARN_BUDGET_MS = int(
+    os.environ.get("PITH_AUTOLEARN_BUDGET_MS", str(BENCHMARK.autolearn_budget_ms))
+)  # ARCH-D03/D06/PERF-036: Base time budget.
 AUTOLEARN_PER_INSIGHT_BUDGET_MS = int(os.environ.get("PITH_AUTOLEARN_PER_INSIGHT_MS", "2000"))
 AUTOLEARN_MAX_BUDGET_MS = int(os.environ.get("PITH_AUTOLEARN_MAX_BUDGET_MS", "15000"))
 AUTOLEARN_WALL_BUDGET_MS = int(os.environ.get("PITH_AUTOLEARN_WALL_BUDGET_MS", str(AUTOLEARN_MAX_BUDGET_MS)))
@@ -1017,9 +1040,11 @@ SESSION_LEARN_PROCESSING_RETRY_AFTER_SECONDS = float(
     os.environ.get("PITH_SESSION_LEARN_PROCESSING_RETRY_AFTER_SECONDS", "2.0")
 )
 SESSION_LEARN_EXECUTOR_WORKERS = int(os.environ.get("PITH_SESSION_LEARN_EXECUTOR_WORKERS", "1"))
-SESSION_LEARN_LIFECYCLE_JOBS_ENABLED = os.environ.get(
-    "PITH_SESSION_LEARN_LIFECYCLE_JOBS_ENABLED", "false"
-).lower() in {"1", "true", "yes"}
+SESSION_LEARN_LIFECYCLE_JOBS_ENABLED = os.environ.get("PITH_SESSION_LEARN_LIFECYCLE_JOBS_ENABLED", "false").lower() in {
+    "1",
+    "true",
+    "yes",
+}
 
 # ARCH-D05: Periodic KA promotion interval (minutes).
 # Promotion runs as background task in conversation_turn, not just session_end.
@@ -1039,23 +1064,27 @@ KA_PROMOTION_INTERVAL_MINUTES = int(os.environ.get("PITH_KA_PROMOTION_INTERVAL_M
 # Budget taken from similarity (was 0.56). Set to 0.0 to disable.
 RETRIEVAL_WEIGHT_RECENCY = float(os.environ.get("PITH_RETRIEVAL_WEIGHT_RECENCY", "0.10"))
 RETRIEVAL_RECENCY_HALF_LIFE_DAYS = float(os.environ.get("PITH_RETRIEVAL_RECENCY_HALF_LIFE_DAYS", "30"))
-AUTHORITY_ARTIFACT_BOOST_ENABLED = os.environ.get(
-    "PITH_AUTHORITY_ARTIFACT_BOOST_ENABLED", "true"
-).lower() in ("true", "1", "yes")
-AUTHORITY_ARTIFACT_BOOST_WEIGHT = float(os.environ.get(
-    "PITH_AUTHORITY_ARTIFACT_BOOST_WEIGHT", "0.18"
-))
+AUTHORITY_ARTIFACT_BOOST_ENABLED = os.environ.get("PITH_AUTHORITY_ARTIFACT_BOOST_ENABLED", "true").lower() in (
+    "true",
+    "1",
+    "yes",
+)
+AUTHORITY_ARTIFACT_BOOST_WEIGHT = float(os.environ.get("PITH_AUTHORITY_ARTIFACT_BOOST_WEIGHT", "0.18"))
 assert 0.0 <= AUTHORITY_ARTIFACT_BOOST_WEIGHT <= 0.3, (
-    "AUTHORITY_ARTIFACT_BOOST_WEIGHT must be [0.0, 0.3], "
-    f"got {AUTHORITY_ARTIFACT_BOOST_WEIGHT}"
+    f"AUTHORITY_ARTIFACT_BOOST_WEIGHT must be [0.0, 0.3], got {AUTHORITY_ARTIFACT_BOOST_WEIGHT}"
 )
 
-RETRIEVAL_WEIGHT_SIMILARITY = max(0.0, (
-    0.56 - RETRIEVAL_WEIGHT_RECENCY  # RETRIEVAL-100: Auto-adjusts when recency weight changes
-))
+RETRIEVAL_WEIGHT_SIMILARITY = max(
+    0.0,
+    (
+        0.56 - RETRIEVAL_WEIGHT_RECENCY  # RETRIEVAL-100: Auto-adjusts when recency weight changes
+    ),
+)
 RETRIEVAL_WEIGHT_EMBEDDING = RETRIEVAL_WEIGHT_SIMILARITY  # Backward compat alias (deprecated)
 RETRIEVAL_WEIGHT_AUTHORITY = 0.08  # RETRIEVAL-033: Down from 0.12 — freed budget to currency
-RETRIEVAL_WEIGHT_CURRENCY = 0.12  # RETRIEVAL-033: Up from 0.08 — recency matters for conflict resolution (correct=highest-serial=most-recent)
+RETRIEVAL_WEIGHT_CURRENCY = (
+    0.12  # RETRIEVAL-033: Up from 0.08 — recency matters for conflict resolution (correct=highest-serial=most-recent)
+)
 
 # RETRIEVAL-034: Stale Recall Transparency
 # When enabled, CONTRADICTED/CONTESTED concepts get [as of {freshness_label}] prefix
@@ -1066,9 +1095,9 @@ STALE_PENALTY_CONTESTED = float(os.environ.get("STALE_PENALTY_CONTESTED", "0.85"
 STALE_RISK_DETECTOR_ENABLED = os.environ.get("PITH_STALE_RISK_DETECTOR_ENABLED", "false").lower() == "true"
 STALE_RISK_AGING_PENALTY_ENABLED = os.environ.get("PITH_STALE_RISK_AGING_PENALTY_ENABLED", "false").lower() == "true"
 STALE_RISK_REVIEW_PENALTY_ENABLED = os.environ.get("PITH_STALE_RISK_REVIEW_PENALTY_ENABLED", "false").lower() == "true"
-STALE_RISK_ALLOW_CONFIRMED_STALE_PROMOTION = os.environ.get(
-    "PITH_STALE_RISK_ALLOW_CONFIRMED_STALE_PROMOTION", "false"
-).lower() == "true"
+STALE_RISK_ALLOW_CONFIRMED_STALE_PROMOTION = (
+    os.environ.get("PITH_STALE_RISK_ALLOW_CONFIRMED_STALE_PROMOTION", "false").lower() == "true"
+)
 STALE_RISK_MAX_PROMOTIONS_PER_RUN = int(os.environ.get("PITH_STALE_RISK_MAX_PROMOTIONS_PER_RUN", "100"))
 STALE_RISK_TYPE_WINDOWS = {"observation": 21, "decision": 30}
 STALE_RISK_THRESHOLD_AGING = float(os.environ.get("PITH_STALE_RISK_THRESHOLD_AGING", "0.65"))
@@ -1083,35 +1112,34 @@ RETRIEVAL_WEIGHT_CONFIDENCE = 0.0  # RETRIEVAL-038: Zeroed — 300pt ablation pr
 RETRIEVAL_WEIGHT_STABILITY = 0.03  # RETRIEVAL-031: Down from 0.05
 RETRIEVAL_WEIGHT_CONTEXT = 0.08  # Context activation (unchanged)
 RETRIEVAL_WEIGHT_GOAL = 0.08  # RETRIEVAL-031: Up from 0.07 (rounding)
-RETRIEVAL_WEIGHT_UTILITY = float(os.environ.get("PITH_RETRIEVAL_WEIGHT_UTILITY", "0.05"))  # RETRIEVAL-080: Learned from feedback
+RETRIEVAL_WEIGHT_UTILITY = float(
+    os.environ.get("PITH_RETRIEVAL_WEIGHT_UTILITY", "0.05")
+)  # RETRIEVAL-080: Learned from feedback
 
 # SESSION-012: Cross-session awareness — post-scoring additive boost (not a formula weight)
-RETRIEVAL_WEIGHT_SESSION_PROXIMITY = float(os.environ.get(
-    "PITH_RETRIEVAL_WEIGHT_SESSION_PROXIMITY", "0.04"
-))
-CROSS_SESSION_WINDOW_HOURS = float(os.environ.get(
-    "PITH_CROSS_SESSION_WINDOW_HOURS", "2.0"
-))
+RETRIEVAL_WEIGHT_SESSION_PROXIMITY = float(os.environ.get("PITH_RETRIEVAL_WEIGHT_SESSION_PROXIMITY", "0.04"))
+CROSS_SESSION_WINDOW_HOURS = float(os.environ.get("PITH_CROSS_SESSION_WINDOW_HOURS", "2.0"))
 
 # =============================================================================
 # RETRIEVAL-080: Feedback Loop — Utility Accumulator Configuration
 # =============================================================================
 # EMA alphas — asymmetric: learn fast from USED (clear signal), slow from UNUSED (ambiguous)
-UTILITY_EMA_ALPHA_USED = 0.15     # Strong positive signal, fast update
+UTILITY_EMA_ALPHA_USED = 0.15  # Strong positive signal, fast update
 UTILITY_EMA_ALPHA_PARTIAL = 0.08  # Moderate signal
-UTILITY_EMA_ALPHA_UNUSED = 0.03   # Weak negative signal, slow decay
+UTILITY_EMA_ALPHA_UNUSED = 0.03  # Weak negative signal, slow decay
 # Classification-mapped targets (gauntlet G4 fix: raw scores too compressed for EMA)
 UTILITY_TARGET_USED = 1.0
 UTILITY_TARGET_PARTIAL = 0.5
 UTILITY_TARGET_UNUSED = 0.0
 # Safety caps
-UTILITY_SCORE_MIN = 0.1    # No concept reaches 0.0 (permanent death) via feedback
-UTILITY_SCORE_MAX = 0.9    # No concept reaches 1.0 (invulnerable) via feedback
-UTILITY_COLD_START = 0.5   # New concepts start here
-MIN_UTILITY_SAMPLES = 5    # Min samples before blending into recalibration
+UTILITY_SCORE_MIN = 0.1  # No concept reaches 0.0 (permanent death) via feedback
+UTILITY_SCORE_MAX = 0.9  # No concept reaches 1.0 (invulnerable) via feedback
+UTILITY_COLD_START = 0.5  # New concepts start here
+MIN_UTILITY_SAMPLES = 5  # Min samples before blending into recalibration
+PROVEN_L3_UTILITY_THRESHOLD = 0.6
 # Recalibration blend weights (gauntlet G3 fix: 0.3 utility made L3 cap unreachable)
-RECALIBRATION_EVIDENCE_WEIGHT = 0.6   # Evidence factor in blended target
-RECALIBRATION_UTILITY_WEIGHT = 0.4    # Utility factor in blended target
+RECALIBRATION_EVIDENCE_WEIGHT = 0.6  # Evidence factor in blended target
+RECALIBRATION_UTILITY_WEIGHT = 0.4  # Utility factor in blended target
 # Baseline date — ignore feedback before this (historic contradiction inflation)
 FEEDBACK_BASELINE_DATE = "2026-03-27"
 # Type-floor override: firmware/constraints/always-activate get minimum utility
@@ -1129,11 +1157,11 @@ MIN_RETRIEVAL_SIMILARITY = float(os.environ.get("PITH_MIN_RETRIEVAL_SIMILARITY",
 # =============================================================================
 # Retrieval Freshness Decay (FRESHNESS_UNIFIED_REDESIGN)
 # =============================================================================
-RETRIEVAL_FRESHNESS_HALF_LIFE_DAYS = 7    # Days for bonus to halve. 7d balances
-                                           # discrimination (CV=0.1255) vs stability.
-                                           # Set to 99999 to effectively disable decay.
-RETRIEVAL_FRESHNESS_MAX_BONUS = 0.08       # Maximum additive freshness bonus (at age=0).
-RETRIEVAL_FRESHNESS_EVOLUTION_BONUS = 0.02 # Flat bonus for evolved concepts (version != v1).
+RETRIEVAL_FRESHNESS_HALF_LIFE_DAYS = 7  # Days for bonus to halve. 7d balances
+# discrimination (CV=0.1255) vs stability.
+# Set to 99999 to effectively disable decay.
+RETRIEVAL_FRESHNESS_MAX_BONUS = 0.08  # Maximum additive freshness bonus (at age=0).
+RETRIEVAL_FRESHNESS_EVOLUTION_BONUS = 0.02  # Flat bonus for evolved concepts (version != v1).
 
 # =============================================================================
 # Health Freshness Decay (FRESHNESS_UNIFIED_REDESIGN)
@@ -1348,7 +1376,9 @@ CTX_PRESSURE_LEARNS_MAX = 30  # 30 learning events ≈ substantial session
 CTX_PRESSURE_THRESHOLD_SUGGEST = 0.25  # Gentle nudge — p75 of observed distribution
 CTX_PRESSURE_THRESHOLD_URGE = 0.35  # Strong warning + payload — p95 of observed distribution
 CTX_PRESSURE_THRESHOLD_CRITICAL = 0.45  # Emergency signal — above observed MAX (0.428)
-CTX_TELEMETRY_MERGE_ENABLED = os.environ.get("CTX_TELEMETRY_MERGE_ENABLED", "1") == "1"  # CTX-TELEMETRY-001: rollout gate for structured telemetry merge
+CTX_TELEMETRY_MERGE_ENABLED = (
+    os.environ.get("CTX_TELEMETRY_MERGE_ENABLED", "1") == "1"
+)  # CTX-TELEMETRY-001: rollout gate for structured telemetry merge
 
 # RETRIEVAL-013: Temporal evolution check
 EVOLUTION_SUPPRESSION_WEIGHT = 0.50  # Max suppression factor (A's score halved at maximum)
@@ -1356,10 +1386,12 @@ EVOLUTION_COSINE_MIN = 0.50  # Lower bound of evolution zone
 EVOLUTION_COSINE_MAX = 0.82  # Upper bound (above = supersession territory)
 
 # RETRIEVAL-020: Inline evolution supersession — canary constants
-EVOLUTION_CANARY_MODE = False             # Phase 2B LIVE — flipped 2026-03-16 after 3-day canary (0 detections, 279 pairs evaluated, 0 errors)
-EVOLUTION_CANARY_DURATION_DAYS = 7       # Documentation-only: Phase 2B transition is manual, not automated by this value
+EVOLUTION_CANARY_MODE = (
+    False  # Phase 2B LIVE — flipped 2026-03-16 after 3-day canary (0 detections, 279 pairs evaluated, 0 errors)
+)
+EVOLUTION_CANARY_DURATION_DAYS = 7  # Documentation-only: Phase 2B transition is manual, not automated by this value
 EVOLUTION_CANARY_START_DATE = "2026-03-13"  # MONITOR-041: used to compute elapsed days and surface window-passed alert
-EVOLUTION_REJECT_COMPOSITE = 0.50        # Below this → skip candidate (mirrors backfill AUTO_REJECT_COMPOSITE)
+EVOLUTION_REJECT_COMPOSITE = 0.50  # Below this → skip candidate (mirrors backfill AUTO_REJECT_COMPOSITE)
 
 # --- HEALTH-009: Auto-association in reflection ---
 ASSOC_REFLECTION_MAX_PER_CYCLE = 100  # Max concepts to auto-associate per reflection
@@ -1435,7 +1467,9 @@ LEXICAL_EVIDENCE_ADMISSION_MIN_TFIDF = float(os.environ.get("PITH_LEXICAL_EVIDEN
 LEXICAL_EVIDENCE_ADMISSION_MIN_OVERLAP_RATIO = float(
     os.environ.get("PITH_LEXICAL_EVIDENCE_ADMISSION_MIN_OVERLAP_RATIO", "0.75")
 )
-LEXICAL_EVIDENCE_ADMISSION_MIN_QUERY_TOKENS = int(os.environ.get("PITH_LEXICAL_EVIDENCE_ADMISSION_MIN_QUERY_TOKENS", "5"))
+LEXICAL_EVIDENCE_ADMISSION_MIN_QUERY_TOKENS = int(
+    os.environ.get("PITH_LEXICAL_EVIDENCE_ADMISSION_MIN_QUERY_TOKENS", "5")
+)
 LEXICAL_EVIDENCE_ADMISSION_MAX_PER_QUERY = int(os.environ.get("PITH_LEXICAL_EVIDENCE_ADMISSION_MAX_PER_QUERY", "1"))
 LEXICAL_EVIDENCE_ADMISSION_SCORE_CAP = float(os.environ.get("PITH_LEXICAL_EVIDENCE_ADMISSION_SCORE_CAP", "0.62"))
 LEXICAL_ABSTENTION_HANDOFF_ENABLED = os.environ.get(
@@ -1510,12 +1544,8 @@ NONSTRATEGY_EXISTING_SUPPORT_MIN_REMAINING_MS = _env_float_clamped(
     low=0.0,
     high=5000.0,
 )
-NONSTRATEGY_EXISTING_SUPPORT_CONCEPT_ALLOWLIST = os.environ.get(
-    "PITH_NONSTRATEGY_EXISTING_SUPPORT_CONCEPT_ALLOWLIST"
-)
-NONSTRATEGY_EXISTING_SUPPORT_ORIGIN_ALLOWLIST = os.environ.get(
-    "PITH_NONSTRATEGY_EXISTING_SUPPORT_ORIGIN_ALLOWLIST"
-)
+NONSTRATEGY_EXISTING_SUPPORT_CONCEPT_ALLOWLIST = os.environ.get("PITH_NONSTRATEGY_EXISTING_SUPPORT_CONCEPT_ALLOWLIST")
+NONSTRATEGY_EXISTING_SUPPORT_ORIGIN_ALLOWLIST = os.environ.get("PITH_NONSTRATEGY_EXISTING_SUPPORT_ORIGIN_ALLOWLIST")
 
 # =============================================================================
 # RETRIEVAL-101: Supersession chain expansion
@@ -1523,20 +1553,12 @@ NONSTRATEGY_EXISTING_SUPPORT_ORIGIN_ALLOWLIST = os.environ.get(
 # When a retrieved concept has superseded_by set, walk the chain to the
 # current head and add the head to the result set (if not already present).
 # =============================================================================
-SUPERSESSION_CHAIN_ENABLED = os.environ.get(
-    "PITH_SUPERSESSION_CHAIN", "1"
-).lower() in ("true", "1")
-SUPERSESSION_CHAIN_BUDGET_MS = int(os.environ.get(
-    "PITH_SUPERSESSION_CHAIN_BUDGET_MS", "50"
-))
-SUPERSESSION_CHAIN_MAX_DEPTH = int(os.environ.get(
-    "PITH_SUPERSESSION_CHAIN_MAX_DEPTH", "8"
-))
+SUPERSESSION_CHAIN_ENABLED = os.environ.get("PITH_SUPERSESSION_CHAIN", "1").lower() in ("true", "1")
+SUPERSESSION_CHAIN_BUDGET_MS = int(os.environ.get("PITH_SUPERSESSION_CHAIN_BUDGET_MS", "50"))
+SUPERSESSION_CHAIN_MAX_DEPTH = int(os.environ.get("PITH_SUPERSESSION_CHAIN_MAX_DEPTH", "8"))
 # Max concepts to chain-expand per retrieval pass. Prevents runaway expansion
 # when many retrieved concepts have chains.
-SUPERSESSION_CHAIN_MAX_EXPANSIONS = int(os.environ.get(
-    "PITH_SUPERSESSION_CHAIN_MAX_EXPANSIONS", "10"
-))
+SUPERSESSION_CHAIN_MAX_EXPANSIONS = int(os.environ.get("PITH_SUPERSESSION_CHAIN_MAX_EXPANSIONS", "10"))
 
 HEALTH_AUTHORITY_ZERO_THRESHOLD = 0.50  # Trip if > 50% concepts have authority = 0
 HEALTH_CURRENCY_TIMEOUT_MS = 5000  # Trip if currency scan exceeds 5s
@@ -1551,9 +1573,7 @@ HEALTH_RECALIBRATION_STALE_HOURS = 72  # Trip if last recalibration > 72h ago
 # Use case: isolate benchmark-only data from polluting interactive sessions.
 # =============================================================================
 RETRIEVAL_KA_EXCLUDE = [
-    ka.strip()
-    for ka in os.environ.get("PITH_RETRIEVAL_KA_EXCLUDE", "pith_benchmarks").split(",")
-    if ka.strip()
+    ka.strip() for ka in os.environ.get("PITH_RETRIEVAL_KA_EXCLUDE", "pith_benchmarks").split(",") if ka.strip()
 ]
 
 # =============================================================================
@@ -1574,9 +1594,11 @@ LIFECYCLE_JOBS_ENABLED = os.environ.get("PITH_LIFECYCLE_JOBS_ENABLED", "false").
     "true",
     "yes",
 }
-LIFECYCLE_JOBS_FALLBACK_DIRECT = os.environ.get(
-    "PITH_LIFECYCLE_JOBS_FALLBACK_DIRECT", "true"
-).lower() in {"1", "true", "yes"}
+LIFECYCLE_JOBS_FALLBACK_DIRECT = os.environ.get("PITH_LIFECYCLE_JOBS_FALLBACK_DIRECT", "true").lower() in {
+    "1",
+    "true",
+    "yes",
+}
 LIFECYCLE_WORKERS = max(1, int(os.environ.get("PITH_LIFECYCLE_WORKERS", "1")))
 LIFECYCLE_JOB_LEASE_SECONDS = int(os.environ.get("PITH_LIFECYCLE_JOB_LEASE_SECONDS", "300"))
 LIFECYCLE_DRAIN_STUCK_SECONDS = int(
@@ -1584,6 +1606,8 @@ LIFECYCLE_DRAIN_STUCK_SECONDS = int(
 )
 LIFECYCLE_DRAIN_WALL_BUDGET_SECONDS = float(os.environ.get("PITH_LIFECYCLE_DRAIN_WALL_BUDGET_SECONDS", "30"))
 LIFECYCLE_JOB_MAX_ATTEMPTS = int(os.environ.get("PITH_LIFECYCLE_JOB_MAX_ATTEMPTS", "3"))
+LIFECYCLE_JOB_MAX_DEFERRALS = int(os.environ.get("PITH_LIFECYCLE_JOB_MAX_DEFERRALS", "10"))
+LIFECYCLE_JOB_DEFER_MAX_AGE_SECONDS = float(os.environ.get("PITH_LIFECYCLE_JOB_DEFER_MAX_AGE_SECONDS", "600"))
 LIFECYCLE_JOB_RETRY_SECONDS = int(os.environ.get("PITH_LIFECYCLE_JOB_RETRY_SECONDS", "60"))
 LIFECYCLE_JOB_CLEANUP_DAYS = int(os.environ.get("PITH_LIFECYCLE_JOB_CLEANUP_DAYS", "7"))
 LIFECYCLE_SUPERVISOR_ENABLED = os.environ.get(

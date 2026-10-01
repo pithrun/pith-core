@@ -56,6 +56,12 @@ from app.storage import (  # DEBT-022: hoisted from function-level
 )
 from app.storage.embedding import EMBEDDING_DIM, EMBEDDING_VERSION, embedding_engine
 
+try:
+    from app.authority_chain import order_authority_candidates, resolve_authority_chain
+except Exception:  # pragma: no cover - defensive fallback during partial installs
+    order_authority_candidates = None
+    resolve_authority_chain = None
+
 # Import governance scoring config
 try:
     from app.core.config import (
@@ -311,7 +317,13 @@ def _expand_authority_artifact_query(query_text: str) -> str:
     if not _is_authority_artifact_query(query_text):
         return query_text
     tokens = _authority_artifact_tokens(query_text)
-    missing_terms = [term for term in _AUTHORITY_ARTIFACT_EXPANSION_TERMS if term not in tokens]
+    expansion_terms = list(_AUTHORITY_ARTIFACT_EXPANSION_TERMS)
+    if resolve_authority_chain is not None:
+        try:
+            expansion_terms.extend(resolve_authority_chain(query_text).expanded_terms)
+        except Exception as exc:
+            logger.debug("authority chain expansion skipped: %s", exc)
+    missing_terms = [term for term in dict.fromkeys(expansion_terms) if term not in tokens]
     if not missing_terms:
         return query_text
     return f"{query_text} {' '.join(missing_terms)}"
@@ -392,7 +404,7 @@ def _apply_authority_artifact_boost(
                 )
                 boosted += 1
         if boosted:
-            results.sort(key=lambda r: (-r.relevance_score, r.concept_id))
+            _sort_authority_artifact_results(results, query_text)
             _record_metric(
                 "retrieval_authority_artifact_boost_applied_total",
                 float(boosted),
@@ -402,6 +414,23 @@ def _apply_authority_artifact_boost(
         logger.debug("authority artifact boost skipped: %s", exc)
         return 0
     return boosted
+
+
+def _sort_authority_artifact_results(results: list[SearchResult], query_text: str) -> None:
+    if order_authority_candidates is None:
+        results.sort(key=lambda r: (-r.relevance_score, r.concept_id))
+        return
+    try:
+        original_ids = [result.concept_id for result in results]
+        ordered_ids = order_authority_candidates(original_ids, query_text)
+        if ordered_ids == original_ids:
+            results.sort(key=lambda r: (-r.relevance_score, r.concept_id))
+            return
+        order_index = {concept_id: idx for idx, concept_id in enumerate(ordered_ids)}
+        results.sort(key=lambda r: (order_index.get(r.concept_id, len(results)), -r.relevance_score, r.concept_id))
+    except Exception as exc:
+        logger.debug("authority chain ordering skipped: %s", exc)
+        results.sort(key=lambda r: (-r.relevance_score, r.concept_id))
 
 
 def _env_float(name: str, default: float) -> float:
@@ -1591,7 +1620,14 @@ class RetrievalEngine:
             except Exception as e:
                 logger.warning(f"Embedding update failed for {concept_id}: {e}")
 
-    def remove_concept(self, concept_id: str, *, persist: bool = False):
+    def remove_concept(
+        self,
+        concept_id: str,
+        *,
+        persist: bool = False,
+        skip_periodic_checkpoint: bool = False,
+        strict_persist: bool = False,
+    ):
         """
         Remove concept from index.
 
@@ -1600,8 +1636,12 @@ class RetrievalEngine:
 
         Args:
             concept_id: ID of concept to remove
-            persist: Force an index checkpoint after successful removal.
+            persist: Force an index checkpoint, including when already absent.
+            skip_periodic_checkpoint: Suppress the legacy every-10th checkpoint.
+            strict_persist: Propagate checkpoint failures to the retry owner.
         """
+        if strict_persist and not persist:
+            raise ValueError("strict_persist requires persist=True")
         with self._writer_admission("remove_concept") as admit:
             if not admit:
                 return
@@ -1610,10 +1650,15 @@ class RetrievalEngine:
             if success:
                 logger.debug(f"Removed concept {concept_id} from index (incremental)")
 
-                # Auto-save every 10 operations, or immediately for DB-backed
-                # lifecycle changes where restart resurrection would create ghosts.
-                if persist or self.index.index_version % 10 == 0:
+            # A requested persistence retry must checkpoint even when the in-memory
+            # tombstone already exists from an earlier failed-save attempt.
+            if persist:
+                if strict_persist:
+                    self._auto_save(strict=True)
+                else:
                     self._auto_save()
+            elif success and not skip_periodic_checkpoint and self.index.index_version % 10 == 0:
+                self._auto_save()
 
             # P0.3: Also remove from embedding index
             embedding_engine.remove_embedding(concept_id)
@@ -2631,13 +2676,17 @@ class RetrievalEngine:
         """
         return build_searchable_text_from_concept(concept)
 
-    def _auto_save(self):
-        """Auto-save index periodically."""
+    def _auto_save(self, *, strict: bool = False) -> bool:
+        """Auto-save the index; optionally propagate failure to a retry owner."""
         try:
             self.index.save(self.index_path)
             logger.debug(f"Auto-saved index to {self.index_path}")
+            return True
         except Exception as e:
             logger.error(f"Auto-save failed: {e}")
+            if strict:
+                raise
+            return False
 
     def search_for_dedup_tfidf(self, query_text: str, top_k: int = 5) -> list[dict]:
         """Raw TF-IDF cosine similarity for deduplication checks.
@@ -3632,6 +3681,16 @@ class RetrievalEngine:
             _probe_set("tfidf", "result_count", len(tfidf_results))
             return tfidf_results
 
+        def _cancel_foreground_recovery_probe(config: ForegroundContractConfig, *, phase: str) -> None:
+            try:
+                get_foreground_contract(_record_metric).cancel_recovery_probe(config)
+            except Exception as recovery_cancel_err:
+                logger.debug(
+                    "FOREGROUND-CONTRACT: %s recovery probe cancel failed: %s",
+                    phase,
+                    recovery_cancel_err,
+                )
+
         def _run_semantic_recovery(
             fallback_reason: str,
             current_results: list[SearchResult],
@@ -3709,15 +3768,25 @@ class RetrievalEngine:
             _semantic_recovery_set("attempted", True)
             _semantic_recovery_set("search_started", True)
             recovery_start = time.perf_counter()
-            raw_recovery_results = embedding_engine.search(effective_query_text, top_k=_slw_semantic_recovery_top_k)
-            recovery_latency_ms = round((time.perf_counter() - recovery_start) * 1000.0, 2)
-            _semantic_recovery_set("latency_ms", recovery_latency_ms)
-            _semantic_recovery_set("raw_count", len(raw_recovery_results or []))
-            _record_metric(
-                "search_lightweight.semantic_recovery_latency_ms",
-                recovery_latency_ms,
-                {"trigger_reason": fallback_reason},
-            )
+            try:
+                raw_recovery_results = embedding_engine.search(
+                    effective_query_text,
+                    top_k=_slw_semantic_recovery_top_k,
+                )
+                recovery_latency_ms = round((time.perf_counter() - recovery_start) * 1000.0, 2)
+                _semantic_recovery_set("latency_ms", recovery_latency_ms)
+                _semantic_recovery_set("raw_count", len(raw_recovery_results or []))
+                _record_metric(
+                    "search_lightweight.semantic_recovery_latency_ms",
+                    recovery_latency_ms,
+                    {"trigger_reason": fallback_reason},
+                )
+            except Exception:
+                _cancel_foreground_recovery_probe(
+                    recovery_config,
+                    phase="retrieval.semantic_recovery",
+                )
+                raise
             try:
                 get_foreground_contract(_record_metric).record_latency_ms(
                     recovery_config,
@@ -3725,6 +3794,10 @@ class RetrievalEngine:
                     answer_path="unknown",
                 )
             except Exception as recovery_latency_err:
+                _cancel_foreground_recovery_probe(
+                    recovery_config,
+                    phase="retrieval.semantic_recovery",
+                )
                 logger.debug("FOREGROUND-CONTRACT: semantic recovery latency record failed: %s", recovery_latency_err)
 
             candidate_ids = [cid for cid, score in raw_recovery_results if score >= _slw_semantic_recovery_min_score]
@@ -3883,14 +3956,24 @@ class RetrievalEngine:
                     query_text = effective_query_text
                     _probe_set("embedding", "search_started", True)
                     _embedding_search_start = time.perf_counter()
-                    raw_results = embedding_engine.search(query_text, top_k=top_k)
-                    _probe_set("embedding", "raw_count", len(raw_results or []))
-                    _embedding_search_elapsed_ms = round((time.perf_counter() - _embedding_search_start) * 1000.0, 2)
-                    _record_metric(
-                        "search_lightweight.embedding_search_ms",
-                        _embedding_search_elapsed_ms,
-                        {"path": "embedding", "admission": "started"},
-                    )
+                    try:
+                        raw_results = embedding_engine.search(query_text, top_k=top_k)
+                        _probe_set("embedding", "raw_count", len(raw_results or []))
+                        _embedding_search_elapsed_ms = round(
+                            (time.perf_counter() - _embedding_search_start) * 1000.0,
+                            2,
+                        )
+                        _record_metric(
+                            "search_lightweight.embedding_search_ms",
+                            _embedding_search_elapsed_ms,
+                            {"path": "embedding", "admission": "started"},
+                        )
+                    except Exception:
+                        _cancel_foreground_recovery_probe(
+                            _slw_foreground_config,
+                            phase="retrieval.embedding_search",
+                        )
+                        raise
                     try:
                         get_foreground_contract(_record_metric).record_latency_ms(
                             _slw_foreground_config,
@@ -3898,6 +3981,10 @@ class RetrievalEngine:
                             answer_path="unknown",
                         )
                     except Exception as _slw_fg_err:
+                        _cancel_foreground_recovery_probe(
+                            _slw_foreground_config,
+                            phase="retrieval.embedding_search",
+                        )
                         logger.debug("FOREGROUND-CONTRACT: retrieval latency record failed: %s", _slw_fg_err)
 
                     # PERF-076: Batch load all candidate concepts in one query
@@ -4133,9 +4220,8 @@ class RetrievalEngine:
         with self._writer_admission("sync_index") as admit:
             if not admit:
                 return 0
-            # Get all active concept IDs from storage
-            all_concepts = list_concepts_full()
-            storage_ids = {c.id for c in all_concepts}
+            # Compare IDs first so the common no-op path does not hydrate every model.
+            storage_ids = set(list_concepts())
 
             # Get indexed concept IDs (exclude logically deleted rows)
             idx = self.index
@@ -4151,6 +4237,7 @@ class RetrievalEngine:
                 return 0
 
             logger.info(f"sync_index: {len(missing_ids)} concepts not in index, adding...")
+            concept_map = load_concepts_batch(list(missing_ids))
 
             # Suppress intermediate IDF recalcs during bulk add
             original_threshold = self.index.idf_update_threshold
@@ -4158,7 +4245,6 @@ class RetrievalEngine:
 
             added = 0
             try:
-                concept_map = {c.id: c for c in all_concepts}
                 for cid in missing_ids:
                     concept = concept_map.get(cid)
                     if concept:
@@ -4176,7 +4262,11 @@ class RetrievalEngine:
             logger.info(f"sync_index: added {added} concepts to index")
             return added
 
-    def pairwise_similarity(self, threshold: float = 0.12) -> list[tuple[str, str, float]]:
+    def pairwise_similarity(
+        self,
+        threshold: float = 0.12,
+        max_pairs_evaluated: int | None = None,
+    ) -> list[tuple[str, str, float]]:
         """Compute all above-threshold concept pairs by cosine similarity.
 
         Uses the TF-IDF matrix for efficient pairwise computation.
@@ -4185,6 +4275,8 @@ class RetrievalEngine:
 
         Args:
             threshold: Minimum cosine similarity to include (default 0.12).
+            max_pairs_evaluated: Optional cap on pair comparisons for bounded
+                maintenance runs.
 
         Returns:
             List of (concept_a, concept_b, cosine_score) tuples where
@@ -4198,6 +4290,11 @@ class RetrievalEngine:
         idx = self.index
         if idx.tfidf_matrix is None or idx.document_count == 0:
             logger.debug("pairwise_similarity: empty index")
+            self._last_pairwise_similarity_stats = {
+                "pairs_evaluated": 0,
+                "pairs_available": 0,
+                "pair_budget_exhausted": False,
+            }
             return []
 
         matrix = idx.tfidf_matrix
@@ -4206,19 +4303,44 @@ class RetrievalEngine:
         # Build set of valid (non-deleted) row indices
         valid_indices = [i for i in range(n_docs) if i not in idx.deleted_indices]
         if len(valid_indices) < 2:
+            self._last_pairwise_similarity_stats = {
+                "pairs_evaluated": 0,
+                "pairs_available": 0,
+                "pair_budget_exhausted": False,
+            }
             return []
 
         # Slice matrix to valid rows only for efficient computation
         valid_matrix = matrix[valid_indices]
 
-        # Compute pairwise cosine similarity (returns dense ndarray)
-        sim_matrix = sk_cosine(valid_matrix)
-
-        # Extract above-threshold pairs (upper triangle only to avoid duplicates)
+        # Extract above-threshold pairs (upper triangle only to avoid duplicates).
+        # Compute row windows instead of a full dense NxN matrix so maintenance
+        # callers can put a real ceiling on comparisons and memory pressure.
         pairs = []
+        pairs_evaluated = 0
+        pairs_available = len(valid_indices) * (len(valid_indices) - 1) // 2
+        pair_budget_exhausted = False
         for i_idx in range(len(valid_indices)):
-            for j_idx in range(i_idx + 1, len(valid_indices)):
-                score = float(sim_matrix[i_idx, j_idx])
+            remaining = len(valid_indices) - i_idx - 1
+            if remaining <= 0:
+                continue
+            comparisons_this_row = remaining
+            if max_pairs_evaluated is not None:
+                budget_remaining = max_pairs_evaluated - pairs_evaluated
+                if budget_remaining <= 0:
+                    pair_budget_exhausted = True
+                    break
+                comparisons_this_row = min(remaining, budget_remaining)
+                pair_budget_exhausted = comparisons_this_row < remaining
+
+            row_scores = sk_cosine(
+                valid_matrix[i_idx],
+                valid_matrix[i_idx + 1 : i_idx + 1 + comparisons_this_row],
+            ).ravel()
+            for offset, score_value in enumerate(row_scores, start=1):
+                j_idx = i_idx + offset
+                pairs_evaluated += 1
+                score = float(score_value)
                 if score >= threshold:
                     # Map back to concept IDs
                     cid_a = idx.concept_ids[valid_indices[i_idx]]
@@ -4226,13 +4348,21 @@ class RetrievalEngine:
                     # Normalize direction (sorted) to match edge storage normalization
                     source, target = sorted([cid_a, cid_b])
                     pairs.append((source, target, round(score, 4)))
+            if pair_budget_exhausted:
+                break
 
         # Sort by score descending for priority processing
         pairs.sort(key=lambda x: x[2], reverse=True)
+        self._last_pairwise_similarity_stats = {
+            "pairs_evaluated": pairs_evaluated,
+            "pairs_available": pairs_available,
+            "pair_budget_exhausted": pair_budget_exhausted,
+        }
 
         logger.info(
             f"pairwise_similarity: {len(pairs)} pairs above threshold {threshold} "
-            f"from {len(valid_indices)} indexed concepts"
+            f"from {len(valid_indices)} indexed concepts "
+            f"(evaluated={pairs_evaluated}/{pairs_available}, budget_exhausted={pair_budget_exhausted})"
         )
         return pairs
 
@@ -4799,6 +4929,334 @@ class RetrievalEngine:
                 os.close(fd)
                 report["duration_s"] = round(time.perf_counter() - t0, 3)
 
+    def ensure_lifecycle_concepts_indexed(
+        self,
+        concept_ids,
+        *,
+        persist: bool = True,
+        refresh_embeddings: bool = True,
+    ) -> dict:
+        """Ensure active/current concept IDs exist in the lexical index.
+
+        Unlike ``refresh_concepts``, this lifecycle reconciliation path revives
+        lazy tombstones and adds IDs that compaction removed from the mapping.
+        One quiesce window and at most one strict persistence checkpoint cover
+        the de-duplicated batch.
+        """
+        report: dict[str, Any] = {
+            "ensured": [],
+            "added": [],
+            "revived": [],
+            "skipped": [],
+            "df_recount_delta": None,
+            "swapped": False,
+            "embeddings_refreshed": 0,
+            "deferred": None,
+        }
+        started = time.perf_counter()
+        ids = list(dict.fromkeys(str(value) for value in concept_ids if value))
+        if not ids:
+            report["duration_s"] = 0.0
+            return report
+
+        lock_dir = Path(resolve_data_dir()) / "locks"
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        lock_path = lock_dir / "reflection.lock"
+        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            try:
+                lock_fd_exclusive(fd)
+            except BlockingIOError:
+                report["deferred"] = "reflection_active"
+                return report
+
+            backup_path = None
+            backup_made = False
+            try:
+                backup_path = f"{self.index_path}.lifecycle-ensure-backup-{self.index.index_version}"
+                if persist and Path(self.index_path).exists():
+                    if Path(backup_path).exists():
+                        shutil.rmtree(backup_path)
+                    shutil.copytree(self.index_path, backup_path)
+                    backup_made = True
+
+                texts: dict[str, str] = {}
+                with self.quiesce_writers():
+                    v0 = self.index.index_version
+                    for concept_id in ids:
+                        with read_snapshot_db("lifecycle_index_ensure_load") as conn:
+                            row = conn.execute(
+                                """SELECT data, summary, fragment_keywords
+                                   FROM concepts
+                                   WHERE id=? AND status='active' AND is_current=1""",
+                                (concept_id,),
+                            ).fetchone()
+                        if row is None:
+                            report["skipped"].append({"id": concept_id, "reason": "not_active_current"})
+                            continue
+                        searchable_text = build_searchable_text(
+                            {
+                                "data": row[0],
+                                "summary": row[1],
+                                "fragment_keywords": row[2] or "",
+                            }
+                        )
+                        if not searchable_text.strip():
+                            report["skipped"].append({"id": concept_id, "reason": "empty_text"})
+                            continue
+
+                        mapped_idx = self.index.concept_id_to_idx.get(concept_id)
+                        was_deleted = mapped_idx in getattr(self.index, "deleted_indices", set())
+                        if mapped_idx is None:
+                            changed = self.index.add_concept(concept_id, searchable_text)
+                            if changed:
+                                report["added"].append(concept_id)
+                        else:
+                            changed = self.index.refresh_concept(concept_id, searchable_text)
+                            if changed and was_deleted:
+                                report["revived"].append(concept_id)
+                        if not changed:
+                            raise RuntimeError(f"failed to ensure active index membership for {concept_id}")
+                        report["ensured"].append(concept_id)
+                        texts[concept_id] = searchable_text
+
+                    if report["ensured"]:
+                        self.index.recompute_document_frequencies()
+                        self.index.force_idf_recalculation()
+
+                    report["df_recount_delta"] = self._recount_df_delta(self.index)
+                    if report["df_recount_delta"] != 0:
+                        raise RuntimeError(
+                            f"verify failed: DF recount delta {report['df_recount_delta']} != 0"
+                        )
+                    if not (
+                        self.index.document_count
+                        == len(self.index.document_term_counts)
+                        == len(self.index.concept_ids)
+                    ):
+                        raise RuntimeError("verify failed: lifecycle ensure index consistency invariant")
+                    for concept_id in report["ensured"]:
+                        if not self.index.contains_active_concept(concept_id):
+                            raise RuntimeError(f"{concept_id} remains absent from the live index")
+                    expected_version = v0 + len(report["ensured"])
+                    if self.index.index_version != expected_version:
+                        raise RuntimeError(
+                            f"no-writer assertion failed: index_version "
+                            f"{self.index.index_version} != expected {expected_version}"
+                        )
+                    if persist:
+                        self.index.save(self.index_path)
+                        report["swapped"] = True
+
+                if persist and refresh_embeddings:
+                    for concept_id, searchable_text in texts.items():
+                        if self._refresh_concept_embedding(concept_id, searchable_text):
+                            report["embeddings_refreshed"] += 1
+                if backup_made:
+                    try:
+                        shutil.rmtree(backup_path)
+                    except Exception:
+                        pass
+                return report
+            except BaseException:
+                if backup_made and backup_path and Path(backup_path).exists():
+                    if Path(self.index_path).exists():
+                        shutil.rmtree(self.index_path)
+                    shutil.move(backup_path, self.index_path)
+                    restored = IncrementalTfidfIndex()
+                    if restored.load(self.index_path):
+                        self.index = restored
+                    logger.warning("lifecycle ensure: restored index backup after failure")
+                raise
+        finally:
+            try:
+                unlock_fd(fd)
+            finally:
+                os.close(fd)
+                report["duration_s"] = round(time.perf_counter() - started, 3)
+
 
 # Global instance - EXACT MATCH of original retrieval.py
 retrieval_engine = RetrievalEngine()
+
+
+def _index_contains_active_concept(concept_id: str) -> bool:
+    index = retrieval_engine.index
+    if hasattr(index, "contains_active_concept"):
+        return bool(index.contains_active_concept(concept_id))
+    idx = index.concept_id_to_idx.get(concept_id)
+    deleted = getattr(index, "deleted_indices", set())
+    return idx is not None and idx not in deleted
+
+
+def _persisted_index_contains_active_concept(concept_id: str) -> bool:
+    document_map_path = Path(retrieval_engine.index_path) / "document_map.json"
+    document_map = json.loads(document_map_path.read_text())
+    idx = document_map.get("concept_id_to_idx", {}).get(concept_id)
+    deleted = set(document_map.get("deleted_indices", []))
+    return idx is not None and idx not in deleted
+
+
+def evict_lifecycle_concepts(
+    concept_ids,
+    *,
+    persist: bool,
+    source: str,
+) -> dict:
+    """Evict exact IDs with bounded retry and one checkpoint per batch."""
+    ids = list(dict.fromkeys(str(value) for value in concept_ids if value))
+    report = {"succeeded": [], "failed": [], "attempts": 0}
+    if not ids:
+        return report
+    for attempt in range(1, 3):
+        report["attempts"] = attempt
+        try:
+            for concept_id in ids:
+                retrieval_engine.remove_concept(
+                    concept_id,
+                    persist=False,
+                    skip_periodic_checkpoint=True,
+                )
+            if persist:
+                index = retrieval_engine.index
+                if not (
+                    index.document_count
+                    == len(index.document_term_counts)
+                    == len(index.concept_ids)
+                ):
+                    raise RuntimeError("refusing lifecycle eviction checkpoint for inconsistent index")
+                retrieval_engine._auto_save(strict=True)
+            failed = [concept_id for concept_id in ids if _index_contains_active_concept(concept_id)]
+            if persist:
+                failed.extend(
+                    concept_id
+                    for concept_id in ids
+                    if concept_id not in failed and _persisted_index_contains_active_concept(concept_id)
+                )
+            if failed:
+                raise RuntimeError(f"index eviction verification failed for {sorted(set(failed))}")
+            report["succeeded"] = ids
+            logger.info(
+                "MAINT-097: lifecycle index batch eviction succeeded count=%d source=%s persist=%s attempt=%d",
+                len(ids),
+                source,
+                persist,
+                attempt,
+            )
+            return report
+        except Exception as exc:
+            log = logger.warning if attempt == 1 else logger.error
+            log(
+                "MAINT-097: lifecycle index batch eviction failed count=%d source=%s "
+                "persist=%s attempt=%d error=%s",
+                len(ids),
+                source,
+                persist,
+                attempt,
+                exc,
+            )
+    report["failed"] = ids
+    return report
+
+
+def ensure_lifecycle_concepts_indexed(
+    concept_ids,
+    *,
+    persist: bool,
+    source: str,
+) -> dict:
+    """Ensure exact active IDs with bounded retry and strict verification."""
+    ids = list(dict.fromkeys(str(value) for value in concept_ids if value))
+    result = {"succeeded": [], "failed": [], "attempts": 0, "deferred": None}
+    if not ids:
+        return result
+    for attempt in range(1, 3):
+        result["attempts"] = attempt
+        try:
+            report = retrieval_engine.ensure_lifecycle_concepts_indexed(
+                ids,
+                persist=persist,
+                refresh_embeddings=persist,
+            )
+            if report.get("deferred"):
+                result["deferred"] = report["deferred"]
+                break
+            skipped = {item["id"] for item in report.get("skipped", [])}
+            failed = [
+                concept_id
+                for concept_id in ids
+                if concept_id not in skipped and not _index_contains_active_concept(concept_id)
+            ]
+            if persist:
+                failed.extend(
+                    concept_id
+                    for concept_id in ids
+                    if concept_id not in skipped
+                    and concept_id not in failed
+                    and not _persisted_index_contains_active_concept(concept_id)
+                )
+            if failed:
+                raise RuntimeError(f"index ensure verification failed for {sorted(set(failed))}")
+            result["succeeded"] = [concept_id for concept_id in ids if concept_id not in skipped]
+            result["failed"] = list(skipped)
+            logger.info(
+                "MAINT-097: lifecycle index batch ensure succeeded count=%d skipped=%d source=%s attempt=%d",
+                len(result["succeeded"]),
+                len(skipped),
+                source,
+                attempt,
+            )
+            return result
+        except Exception as exc:
+            log = logger.warning if attempt == 1 else logger.error
+            log(
+                "MAINT-097: lifecycle index batch ensure failed count=%d source=%s attempt=%d error=%s",
+                len(ids),
+                source,
+                attempt,
+                exc,
+            )
+    result["failed"] = ids
+    return result
+
+
+def evict_lifecycle_concept(
+    concept_id: str,
+    *,
+    persist: bool,
+    source: str,
+) -> bool:
+    """Evict one lifecycle-inactive concept with bounded retry and verification."""
+    for attempt in range(1, 3):
+        try:
+            retrieval_engine.remove_concept(
+                concept_id,
+                persist=persist,
+                skip_periodic_checkpoint=not persist,
+                strict_persist=persist,
+            )
+            if _index_contains_active_concept(concept_id):
+                raise RuntimeError(f"{concept_id} remains active in the live index")
+            if persist and _persisted_index_contains_active_concept(concept_id):
+                raise RuntimeError(f"{concept_id} remains active in the persisted index")
+            logger.info(
+                "MAINT-096: lifecycle index eviction succeeded "
+                "concept_id=%s source=%s persist=%s attempt=%d",
+                concept_id,
+                source,
+                persist,
+                attempt,
+            )
+            return True
+        except Exception as exc:
+            log = logger.warning if attempt == 1 else logger.error
+            log(
+                "MAINT-096: lifecycle index eviction failed "
+                "concept_id=%s source=%s persist=%s attempt=%d error=%s",
+                concept_id,
+                source,
+                persist,
+                attempt,
+                exc,
+            )
+    return False

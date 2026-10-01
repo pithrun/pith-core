@@ -14,10 +14,11 @@ import threading
 import time
 import uuid
 from contextlib import nullcontext
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from app.core.fork_safety import should_suppress_optional_subprocess
+from app.storage.session_bindings import WRITER_PROTOCOL_VERSION
 
 _REPO_ROOT = Path(__file__).parent.parent.parent
 _DEPLOY_METADATA_PATH = _REPO_ROOT / ".pith-deploy.json"
@@ -208,6 +209,14 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _startup_env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        logger.warning("Invalid float env var %s=%r; using %s", name, os.environ.get(name), default)
+        return default
+
+
 _FAST_STATS_CACHE_TTL_S = float(os.environ.get("PITH_FAST_STATS_CACHE_TTL_S", "5"))
 _FAST_STATS_COLD_BUDGET_S = float(os.environ.get("PITH_FAST_STATS_COLD_BUDGET_S", "0.5"))
 _FAST_STATS_MAX_STALE_S = float(os.environ.get("PITH_FAST_STATS_MAX_STALE_S", "60"))
@@ -303,6 +312,19 @@ def _env_bool(name: str, default: bool) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _health_status_fold_config() -> tuple[bool, str | None]:
+    raw = os.environ.get("PITH_HEALTH_STATUS_FOLD_ENABLED")
+    if raw is None:
+        return True, None
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True, None
+    if normalized in {"0", "false", "no", "off"}:
+        return False, None
+    logger.warning("Invalid PITH_HEALTH_STATUS_FOLD_ENABLED=%r; keeping status fold enabled", raw)
+    return True, "health_status_fold_config_invalid"
 
 
 _DIAGNOSTIC_WARMER_ALLOWED_MODES = ("all_lanes", "safe_sequential")
@@ -698,7 +720,9 @@ def _warm_one_tick_all_lanes(lanes: tuple[tuple, ...]) -> None:
     now = time.monotonic()
     for name, lock, get_cache, ttl_s, ensure_refresh, obs_snapshot in lanes:
         try:
-            if _diagnostic_warmer_lane_due((name, lock, get_cache, ttl_s, ensure_refresh, obs_snapshot), now, interval_ms):
+            if _diagnostic_warmer_lane_due(
+                (name, lock, get_cache, ttl_s, ensure_refresh, obs_snapshot), now, interval_ms
+            ):
                 _submit_diagnostic_warmer_lane(name, ensure_refresh)
         except Exception:
             logger.debug("diagnostic_warmer tick error lane=%s", name, exc_info=True)
@@ -720,7 +744,9 @@ def _warm_one_tick_safe_sequential(lanes: tuple[tuple, ...]) -> None:
         lane_index = (start_index + offset) % lane_count
         name, lock, get_cache, ttl_s, ensure_refresh, obs_snapshot = lanes[lane_index]
         try:
-            if _diagnostic_warmer_lane_due((name, lock, get_cache, ttl_s, ensure_refresh, obs_snapshot), now, interval_ms):
+            if _diagnostic_warmer_lane_due(
+                (name, lock, get_cache, ttl_s, ensure_refresh, obs_snapshot), now, interval_ms
+            ):
                 _submit_diagnostic_warmer_lane(name, ensure_refresh)
                 with _DIAGNOSTIC_WARMER_LOCK:
                     _DIAGNOSTIC_WARMER_NEXT_INDEX = (lane_index + 1) % lane_count
@@ -881,8 +907,11 @@ def _read_canonical_head(runtime_head: str) -> str:
 
 
 from app.api.write_durability import (
+    ManagedReplayAuthority,
+    WriteReplayState,
     abandon_write_request,
     begin_write_request,
+    commit_managed_write_requests_for_episode,
     commit_write_request,
     fail_write_request,
     get_write_request_status,
@@ -943,6 +972,15 @@ _cfg.LIFECYCLE_DRAIN_WALL_BUDGET_SECONDS = float(
 _cfg.LIFECYCLE_JOB_MAX_ATTEMPTS = int(
     os.environ.get("PITH_LIFECYCLE_JOB_MAX_ATTEMPTS", str(_cfg.LIFECYCLE_JOB_MAX_ATTEMPTS))
 )
+_cfg.LIFECYCLE_JOB_MAX_DEFERRALS = int(
+    os.environ.get("PITH_LIFECYCLE_JOB_MAX_DEFERRALS", str(_cfg.LIFECYCLE_JOB_MAX_DEFERRALS))
+)
+_cfg.LIFECYCLE_JOB_DEFER_MAX_AGE_SECONDS = float(
+    os.environ.get(
+        "PITH_LIFECYCLE_JOB_DEFER_MAX_AGE_SECONDS",
+        str(_cfg.LIFECYCLE_JOB_DEFER_MAX_AGE_SECONDS),
+    )
+)
 _cfg.LIFECYCLE_JOB_RETRY_SECONDS = int(
     os.environ.get("PITH_LIFECYCLE_JOB_RETRY_SECONDS", str(_cfg.LIFECYCLE_JOB_RETRY_SECONDS))
 )
@@ -991,6 +1029,8 @@ from importlib import import_module
 from typing import Any
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request, Response
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import (
@@ -1004,6 +1044,10 @@ from pydantic import (
 )
 
 from app.cognitive.learning import create_concept, evolve_concept, validate_proposal
+from app.core.foreground_contract import (
+    FOREGROUND_CONTRACT_CIRCUIT_OPEN_METRIC,
+    FOREGROUND_CONTRACT_DECISION_METRIC,
+)
 from app.core.logging_config import setup_logging
 from app.core.models import (
     Association,
@@ -1014,11 +1058,13 @@ from app.core.models import (
     ConversationTurnRequest,
     SearchQuery,
     SearchResult,
+    SessionBindingEnvelope,
     SessionEndRequest,
     SessionInfo,
     SessionLearnRequest,
     SessionLearnResponse,
 )
+from app.core.request_identity import new_conversation_turn_request_id
 from app.storage import (
     _db,
     _db_immediate,
@@ -1032,6 +1078,7 @@ from app.storage import (
     list_concepts_full,
     list_sessions,
     load_concept,
+    load_session,
     load_write_request_replay,
     restore_concept,
     run_storage_migration,
@@ -1092,13 +1139,53 @@ def auto_associate_single(*args: Any, **kwargs: Any) -> Any:
 # MATURITY-001: Maturities blocked from external API results
 _BLOCKED_MATURITIES = {"QUARANTINED", "DISCARDED"}
 
-SERVER_VERSION = os.environ.get("PITH_VERSION", "1.0.6")
+SERVER_VERSION = os.environ.get("PITH_VERSION", "1.0.7")
 
 app = FastAPI(
     title="Pith Server",
     version=SERVER_VERSION,
     description="AI Learning Architecture with versioned conceptual memory",
 )
+
+
+def _redact_request_validation_errors(errors: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Remove managed capability input from FastAPI's otherwise-echoing 422 body."""
+
+    def _redact(value: Any, *, capability_scope: bool = False) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: ("[redacted]" if str(key) == "capability" else _redact(item, capability_scope=capability_scope))
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [_redact(item, capability_scope=capability_scope) for item in value]
+        if isinstance(value, tuple):
+            return tuple(_redact(item, capability_scope=capability_scope) for item in value)
+        return "[redacted]" if capability_scope else value
+
+    redacted: list[dict[str, Any]] = []
+    for error in errors:
+        item = dict(error)
+        loc = tuple(item.get("loc") or ())
+        capability_scope = "binding" in loc and "capability" in loc
+        if "input" in item:
+            item["input"] = _redact(item["input"], capability_scope=capability_scope)
+        if "ctx" in item:
+            item["ctx"] = _redact(item["ctx"], capability_scope=capability_scope)
+        redacted.append(item)
+    return redacted
+
+
+@app.exception_handler(RequestValidationError)
+async def _request_validation_exception_handler(
+    _request: Request,
+    exc: RequestValidationError,
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=422,
+        content=jsonable_encoder({"detail": _redact_request_validation_errors(exc.errors())}),
+    )
+
 
 _PITH_ORIENT_CACHE_LOCK = threading.Lock()
 _PITH_ORIENT_CACHE: dict[tuple[str], dict[str, Any]] = {}
@@ -1196,6 +1283,15 @@ import threading as _threading_fort
 HEAVY_SEMAPHORE_LIMIT = 2
 HEAVY_ENDPOINT_TIMEOUT_S = 30
 _HEAVY_ENDPOINT_SEMAPHORE = _threading_fort.Semaphore(HEAVY_SEMAPHORE_LIMIT)
+HOOK_ADDITIONAL_CONTEXT_SEMAPHORE_LIMIT = max(
+    1,
+    _env_int("PITH_HOOK_ADDITIONAL_CONTEXT_SEMAPHORE_LIMIT", 1),
+)
+HOOK_ADDITIONAL_CONTEXT_TIMEOUT_S = max(
+    0.0,
+    min(_startup_env_float("PITH_HOOK_ADDITIONAL_CONTEXT_TIMEOUT_S", 0.25), 5.0),
+)
+_HOOK_ADDITIONAL_CONTEXT_SEMAPHORE = _threading_fort.Semaphore(HOOK_ADDITIONAL_CONTEXT_SEMAPHORE_LIMIT)
 _SESSION_LEARN_SYNC_WAIT_SECONDS = max(0.0, min(_cfg.SESSION_LEARN_SYNC_WAIT_SECONDS, 15.0))
 _SESSION_LEARN_PROCESSING_RETRY_AFTER_SECONDS = max(0.0, _cfg.SESSION_LEARN_PROCESSING_RETRY_AFTER_SECONDS)
 _SESSION_LEARN_EXECUTOR_WORKERS = max(1, _cfg.SESSION_LEARN_EXECUTOR_WORKERS)
@@ -1318,6 +1414,12 @@ async def verify_api_key(request: Request):
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
+@app.get("/auth/validate", dependencies=[Depends(verify_api_key)])
+async def auth_validate():
+    """Read-only protected route for local client auth diagnostics."""
+    return {"ok": True, "auth": "validated"}
+
+
 _LOCAL_OPERATOR_HOSTS = {"127.0.0.1", "::1", "localhost", "testclient"}
 
 
@@ -1398,7 +1500,6 @@ _PITH_DEBUG = os.environ.get("PITH_DEBUG", "0") == "1"
 # OPS-500-FIX: Retry helper for transient DB lock errors
 import sqlite3 as _sqlite3_retry
 import time as _time_retry
-from datetime import UTC
 
 
 def _with_db_retry(fn, max_retries=2, backoff=0.5):
@@ -1525,6 +1626,7 @@ def _build_ready_state() -> dict:
         "mode": mode,
         "process_state": process_state,
         "write_state": write_state,
+        "session_writer_protocol": WRITER_PROTOCOL_VERSION,
         "retrieval_state": retrieval_state,
         "semantic_full_search_state": semantic_full_search_state,
         "semantic_warm_readiness": semantic_warm_readiness,
@@ -1553,6 +1655,71 @@ def _apply_memory_durability_health(ready: dict, *, lifecycle_jobs: dict, sessio
         return
 
 
+def _derive_health_status(ready: dict) -> None:
+    failure_states = {"critical", "unhealthy", "error", "failed", "blocked"}
+    degraded_states = {"degraded", "warning", "recovering", "unavailable", "stale", "lagging"}
+    normal_states = {"ok", "healthy", "ready", "running", "disabled", "available", "idle"}
+    liveness_status = str(ready.get("status") or "unknown").lower()
+    ready["liveness_status"] = liveness_status
+    enabled, config_reason = _health_status_fold_config()
+    if not enabled:
+        ready["status_contract_version"] = 1
+        ready["status"] = liveness_status
+        ready["status_reasons"] = ["health_status_fold_disabled"]
+        return
+
+    ready["status_contract_version"] = 2
+    reasons: list[str] = []
+    aggregate = "healthy"
+    mode = str(ready.get("mode") or "unknown").lower()
+    if liveness_status != "healthy":
+        aggregate = "unhealthy"
+        reasons.append(f"liveness:{liveness_status}")
+    if mode == "blocked":
+        aggregate = "unhealthy"
+        reasons.append("mode:blocked")
+    elif mode != "ready":
+        if aggregate != "unhealthy":
+            aggregate = "degraded"
+        reasons.append(f"mode:{mode}")
+
+    metrics_payload = ready.get("metrics") if isinstance(ready.get("metrics"), dict) else {}
+    components = ready.get("components") if isinstance(ready.get("components"), dict) else {}
+    for name, raw_state in components.items():
+        state = str(raw_state or "unknown").lower()
+        if state in normal_states:
+            continue
+        reason = f"component:{name}:{state}"
+        if state in failure_states:
+            aggregate = "unhealthy"
+            reasons.append(reason)
+        elif state in degraded_states:
+            if aggregate != "unhealthy":
+                aggregate = "degraded"
+            reasons.append(reason)
+        elif state == "unknown":
+            payload = metrics_payload.get(name)
+            expected_deferred = (
+                isinstance(payload, dict)
+                and payload.get("deferred") is True
+                and payload.get("alert") is False
+                and not payload.get("error")
+            )
+            if not expected_deferred:
+                if aggregate != "unhealthy":
+                    aggregate = "degraded"
+                reasons.append(reason)
+        else:
+            if aggregate != "unhealthy":
+                aggregate = "degraded"
+            reasons.extend((reason, f"unrecognized_component_state:{name}:{state}"))
+
+    if config_reason:
+        reasons.append(config_reason)
+    ready["status"] = aggregate
+    ready["status_reasons"] = sorted(set(reasons))
+
+
 def _external_maintenance_freshness_threshold_hours(scheduler_installed: bool) -> float:
     """Return stale threshold for the configured external maintenance scheduler."""
     return 36.0 if scheduler_installed else 12.0
@@ -1564,8 +1731,10 @@ def _build_external_maintenance_health() -> dict[str, Any]:
     from datetime import datetime as _dt
 
     from app.core.profile import resolve_data_dir
+    from app.ops.maintenance import empty_maintenance_outcome_health, normalize_maintenance_outcome_health
 
     heartbeat_path = Path(resolve_data_dir()) / "maintenance_heartbeat.json"
+    full_heartbeat_path = heartbeat_path.with_name("maintenance_full_heartbeat.json")
     scheduler_dir = Path(os.environ.get("PITH_LAUNCH_AGENTS_DIR", Path.home() / "Library" / "LaunchAgents"))
     scheduler_path = scheduler_dir / "com.pith.maintenance.plist"
     scheduler_installed = scheduler_path.exists()
@@ -1584,7 +1753,7 @@ def _build_external_maintenance_health() -> dict[str, Any]:
         },
     }
 
-    if not heartbeat_path.exists():
+    if not heartbeat_path.exists() and not full_heartbeat_path.exists():
         scheduler_state = "scheduled" if scheduler_installed else "not_installed"
         message = (
             "External launchd maintenance is scheduled but no heartbeat exists yet."
@@ -1597,6 +1766,7 @@ def _build_external_maintenance_health() -> dict[str, Any]:
             "scheduler_state": scheduler_state,
             "alert": False,
             "message": message,
+            "outcome_health": empty_maintenance_outcome_health("heartbeat_missing"),
             "heartbeat": {
                 "exists": False,
                 "path": str(heartbeat_path),
@@ -1609,7 +1779,23 @@ def _build_external_maintenance_health() -> dict[str, Any]:
         }
 
     try:
-        data = _json.loads(heartbeat_path.read_text())
+        latest_run = {}
+        if full_heartbeat_path.exists():
+            data = _json.loads(full_heartbeat_path.read_text())
+            # Diagnostic evidence cannot invalidate authoritative full-run proof.
+            try:
+                latest_run = _json.loads(heartbeat_path.read_text())
+                if not isinstance(latest_run, dict):
+                    latest_run = {}
+            except (OSError, ValueError):
+                pass
+        else:
+            data = _json.loads(heartbeat_path.read_text())
+            latest_run = data
+        outcome_health = normalize_maintenance_outcome_health(
+            data.get("outcome_health"),
+            missing_reason="legacy_heartbeat",
+        )
         last_run_raw = data.get("last_run") or data.get("timestamp")
         if not last_run_raw:
             return {
@@ -1619,6 +1805,7 @@ def _build_external_maintenance_health() -> dict[str, Any]:
                 "scheduler_state": "error",
                 "alert": True,
                 "message": "maintenance heartbeat missing last_run/timestamp",
+                "outcome_health": outcome_health,
             }
         last_run = _ensure_aware(_dt.fromisoformat(last_run_raw))
         hours_since = (_utc_now() - last_run).total_seconds() / 3600
@@ -1626,7 +1813,15 @@ def _build_external_maintenance_health() -> dict[str, Any]:
         source = data.get("source") or ("built_in" if data.get("scheduler") == "builtin" else "unknown")
         freshness_threshold_hours = _external_maintenance_freshness_threshold_hours(scheduler_installed)
         freshness_state = "stale" if hours_since > freshness_threshold_hours else "fresh"
-        alert = freshness_state == "stale" or status in {"error", "errors", "circuit_open"}
+        alert = (
+            freshness_state == "stale"
+            or status in {"error", "errors", "circuit_open"}
+            or outcome_health.get("overall_state") == "critical"
+        )
+        full_run_missing = outcome_health.get("run_scope") != "full" or data.get("dry_run") is True
+        if full_run_missing:
+            alert = True
+            outcome_health = empty_maintenance_outcome_health("full_run_evidence_missing", critical=True)
         return {
             **base,
             **data,
@@ -1636,6 +1831,12 @@ def _build_external_maintenance_health() -> dict[str, Any]:
             "freshness_state": freshness_state,
             "scheduler_state": "degraded" if alert else "healthy",
             "alert": alert,
+            "outcome_health": outcome_health,
+            "full_run_evidence_missing": full_run_missing,
+            "latest_run": {
+                key: latest_run.get(key) for key in ("last_run", "source", "status", "dry_run", "outcome_health")
+            },
+            "health_evidence_path": str(full_heartbeat_path if full_heartbeat_path.exists() else heartbeat_path),
             "heartbeat": {
                 "exists": True,
                 "path": str(heartbeat_path),
@@ -1658,6 +1859,7 @@ def _build_external_maintenance_health() -> dict[str, Any]:
             "scheduler_state": "error",
             "alert": True,
             "message": _safe_error(e),
+            "outcome_health": empty_maintenance_outcome_health("heartbeat_unreadable", critical=True),
             "heartbeat": {
                 "exists": heartbeat_path.exists(),
                 "path": str(heartbeat_path),
@@ -2088,33 +2290,125 @@ async def _run_deferred_startup_warmups(
 
 
 def _run_conversation_turn_lifecycle_job(job: dict) -> dict:
-    payload = job.get("payload") or {}
-    request_payload = payload.get("learn_request") if isinstance(payload, dict) else None
-    if not isinstance(request_payload, dict):
-        raise ValueError("conversation_turn lifecycle job missing learn_request payload")
-    learn_request = SessionLearnRequest(**request_payload)
-    bound_session_payload = payload.get("bound_session")
-    bound_session = SessionInfo(**bound_session_payload) if bound_session_payload else None
-    result = session_manager._background_autolearn(
-        learn_request,
-        payload.get("extracted"),
-        payload.get("request_message", ""),
-        payload.get("prev_msg", ""),
-        payload.get("prev_response", ""),
-        bound_session,
-        payload.get("raw_capture_ref"),
-        payload.get("active_binding_snapshot"),
+    def _run_effect() -> dict:
+        payload = job.get("payload") or {}
+        request_payload = payload.get("learn_request") if isinstance(payload, dict) else None
+        if not isinstance(request_payload, dict):
+            raise ValueError("conversation_turn lifecycle job missing learn_request payload")
+        learn_request = SessionLearnRequest(**request_payload)
+        bound_session_payload = payload.get("bound_session")
+        bound_session = SessionInfo(**bound_session_payload) if bound_session_payload else None
+        result = session_manager._background_autolearn(
+            learn_request,
+            payload.get("extracted"),
+            payload.get("request_message", ""),
+            payload.get("prev_msg", ""),
+            payload.get("prev_response", ""),
+            bound_session,
+            payload.get("raw_capture_ref"),
+            payload.get("active_binding_snapshot"),
+        )
+        return {"status": "committed", "result": result}
+
+    if job.get("binding_hash") is None:
+        return _run_effect()
+
+    from app.session.binding import BindingBusyError, run_managed_conversation_turn_effect
+    from app.session.lifecycle_jobs_runtime import LifecycleJobDeferred
+
+    try:
+        return run_managed_conversation_turn_effect(job, run_effect=_run_effect)
+    except BindingBusyError as exc:
+        raise LifecycleJobDeferred("managed_episode_guard_busy", retry_after_seconds=1) from exc
+
+
+def _submit_managed_conversation_turn_drain() -> None:
+    """Nudge the durable runner after foreground registration has committed."""
+
+    from app.session.lifecycle_jobs_runtime import submit_lifecycle_drain
+
+    submit_lifecycle_drain(
+        run_job=_run_conversation_turn_lifecycle_job,
+        reason="managed_conversation_turn_autolearn",
+        limit=5,
+        source="conversation_turn",
     )
-    return {"status": "committed", "result": result}
+
+
+def _run_session_end_lifecycle_job(job: dict) -> dict:
+    payload = job.get("payload") or {}
+    request_payload = payload.get("end_request") if isinstance(payload, dict) else None
+    if not isinstance(request_payload, dict):
+        raise ValueError("session_end lifecycle job missing end_request payload")
+    end_request = SessionEndRequest(**request_payload)
+
+    if job.get("binding_hash") is None:
+        return _run_session_end_replay_payload(request_payload)
+
+    from app.session.binding import (
+        BindingBusyError,
+        ManagedCloseDeferred,
+        run_managed_session_end_effect,
+    )
+    from app.session.lifecycle_jobs_runtime import LifecycleJobDeferred
+
+    try:
+        result = run_managed_session_end_effect(
+            job,
+            run_effect=lambda: _with_db_retry(lambda: session_manager.end_session(end_request)),
+        )
+    except (BindingBusyError, ManagedCloseDeferred) as exc:
+        raise LifecycleJobDeferred(str(exc), retry_after_seconds=1) from exc
+
+    authority = ManagedReplayAuthority(
+        profile=str(job["profile"]),
+        binding_hash=str(job["binding_hash"]),
+        session_id=str(job["session_id"]),
+    )
+    response = _coerce_session_end_payload("", result)
+    response.pop("request_id", None)
+    response["_protocol"] = {
+        "binding_mode": "managed",
+        "binding_protocol_version": 1,
+        "binding_generation": int(job["binding_generation"]),
+        "lifecycle_phase": str(result.get("lifecycle_phase") or result.get("status") or "ended"),
+    }
+    commit_managed_write_requests_for_episode("session_end", authority, response)
+    return response
+
+
+def _submit_managed_session_end_drain() -> None:
+    from app.session.lifecycle_jobs_runtime import submit_lifecycle_drain
+
+    submit_lifecycle_drain(
+        run_job=_run_session_end_lifecycle_job,
+        reason="managed_session_end",
+        limit=1,
+        source="session_end",
+    )
 
 
 def _register_lifecycle_job_runners() -> None:
+    from app.core.profile import get_active_profile
     from app.ops.reflection_runner import run_reflection_lifecycle_job
-    from app.session.lifecycle_jobs_runtime import register_lifecycle_job_runner
+    from app.session.binding import sweep_due_managed_episodes
+    from app.session.lifecycle_jobs_runtime import (
+        register_lifecycle_job_runner,
+        register_lifecycle_maintenance_callback,
+    )
 
     register_lifecycle_job_runner("conversation_turn", _run_conversation_turn_lifecycle_job)
     register_lifecycle_job_runner("session_learn", _run_session_learn_lifecycle_job)
+    register_lifecycle_job_runner("session_end", _run_session_end_lifecycle_job)
     register_lifecycle_job_runner("reflection_full", run_reflection_lifecycle_job)
+    register_lifecycle_maintenance_callback(
+        "managed_session_sweep",
+        lambda *, max_wall_seconds: sweep_due_managed_episodes(
+            profile=get_active_profile(),
+            limit=50,
+            max_wall_seconds=max_wall_seconds,
+        ),
+    )
 
 
 def _start_lifecycle_supervisor_if_enabled() -> None:
@@ -2424,6 +2718,31 @@ async def _complete_startup_initialization():
         except Exception as e:
             logger.warning(f"Startup: TF-IDF refresh drain failed to start (non-fatal): {e}")
 
+        # MAINT-097: durable membership/index reconciliation is an invariant,
+        # independent of optional maintenance and refresh feature flags.
+        try:
+            from app.retrieval.lifecycle_index_drain import (
+                disable_lifecycle_index_drain,
+                start_lifecycle_index_drain,
+            )
+
+            if _benchmark_readonly_startup:
+                disable_lifecycle_index_drain("benchmark_readonly")
+                logger.info("Startup: Lifecycle index outbox drain skipped in benchmark-readonly mode")
+            else:
+                app.state.lifecycle_index_outbox_task = await start_lifecycle_index_drain()
+                logger.info("Startup: Lifecycle index outbox drain started")
+        except Exception as e:
+            _set_degraded_reason(app.state.degraded_reason or "lifecycle_index_outbox_failed")
+            logger.error(f"Startup: Lifecycle index outbox drain failed to start: {e}", exc_info=True)
+            app.state.startup_warnings.append(
+                {
+                    "component": "lifecycle_index_outbox",
+                    "severity": "critical",
+                    "message": f"Lifecycle index outbox drain failed: {e}",
+                }
+            )
+
         if getattr(app.state, "retrieval_state", "recovering") != "degraded":
             app.state.retrieval_state = "ready"
         if app.state.write_state != "blocked":
@@ -2615,6 +2934,13 @@ async def shutdown_event():
         await stop_refresh_drain()
     except Exception as e:
         logger.warning(f"Shutdown: TF-IDF refresh drain stop failed: {e}")
+    try:
+        from app.retrieval.lifecycle_index_drain import stop_lifecycle_index_drain
+
+        await stop_lifecycle_index_drain()
+        logger.info("Shutdown: Lifecycle index outbox drain stopped")
+    except Exception as e:
+        logger.warning(f"Shutdown: Lifecycle index outbox drain stop failed: {e}")
     try:
         shutdown_diagnostic_warmer(wait=True)  # EUNOMIA-126
         logger.info("Shutdown: diagnostic warmer stopped")
@@ -3041,6 +3367,55 @@ def _deferred_health_metric(reason: str, *, pressure_state: Any | None = None) -
     }
 
 
+def _build_foreground_contract_health() -> dict[str, Any]:
+    from app.ops.metrics import metrics
+
+    since = (_utc_now() - timedelta(hours=1)).isoformat()
+    opens = metrics.query_counter_summary(
+        FOREGROUND_CONTRACT_CIRCUIT_OPEN_METRIC,
+        since=since,
+        strict=True,
+    )
+    enforce_opens = metrics.query_counter_summary(
+        FOREGROUND_CONTRACT_CIRCUIT_OPEN_METRIC,
+        since=since,
+        labels_filter={"mode": "enforce"},
+        strict=True,
+    )
+    decisions = metrics.query_counter_summary(
+        FOREGROUND_CONTRACT_DECISION_METRIC,
+        since=since,
+        strict=True,
+    )
+    decision_count = int(decisions["count"])
+    circuit_open_count = int(opens["count"])
+    enforce_circuit_open_count = int(enforce_opens["count"])
+    rate = round(circuit_open_count / decision_count * 100, 2) if decision_count else None
+    if decision_count == 0:
+        status = "unknown"
+        alert = False
+        reason = "no_decisions_in_window"
+    elif enforce_circuit_open_count > 0:
+        status = "warning"
+        alert = True
+        reason = "enforced_circuit_open_observed"
+    else:
+        status = "ok"
+        alert = False
+        reason = "no_enforced_circuit_opens"
+    return {
+        "status": status,
+        "alert": alert,
+        "decision_count": decision_count,
+        "circuit_open_count": circuit_open_count,
+        "enforce_circuit_open_count": enforce_circuit_open_count,
+        "circuit_open_rate_pct": rate,
+        "newest_open_at": opens["newest_timestamp"],
+        "window_seconds": 3600,
+        "reason": reason,
+    }
+
+
 @app.get("/health")
 def health_check(request: Request, detail: str | None = None):
     health_start = time.perf_counter()
@@ -3150,6 +3525,23 @@ def health_check(request: Request, detail: str | None = None):
                     _build_lifecycle_jobs_health,
                 )
             )
+            foreground_contract = (
+                _deferred_health_metric(defer_reason, pressure_state=pressure_state)
+                if defer_db_metrics and defer_reason in {"pressure_protected_health", "health_detail_budget_exhausted"}
+                else _build_unavailable_health_metric(defer_reason)
+                if defer_db_metrics and defer_reason is not None
+                else _run_health_section(
+                    "foreground_contract",
+                    health_start,
+                    health_budget_ms,
+                    _build_foreground_contract_health,
+                )
+            )
+            external_scheduler_component = external_maintenance["scheduler_state"]
+            if external_scheduler_component == "not_installed":
+                external_scheduler_component = "disabled"
+            elif external_scheduler_component == "scheduled":
+                external_scheduler_component = "available"
             ready["components"] = {
                 "storage": "ok",
                 "retrieval_index": ready["retrieval_state"],
@@ -3159,10 +3551,11 @@ def health_check(request: Request, detail: str | None = None):
                 "curiosity_engine": "ok",
                 "maintenance_scheduler": effective_state,
                 "maintenance_scheduler_builtin": built_in_state,
-                "maintenance_scheduler_external": external_maintenance["scheduler_state"],
+                "maintenance_scheduler_external": external_scheduler_component,
                 "required_context_cache": required_context_cache.get("status", "unknown"),
                 "conversation_turn_latency": conversation_turn_latency.get("status", "unknown"),
                 "lifecycle_jobs": lifecycle_jobs.get("status", "unknown"),
+                "foreground_contract": foreground_contract.get("status", "unknown"),
                 "autolearn_maintenance": "unknown",
             }
             if defer_db_metrics:
@@ -3233,6 +3626,7 @@ def health_check(request: Request, detail: str | None = None):
             }
             ready["metrics"]["session_learn_queue"] = session_learn_queue
             ready["metrics"]["lifecycle_jobs"] = lifecycle_jobs
+            ready["metrics"]["foreground_contract"] = foreground_contract
             autolearn_maintenance = _build_autolearn_maintenance_health(defer_reason if defer_db_metrics else None)
             ready["metrics"]["autolearn_maintenance"] = autolearn_maintenance
             ready["components"]["autolearn_maintenance"] = autolearn_maintenance.get("status", "unknown")
@@ -3246,6 +3640,7 @@ def health_check(request: Request, detail: str | None = None):
                 session_learn_queue=session_learn_queue,
             )
             ready["feature_flags"] = _get_feature_flags()
+            _derive_health_status(ready)
             ready["health_elapsed_ms"] = _health_elapsed_ms(health_start)
             return ready
 
@@ -4023,6 +4418,115 @@ def _build_pith_health_authoritative_cached(capture_budget_ms: int, *, force_ref
             capture_budget_ms=capture_budget_ms,
             capture_started=capture_started,
         )
+
+
+def _build_deferred_full_health_payload(base: dict, active_reflection: dict | None) -> dict:
+    """Return a full-mode health payload without synchronous legacy full analysis."""
+    health = dict(base)
+    section_errors = dict(health.get("section_errors") or {})
+    section_errors.setdefault("full_analysis", "deferred: synchronous_full_health_disabled")
+    section_errors.setdefault("fts_verbatim_parity", "deferred: synchronous_full_health_disabled")
+
+    existing_reason = health.get("capture_degraded_reason")
+    deferred_reason = "full_sections_deferred"
+    if existing_reason:
+        degraded_reason = (
+            existing_reason if deferred_reason in str(existing_reason) else f"{existing_reason};{deferred_reason}"
+        )
+    else:
+        degraded_reason = deferred_reason
+
+    health["mode"] = "full"
+    health["partial"] = True
+    health["section_errors"] = section_errors
+    health["capture_degraded"] = True
+    health["capture_degraded_reason"] = degraded_reason
+    health["active_reflection"] = active_reflection
+    health.pop("fts_verbatim_parity", None)
+    health.setdefault("generated_at", _utc_now_iso())
+    health.setdefault("cache_age_ms", 0)
+    health.setdefault("section_timings_ms", {})
+    return health
+
+
+_PITH_HEALTH_ALLOWED_INCLUDES = {
+    "fts_concepts_parity",
+    "fts_verbatim_parity",
+}
+
+
+def _parse_pith_health_include(include: str | None) -> set[str]:
+    if not include:
+        return set()
+    requested = {part.strip() for part in include.split(",") if part.strip()}
+    unknown = requested - _PITH_HEALTH_ALLOWED_INCLUDES
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail=f"unknown pith_health include(s): {','.join(sorted(unknown))}",
+        )
+    return requested
+
+
+def _append_capture_degraded_reason(existing: object, reason: str) -> str:
+    if not existing:
+        return reason
+    existing_text = str(existing)
+    return existing_text if reason in existing_text else f"{existing_text};{reason}"
+
+
+def _attach_requested_pith_health_sections(
+    health: dict,
+    requested_sections: set[str],
+    *,
+    capture_started: float,
+    capture_budget_ms: int,
+) -> dict:
+    if not requested_sections:
+        return health
+    from app.storage.stats import get_fts_concepts_parity, get_fts_verbatim_parity
+
+    enriched = dict(health)
+    section_errors = dict(enriched.get("section_errors") or {})
+    parity_sections = (
+        ("fts_concepts_parity", get_fts_concepts_parity),
+        ("fts_verbatim_parity", get_fts_verbatim_parity),
+    )
+    for section_name, loader in parity_sections:
+        if section_name not in requested_sections:
+            continue
+        elapsed_ms = int((time.monotonic() - capture_started) * 1000)
+        remaining_budget_ms = capture_budget_ms - elapsed_ms
+        if remaining_budget_ms <= 0:
+            parity = {
+                "status": "unavailable",
+                "error": "budget_exceeded",
+                "budget_ms": 0,
+            }
+        else:
+            parity_budget_ms = min(1000, remaining_budget_ms)
+            try:
+                parity = loader(budget_ms=parity_budget_ms)
+            except Exception as err:
+                parity = {
+                    "status": "unavailable",
+                    "error": _safe_error(err),
+                    "budget_ms": parity_budget_ms,
+                }
+
+        enriched[section_name] = parity
+        if parity.get("status") == "unavailable":
+            section_errors[section_name] = parity.get("error", "unavailable")
+            enriched["partial"] = True
+            enriched["capture_degraded"] = True
+            enriched["capture_degraded_reason"] = _append_capture_degraded_reason(
+                enriched.get("capture_degraded_reason"),
+                f"{section_name}_unavailable",
+            )
+        else:
+            section_errors.pop(section_name, None)
+    enriched["section_errors"] = section_errors
+    return enriched
 
 
 def _build_empty_knowledge_areas_payload(error: str) -> dict:
@@ -6612,16 +7116,20 @@ def pith_health(
     freshness: str = "fast",
     force_refresh: bool = False,
     capture_budget_ms: str | None = None,
+    include: str | None = None,
 ):
     """Get pith health analysis."""
     if detail not in {"fast", "full"}:
         raise HTTPException(status_code=400, detail="detail must be 'fast' or 'full'")
+    requested_sections = _parse_pith_health_include(include)
     _validate_diagnostic_freshness(freshness)
-    if capture_budget_ms is not None:
-        _bounded_capture_budget_ms(
+    request_budget_ms = None
+    if capture_budget_ms is not None or detail == "full" or freshness == "authoritative" or requested_sections:
+        request_budget_ms = _bounded_capture_budget_ms(
             capture_budget_ms,
             default_ms=DIAGNOSTIC_AUTHORITATIVE_CAPTURE_BUDGET_DEFAULT_MS,
         )
+    capture_started = time.monotonic()
     ready = _build_ready_state()
     try:
         from app.ops.reflection_runner import reflection_runner
@@ -6656,133 +7164,32 @@ def pith_health(
             authoritative=False,
             value_semantics="unavailable",
             degraded_reason=reason,
-            capture_budget_ms=_bounded_capture_budget_ms(
-                capture_budget_ms,
-                default_ms=DIAGNOSTIC_AUTHORITATIVE_CAPTURE_BUDGET_DEFAULT_MS,
-            ),
+            capture_budget_ms=request_budget_ms or DIAGNOSTIC_AUTHORITATIVE_CAPTURE_BUDGET_DEFAULT_MS,
         )
     if detail == "fast":
         if freshness == "authoritative":
-            budget_ms = _bounded_capture_budget_ms(
-                capture_budget_ms,
-                default_ms=DIAGNOSTIC_AUTHORITATIVE_CAPTURE_BUDGET_DEFAULT_MS,
-            )
-            return _build_pith_health_authoritative_cached(budget_ms, force_refresh=force_refresh)
-        return _build_pith_health_fast_cached()
-
-    try:
-        health = reflection_engine.analyze_stability()
-
-        # FEDERATION L1.5: Add model diversity stats
-        try:
-            from app.storage import _get_connection
-
-            conn = _get_connection()
-            model_rows = conn.execute(
-                "SELECT model_id, COUNT(*) as session_count "
-                "FROM sessions WHERE model_id IS NOT NULL AND model_id != 'unknown' "
-                "GROUP BY model_id ORDER BY session_count DESC"
-            ).fetchall()
-            health["model_stats"] = {
-                "models_seen": [{"model_id": r[0], "session_count": r[1]} for r in model_rows],
-                "unique_model_count": len(model_rows),
-            }
-        except Exception as e:
-            health["model_stats"] = {"error": _safe_error(e)}
-
-        # FEDERATION L2: Add federation status (A4.2)
-        try:
-            from app.storage import _db
-
-            with _db() as conn:
-                tables = [
-                    r[0]
-                    for r in conn.execute(
-                        "SELECT name FROM sqlite_master WHERE type='table' AND name='federation_events'"
-                    ).fetchall()
-                ]
-                if "federation_events" in tables:
-                    recent_events = conn.execute(
-                        "SELECT COUNT(*) FROM federation_events WHERE created_at > datetime('now', '-24 hours')"
-                    ).fetchone()[0]
-                    unconsumed = conn.execute("SELECT COUNT(*) FROM federation_events WHERE consumed = 0").fetchone()[0]
-                    total_events = conn.execute("SELECT COUNT(*) FROM federation_events").fetchone()[0]
-                    # MAINT-015: Accurate bridge status
-                    if total_events > 0 and unconsumed == total_events:
-                        bridge_status = "no_consumer"
-                    elif unconsumed >= 1000:
-                        bridge_status = "backpressure"
-                    elif unconsumed > 0:
-                        bridge_status = "lagging"
-                    else:
-                        bridge_status = "healthy"
-                    health["federation_status"] = {
-                        "events_emitted_24h": recent_events,
-                        "events_unconsumed": unconsumed,
-                        "events_total": total_events,
-                        "bridge_status": bridge_status,
-                        "bridge_healthy": bridge_status in ("healthy", "lagging"),
-                    }
-        except Exception as e:
-            health["federation_status"] = {"error": _safe_error(e)}
-
-        # VERBATIM-SURFACE A4: FTS5 parity check
-        try:
-            from app.storage import _db as _vs_db
-
-            with _vs_db() as _vs_conn:
-                _fts_count = _vs_conn.execute(
-                    "SELECT COUNT(DISTINCT fc.c0) "
-                    "FROM fts_verbatim_content fc "
-                    "JOIN verbatim_fragments vf ON vf.id = fc.c0 "
-                    "JOIN concepts c ON c.id = vf.concept_id "
-                    "WHERE vf.fragment_type='conversation' "
-                    "AND vf.content IS NOT NULL "
-                    "AND c.status='active'"
-                ).fetchone()[0]
-                _canonical_count = _vs_conn.execute(
-                    "SELECT COUNT(*) FROM verbatim_fragments vf "
-                    "JOIN concepts c ON c.id = vf.concept_id "
-                    "WHERE vf.fragment_type='conversation' "
-                    "AND vf.content IS NOT NULL "
-                    "AND c.status='active'"
-                ).fetchone()[0]
-                _fts_drift = abs(_fts_count - _canonical_count) / max(_canonical_count, 1)
-                health["fts_verbatim_parity"] = {
-                    "fts_count": _fts_count,
-                    "canonical_count": _canonical_count,
-                    "drift_pct": round(_fts_drift * 100, 1),
-                    "status": "ok" if _fts_drift <= 0.05 else "degraded",
-                }
-        except Exception as _vs_err:
-            health["fts_verbatim_parity"] = {"error": str(_vs_err)}
-
-        # STABILITY-021: Include startup warnings in health
-        warnings = getattr(app.state, "startup_warnings", [])
-        if warnings:
-            health["startup_warnings"] = warnings
-            health["startup_degraded"] = any(w["severity"] == "critical" for w in warnings)
-
-        health["active_reflection"] = active_reflection
-        health.setdefault("mode", "full")
-        health.setdefault("generated_at", _utc_now_iso())
-        health.setdefault("cache_age_ms", 0)
-        health.setdefault("partial", False)
-        health.setdefault("section_errors", {})
-        health.setdefault("section_timings_ms", {})
-        return _annotate_capture_contract(
-            health,
-            requested_freshness=freshness,
-            authoritative=freshness == "authoritative",
-            value_semantics="real",
-            degraded_reason=None,
-            capture_budget_ms=_bounded_capture_budget_ms(
-                capture_budget_ms,
-                default_ms=DIAGNOSTIC_AUTHORITATIVE_CAPTURE_BUDGET_DEFAULT_MS,
-            ),
+            base_health = _build_pith_health_authoritative_cached(request_budget_ms, force_refresh=force_refresh)
+        else:
+            base_health = _build_pith_health_fast_cached()
+        return _attach_requested_pith_health_sections(
+            base_health,
+            requested_sections,
+            capture_started=capture_started,
+            capture_budget_ms=request_budget_ms or DIAGNOSTIC_AUTHORITATIVE_CAPTURE_BUDGET_DEFAULT_MS,
         )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=_safe_error(e))
+
+    budget_ms = request_budget_ms or DIAGNOSTIC_AUTHORITATIVE_CAPTURE_BUDGET_DEFAULT_MS
+    if freshness == "authoritative":
+        base_health = _build_pith_health_authoritative_cached(budget_ms, force_refresh=force_refresh)
+    else:
+        base_health = _build_pith_health_fast_cached()
+    full_health = _build_deferred_full_health_payload(base_health, active_reflection)
+    return _attach_requested_pith_health_sections(
+        full_health,
+        requested_sections,
+        capture_started=capture_started,
+        capture_budget_ms=budget_ms,
+    )
 
 
 @app.get("/memory_projection")
@@ -6808,81 +7215,27 @@ def maintenance_health():
     """Amendment 3: Check maintenance scheduler health via heartbeat file."""
     result = _build_maintenance_health()
     result["session_learn_queue"] = _build_session_learn_queue_health()
+    try:
+        from app.retrieval.lifecycle_index_drain import get_lifecycle_index_outbox_status
+
+        result["lifecycle_index_outbox"] = get_lifecycle_index_outbox_status()
+    except Exception as exc:
+        result["lifecycle_index_outbox"] = {
+            "status": "critical",
+            "alert": True,
+            "worker_running": False,
+            "latest_error": _safe_error(exc),
+        }
     return result
 
 
 @app.get("/health/backup")
 def backup_health():
-    """OPS-153: Backup health status — structured JSON for monitoring dashboards.
-
-    Returns age, size, concept count, integrity, and a clear status:
-      healthy: backup exists and is <12h old
-      warning: backup exists but is 12-24h old
-      critical: backup missing or >24h old or integrity failure
-    """
-    import sqlite3 as _sqlite3
-    from datetime import UTC
-    from datetime import datetime as _dt
-
+    """OPS-575: Serve bounded producer-cached maintenance-backup proof."""
     from app.core.profile import resolve_data_dir
+    from app.ops.backup_health import build_backup_health_response
 
-    data_dir = resolve_data_dir()
-    backup_path = data_dir / "pith_backup.db"
-
-    if not backup_path.exists():
-        return {
-            "status": "critical",
-            "reason": "no_backup",
-            "message": "No backup file found. Run maintenance or wait for next 6h cycle.",
-            "backup_path": str(backup_path),
-            "timestamp": _utc_now_iso(),
-        }
-
-    try:
-        stat = backup_path.stat()
-        backup_age_hours = (_utc_now() - _ensure_aware(_dt.fromtimestamp(stat.st_mtime, tz=UTC))).total_seconds() / 3600
-        backup_size_mb = round(stat.st_size / 1024 / 1024, 1)
-
-        # Read-only connection to backup for integrity + concept count
-        verify_conn = _sqlite3.connect(f"file:{backup_path}?mode=ro", uri=True)
-        try:
-            integrity = verify_conn.execute("PRAGMA quick_check").fetchone()[0]
-            concept_count = verify_conn.execute("SELECT COUNT(*) FROM concepts WHERE is_current = 1").fetchone()[0]
-        finally:
-            verify_conn.close()
-
-        # Determine status
-        if integrity != "ok":
-            status = "critical"
-            reason = "integrity_failure"
-        elif backup_age_hours > 24:
-            status = "critical"
-            reason = "stale_backup"
-        elif backup_age_hours > 12:
-            status = "warning"
-            reason = "aging_backup"
-        else:
-            status = "healthy"
-            reason = "ok"
-
-        return {
-            "status": status,
-            "reason": reason,
-            "backup_age_hours": round(backup_age_hours, 1),
-            "backup_size_mb": backup_size_mb,
-            "concept_count": concept_count,
-            "integrity": integrity,
-            "backup_path": str(backup_path),
-            "timestamp": _utc_now_iso(),
-        }
-    except Exception as e:
-        return {
-            "status": "critical",
-            "reason": "read_error",
-            "message": _safe_error(e),
-            "backup_path": str(backup_path),
-            "timestamp": _utc_now_iso(),
-        }
+    return build_backup_health_response(resolve_data_dir(), now=_utc_now())
 
 
 @app.post("/pith/benchmark", dependencies=[Depends(verify_api_key)])
@@ -7035,6 +7388,18 @@ def maintenance_status():
         status["tfidf_refresh_drain"] = get_drain_status()
     except Exception:
         pass
+
+    try:
+        from app.retrieval.lifecycle_index_drain import get_lifecycle_index_outbox_status
+
+        status["lifecycle_index_outbox"] = get_lifecycle_index_outbox_status()
+    except Exception as exc:
+        status["lifecycle_index_outbox"] = {
+            "status": "critical",
+            "alert": True,
+            "worker_running": False,
+            "latest_error": _safe_error(exc),
+        }
 
     return status
 
@@ -7704,7 +8069,7 @@ def auto_associate_batch_endpoint(request: AutoAssociateBatchRequest = None):
     """Run batch auto-association pipeline across all active concepts.
 
     Two-tier strategy:
-      Tier 1 — cosine similarity above tier1_threshold (default 0.12)
+      Tier 1 — cosine similarity above tier1_threshold (default 0.18)
       Tier 2 — lower cosine + same knowledge_area for remaining orphans
 
     All parameters optional with sensible defaults. Use dry_run=true to preview.
@@ -7712,7 +8077,7 @@ def auto_associate_batch_endpoint(request: AutoAssociateBatchRequest = None):
     if request is None:
         request = AutoAssociateBatchRequest()
     try:
-        result = auto_associate_batch(request)
+        result = auto_associate_batch(request, invocation_source="api")
         return result.model_dump()
     except Exception as e:
         logger.error(f"auto_associate_batch error: {e}", exc_info=True)
@@ -7829,6 +8194,8 @@ async def session_end(request: Request):
         recognized_fields = {
             "request_id",
             "session_id",
+            "binding",
+            "binding_generation",
             "origin_id",
             "previous_response",
             "previous_message",
@@ -7843,7 +8210,7 @@ async def session_end(request: Request):
                 except ValidationError as exc:
                     raise HTTPException(
                         status_code=400,
-                        detail=exc.errors(include_context=False),
+                        detail=_redact_request_validation_errors(exc.errors(include_context=False)),
                     ) from exc
 
         request_id = _ensure_session_end_request_id(request_id)
@@ -7851,6 +8218,95 @@ async def session_end(request: Request):
             end_request = end_request.model_copy(update={"request_id": request_id})
         request_payload = dict(body) if isinstance(body, dict) else {}
         request_payload["request_id"] = request_id
+
+        if end_request is not None and end_request.binding is not None:
+            from app.core.profile import get_active_profile
+            from app.session.binding import ManagedBindingError, request_managed_close
+
+            try:
+                _require_managed_session_end_runtime(end_request)
+                profile = get_active_profile()
+
+                def _begin_managed_close_replay(conn, context):
+                    return begin_write_request(
+                        "session_end",
+                        request_id,
+                        request_payload=end_request.model_dump(mode="json"),
+                        authority=ManagedReplayAuthority(
+                            profile=context.profile,
+                            binding_hash=context.binding_hash,
+                            session_id=context.session_id,
+                        ),
+                        conn=conn,
+                    )
+
+                close = request_managed_close(
+                    end_request,
+                    profile=profile,
+                    reason="explicit",
+                    now=datetime.now(UTC),
+                    begin_replay=_begin_managed_close_replay,
+                )
+                replay_state = close.pop("_replay_state", None)
+                if close.get("replay") is not None:
+                    return close["replay"]
+                if close.get("status") == "already_terminal":
+                    terminal_phase = str(close.get("lifecycle_phase") or "ended")
+                    terminal_payload = {
+                        "status": terminal_phase,
+                        "session_id": close["session_id"],
+                        "binding_generation": close["binding_generation"],
+                        "lifecycle_phase": terminal_phase,
+                        "final_learning_state": ("committed" if terminal_phase == "ended" else "needs_attention"),
+                        "_protocol": {
+                            "binding_mode": "managed",
+                            "binding_protocol_version": end_request.binding.protocol_version,
+                            "binding_generation": close["binding_generation"],
+                            "lifecycle_phase": terminal_phase,
+                        },
+                    }
+                    return _commit_session_end_result(
+                        request_id,
+                        terminal_payload,
+                        replay_state=replay_state,
+                    )
+                _submit_managed_session_end_drain()
+                payload = _session_end_processing_payload(
+                    request_id,
+                    processing_time_ms=(time.perf_counter() - start) * 1000,
+                )
+                payload["_protocol"] = {
+                    "binding_mode": "managed",
+                    "binding_protocol_version": end_request.binding.protocol_version,
+                    "binding_generation": close["binding_generation"],
+                    "lifecycle_phase": "closing",
+                }
+                return payload
+            except HTTPException as exc:
+                duplicate = exc.status_code == 409 and (
+                    exc.detail == "Duplicate write request is already processing"
+                    or (isinstance(exc.detail, dict) and exc.detail.get("error") == "managed_replay_already_processing")
+                )
+                if duplicate:
+                    payload = _session_end_processing_payload(
+                        request_id,
+                        processing_time_ms=(time.perf_counter() - start) * 1000,
+                    )
+                    payload["_protocol"] = {
+                        "binding_mode": "managed",
+                        "binding_protocol_version": end_request.binding.protocol_version,
+                        "binding_generation": end_request.binding_generation,
+                        "lifecycle_phase": "closing",
+                    }
+                    return payload
+                raise
+            except ManagedBindingError as exc:
+                headers = {"Retry-After": "1"} if exc.status_code in {423, 503} else None
+                raise HTTPException(
+                    status_code=exc.status_code,
+                    detail={"error": exc.code, "request_id": request_id},
+                    headers=headers,
+                ) from exc
 
         try:
             replay_state = begin_write_request("session_end", request_id, request_payload=request_payload)
@@ -7881,6 +8337,72 @@ async def session_end(request: Request):
             raise
 
 
+def _ensure_conversation_turn_request_id(
+    request: ConversationTurnRequest,
+) -> tuple[ConversationTurnRequest, str]:
+    request_id = request.request_id or new_conversation_turn_request_id()
+    if request.request_id == request_id:
+        return request, request_id
+    try:
+        request.request_id = request_id
+        return request, request_id
+    except Exception:
+        return request.model_copy(update={"request_id": request_id}), request_id
+
+
+def _conversation_turn_http_exception(
+    exc: HTTPException,
+    request_id: str,
+) -> HTTPException:
+    headers = dict(exc.headers or {})
+    headers["X-Pith-Request-Id"] = request_id
+    detail = exc.detail
+    if isinstance(detail, dict):
+        detail = {**detail, "request_id": request_id}
+    return HTTPException(status_code=exc.status_code, detail=detail, headers=headers)
+
+
+def _prepare_managed_conversation_turn_binding(request, context) -> dict[str, Any]:
+    """Push the exact episode selected by the managed binding gateway."""
+
+    if request.binding is None or request.session_id != context.session_id:
+        from app.session.binding import ManagedBindingError
+
+        raise ManagedBindingError("binding_context_mismatch")
+    session = session_manager._session_info_from_row(load_session(context.session_id))
+    if session is None or session.status != "active":
+        from app.session.binding import ManagedBindingError
+
+        raise ManagedBindingError("managed_episode_changed")
+    session_token, active_token = session_manager._push_request_session(session)
+    return {
+        "session_token": session_token,
+        "active_token": active_token,
+        "bind_status": "bound",
+        "binding_source": "managed_binding",
+        "resolved_session_id": context.session_id,
+    }
+
+
+def _require_managed_conversation_turn_runtime(request: ConversationTurnRequest) -> None:
+    """Fail closed before admission when prior-turn work cannot be durably run."""
+
+    if not request.previous_response or len(request.previous_response) < 30:
+        return
+    from app.session.binding import ManagedBindingError
+    from app.session.lifecycle_jobs_runtime import lifecycle_job_runner_registered
+
+    if (
+        not _cfg.LIFECYCLE_JOBS_ENABLED
+        or not _cfg.get_feature_flag("BACKGROUND_AUTOLEARN_ENABLED", True)
+        or not lifecycle_job_runner_registered("conversation_turn")
+    ):
+        raise ManagedBindingError(
+            "managed_post_response_registration_unavailable",
+            status_code=503,
+        )
+
+
 @app.post("/conversation_turn", dependencies=[Depends(verify_api_key)])
 def conversation_turn_endpoint(
     request: ConversationTurnRequest,
@@ -7889,64 +8411,182 @@ def conversation_turn_endpoint(
 ):
     """Pre-response context activation. Given a user message, find and return
     the most relevant existing knowledge. Read-only. Target: <50ms."""
-    if getattr(app.state, "startup_task", None) is not None:
-        _require_retrieval_ready("conversation_turn")
-    is_hook_additional_context = getattr(request, "context_delivery_mode", "") == "hook_additional_context"
-    # PERF-FORT-1: Semaphore prevents threadpool starvation under concurrent load
+    request, request_id = _ensure_conversation_turn_request_id(request)
+    is_hook_additional_context = request.context_delivery_mode == "hook_additional_context"
     acquired = False
-    if not is_hook_additional_context:
-        acquired = _HEAVY_ENDPOINT_SEMAPHORE.acquire(timeout=HEAVY_ENDPOINT_TIMEOUT_S)
-        if not acquired:
-            raise HTTPException(
-                status_code=503,
-                detail="Server under heavy load — try again in a few seconds",
-                headers={"Retry-After": "3"},
-            )
+    acquired_hook = False
     binding = None
+    managed_context = None
+    managed_guard = None
+    managed_shadow = None
     try:
+        if getattr(app.state, "startup_task", None) is not None:
+            _require_retrieval_ready("conversation_turn")
+        if is_hook_additional_context:
+            acquired_hook = _HOOK_ADDITIONAL_CONTEXT_SEMAPHORE.acquire(timeout=HOOK_ADDITIONAL_CONTEXT_TIMEOUT_S)
+            if not acquired_hook:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Pith hook context lane saturated - try again shortly",
+                    headers={"Retry-After": "1"},
+                )
+        else:
+            acquired = _HEAVY_ENDPOINT_SEMAPHORE.acquire(timeout=HEAVY_ENDPOINT_TIMEOUT_S)
+            if not acquired:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Server under heavy load — try again in a few seconds",
+                    headers={"Retry-After": "3"},
+                )
         request.transport_mode = x_pith_transport
-        binding = session_manager.prepare_conversation_turn_binding(request)
-        result = session_manager.conversation_turn(request)
+        if request.binding is not None:
+            from app.core.profile import get_active_profile
+            from app.session.binding import observe_managed_shadow_turn, resolve_managed_turn
+
+            profile = get_active_profile()
+            managed_shadow = observe_managed_shadow_turn(request, profile=profile)
+            if managed_shadow is not None:
+                # Capability material is needed only for the read-only shadow
+                # validation above; keep it out of the legacy request pipeline.
+                request.binding = None
+                binding = session_manager.prepare_conversation_turn_binding(request)
+            else:
+                _require_managed_conversation_turn_runtime(request)
+                managed_context, managed_guard = resolve_managed_turn(
+                    request,
+                    profile=profile,
+                    now=datetime.now(UTC),
+                )
+                request.session_id = managed_context.session_id
+                binding = _prepare_managed_conversation_turn_binding(
+                    request,
+                    managed_context,
+                )
+        else:
+            binding = session_manager.prepare_conversation_turn_binding(request)
+        if managed_context is not None:
+            from app.session.binding import managed_episode_context
+
+            with managed_episode_context(managed_context):
+                result = session_manager.conversation_turn(request)
+        else:
+            result = session_manager.conversation_turn(request)
+        result.request_id = request_id
         result.bind_status = binding["bind_status"]
         result.binding_source = binding["binding_source"]
         result.resolved_session_id = binding["resolved_session_id"]
+        session_active = bool(binding["bind_status"] == "bound" and binding["resolved_session_id"])
+        session_active_source = (
+            "server_binding_bound_with_resolved_session_id"
+            if session_active
+            else "server_binding_unbound_or_missing_session"
+        )
+        result.session_active = session_active
+        result.session_active_source = session_active_source
+        result.auth_error = None
         if binding["bind_status"] == "unbound":
             result.working_context = None
             result.checkpoint_resume_available = False
-        # EUNOMIA-039 Fix 3: Dispatch autolearn AFTER response is sent to client
-        background_tasks.add_task(session_manager.dispatch_post_response_tasks, result)
-        return result.model_dump()
-    except Exception as e:
-        from app.governance.repo_hygiene_policy import RepoHygienePolicyError
+        if managed_context is not None:
+            from app.session.binding import (
+                build_managed_post_response_plan,
+                register_managed_post_response_plan,
+            )
 
-        if isinstance(e, RepoHygienePolicyError):
-            raise HTTPException(
+            managed_plan = build_managed_post_response_plan(
+                result,
+                context=managed_context,
+            )
+            managed_autolearn_registered = register_managed_post_response_plan(
+                managed_plan,
+                response=result,
+            )
+            if managed_autolearn_registered:
+                background_tasks.add_task(_submit_managed_conversation_turn_drain)
+            dedup_key = getattr(result, "_pending_turn_dedup_key", None)
+            if dedup_key:
+                object.__setattr__(
+                    result,
+                    "_pending_turn_dedup_key",
+                    f"{managed_context.binding_hash}:{dedup_key}",
+                )
+        # EUNOMIA-039 Fix 3: Dispatch global post-response work after response.
+        background_tasks.add_task(session_manager.dispatch_post_response_tasks, result)
+        payload = result.model_dump()
+        payload["_protocol"] = {
+            "request_id": request_id,
+            "bind_status": result.bind_status,
+            "binding_source": result.binding_source,
+            "resolved_session_id": result.resolved_session_id,
+            "session_active": result.session_active,
+            "session_active_source": result.session_active_source,
+            "auth_error": result.auth_error,
+        }
+        if managed_context is not None:
+            payload["_protocol"].update(
+                {
+                    "binding_mode": "managed",
+                    "binding_protocol_version": managed_context.protocol_version,
+                    "binding_generation": managed_context.generation,
+                    "lifecycle_phase": "active",
+                }
+            )
+        elif managed_shadow is not None:
+            payload["_protocol"].update(
+                {
+                    "binding_mode": "shadow",
+                    "binding_protocol_version": managed_shadow.protocol_version,
+                    "lifecycle_phase": "active",
+                }
+            )
+        return payload
+    except HTTPException as exc:
+        raise _conversation_turn_http_exception(exc, request_id) from exc
+    except Exception as exc:
+        from app.governance.repo_hygiene_policy import RepoHygienePolicyError
+        from app.session.binding import ManagedBindingError
+
+        if isinstance(exc, ManagedBindingError):
+            headers = {"Retry-After": "1"} if exc.status_code in {423, 503} else None
+            http_exc = HTTPException(
+                status_code=exc.status_code,
+                detail={"error": exc.code},
+                headers=headers,
+            )
+        elif isinstance(exc, RepoHygienePolicyError):
+            http_exc = HTTPException(
                 status_code=400,
                 detail={
-                    "error": e.error_code,
-                    "message": e.detail,
-                    "workspace_context": e.workspace_context,
+                    "error": exc.error_code,
+                    "message": exc.detail,
+                    "workspace_context": exc.workspace_context,
                 },
             )
-        if e.__class__.__name__ == "InvalidSessionBindingError":
-            raise HTTPException(
+        elif exc.__class__.__name__ == "InvalidSessionBindingError":
+            http_exc = HTTPException(
                 status_code=404,
                 detail={
                     "error": "invalid_session_id",
-                    "message": str(e),
-                    "session_id": getattr(e, "session_id", None),
-                    "reason": getattr(e, "reason", "invalid_session_id"),
-                    "session_status": getattr(e, "session_status", None),
+                    "message": str(exc),
+                    "session_id": getattr(exc, "session_id", None),
+                    "reason": getattr(exc, "reason", "invalid_session_id"),
+                    "session_status": getattr(exc, "session_status", None),
                 },
-            ) from e
-        logger.error(f"conversation_turn error: {e}")
-        raise HTTPException(status_code=500, detail=_safe_error(e))
+            )
+        else:
+            logger.error("conversation_turn error: %s", exc)
+            http_exc = HTTPException(status_code=500, detail=_safe_error(exc))
+        raise _conversation_turn_http_exception(http_exc, request_id) from exc
     finally:
         if binding is not None:
             session_manager._pop_request_session(
                 binding["session_token"],
                 binding["active_token"],
             )
+        if managed_guard is not None:
+            managed_guard.release()
+        if acquired_hook:
+            _HOOK_ADDITIONAL_CONTEXT_SEMAPHORE.release()
         if acquired:
             _HEAVY_ENDPOINT_SEMAPHORE.release()
 
@@ -8048,7 +8688,13 @@ def _prepare_structured_session_learn_fast_path(request: SessionLearnRequest) ->
         request.trigger_path = "session_learn_structured_fast_path"
 
 
-def _enqueue_session_learn_lifecycle_job(request: SessionLearnRequest, request_id: str) -> dict:
+def _enqueue_session_learn_lifecycle_job(
+    request: SessionLearnRequest,
+    request_id: str,
+    *,
+    managed_context=None,
+    replay_state: WriteReplayState | None = None,
+) -> dict:
     from app.session.lifecycle_jobs_runtime import enqueue_session_learn_job, submit_lifecycle_drain
 
     enqueue_start = time.perf_counter()
@@ -8056,6 +8702,8 @@ def _enqueue_session_learn_lifecycle_job(request: SessionLearnRequest, request_i
         learn_request=request,
         request_id=request_id,
         priority=_SESSION_LEARN_LIFECYCLE_PRIORITY,
+        managed_context=managed_context,
+        replay_state=replay_state,
     )
     _record_session_learn_lifecycle_latency(
         "session_learn_lifecycle_enqueue_latency_ms",
@@ -8075,8 +8723,61 @@ def _enqueue_session_learn_lifecycle_job(request: SessionLearnRequest, request_i
     return job
 
 
+def _require_managed_session_learn_runtime(request: SessionLearnRequest) -> None:
+    """Fail closed before managed learning admission if its runner is unavailable."""
+
+    if request.binding is None:
+        return
+    from app.session.binding import ManagedBindingError
+    from app.session.lifecycle_jobs_runtime import lifecycle_job_runner_registered
+
+    if not _cfg.LIFECYCLE_JOBS_ENABLED or not lifecycle_job_runner_registered("session_learn"):
+        raise ManagedBindingError(
+            "managed_learning_registration_unavailable",
+            status_code=503,
+        )
+
+
+def _managed_replay_state_from_job(job: dict, *, endpoint: str) -> WriteReplayState:
+    payload = job.get("payload") or {}
+    replay = payload.get("managed_replay") if isinstance(payload, dict) else None
+    if not isinstance(replay, dict):
+        raise ValueError(f"managed {endpoint} lifecycle job missing replay authority")
+    external_request_id = str(replay.get("external_request_id") or "")
+    storage_request_id = str(replay.get("storage_request_id") or "")
+    request_hash = str(replay.get("request_hash") or "")
+    claim_token = str(replay.get("claim_token") or "")
+    binding_hash = str(job.get("binding_hash") or "")
+    session_id = str(job.get("session_id") or "")
+    if not all((external_request_id, storage_request_id, request_hash, claim_token, binding_hash, session_id)):
+        raise ValueError(f"managed {endpoint} lifecycle replay authority is incomplete")
+    return WriteReplayState(
+        request_id=external_request_id,
+        storage_request_id=storage_request_id,
+        request_hash=request_hash,
+        binding_hash=binding_hash,
+        session_id=session_id,
+        claim_token=claim_token,
+    )
+
+
 def _ensure_session_end_request_id(request_id: str | None) -> str:
     return request_id or f"se_srv_{uuid.uuid4().hex[:16]}"
+
+
+def _require_managed_session_end_runtime(request: SessionEndRequest) -> None:
+    """Fail closed before managed close admission if its runner is unavailable."""
+
+    if request.binding is None:
+        return
+    from app.session.binding import ManagedBindingError
+    from app.session.lifecycle_jobs_runtime import lifecycle_job_runner_registered
+
+    if not _cfg.LIFECYCLE_JOBS_ENABLED or not lifecycle_job_runner_registered("session_end"):
+        raise ManagedBindingError(
+            "managed_close_registration_unavailable",
+            status_code=503,
+        )
 
 
 def _session_end_processing_payload(request_id: str, *, processing_time_ms: float = 0.0) -> dict:
@@ -8151,6 +8852,7 @@ def _build_unavailable_health_metric(reason: str) -> dict:
     return {
         "status": "unknown",
         "alert": False,
+        "deferred": True,
         "reason": reason,
     }
 
@@ -8223,9 +8925,39 @@ def _build_lifecycle_jobs_health() -> dict:
         oldest_queued_age = _iso_age_seconds(summary.get("oldest_queued_updated_at"))
         oldest_running_age = _iso_age_seconds(summary.get("oldest_running_updated_at"))
         last_committed_age = _iso_age_seconds(summary.get("last_committed_updated_at"))
-        if queued_count > 50 or (oldest_queued_age or 0) > 600 or stale_running_count > 0:
+        max_deferred_attempts = int(summary.get("max_deferred_attempts") or 0)
+        oldest_deferred_age = _iso_age_seconds(summary.get("oldest_deferred_at"))
+        critical_deferred_attempts = max(1, int(_cfg.LIFECYCLE_JOB_MAX_DEFERRALS or 0))
+        warning_deferred_attempts = max(1, critical_deferred_attempts // 2)
+        critical_deferred_age = max(1.0, float(_cfg.LIFECYCLE_JOB_DEFER_MAX_AGE_SECONDS or 0.0))
+        warning_deferred_age = critical_deferred_age / 2.0
+        deferred_critical = max_deferred_attempts >= critical_deferred_attempts or (
+            (oldest_deferred_age or 0) >= critical_deferred_age
+        )
+        deferred_warning = max_deferred_attempts >= warning_deferred_attempts or (
+            (oldest_deferred_age or 0) >= warning_deferred_age
+        )
+
+        def source_payload(source_summary: dict, *, enabled: bool) -> dict:
+            return {
+                "enabled": enabled,
+                "queued_count": int(source_summary["queued_count"]),
+                "running_count": int(source_summary["running_count"]),
+                "retry_count": int(source_summary["retry_count"]),
+                "failed_count": int(source_summary["failed_count"]),
+                "committed_count": int(source_summary["committed_count"]),
+                "skipped_count": int(source_summary["skipped_count"]),
+                "stale_running_count": int(source_summary["stale_running_count"]),
+                "max_deferred_attempts": int(source_summary.get("max_deferred_attempts") or 0),
+                "oldest_deferred_age_seconds": _iso_age_seconds(source_summary.get("oldest_deferred_at")),
+                "oldest_queued_age_seconds": _iso_age_seconds(source_summary.get("oldest_queued_updated_at")),
+                "oldest_running_age_seconds": _iso_age_seconds(source_summary.get("oldest_running_updated_at")),
+                "last_committed_age_seconds": _iso_age_seconds(source_summary.get("last_committed_updated_at")),
+            }
+
+        if queued_count > 50 or (oldest_queued_age or 0) > 600 or stale_running_count > 0 or deferred_critical:
             status = "critical"
-        elif queued_count > 10 or (oldest_queued_age or 0) > 120:
+        elif queued_count > 10 or (oldest_queued_age or 0) > 120 or deferred_warning:
             status = "warning"
         else:
             status = "ok"
@@ -8240,6 +8972,8 @@ def _build_lifecycle_jobs_health() -> dict:
             "committed_count": int(summary["committed_count"]),
             "skipped_count": int(summary["skipped_count"]),
             "stale_running_count": stale_running_count,
+            "max_deferred_attempts": max_deferred_attempts,
+            "oldest_deferred_age_seconds": oldest_deferred_age,
             "oldest_queued_age_seconds": oldest_queued_age,
             "oldest_running_age_seconds": oldest_running_age,
             "last_committed_age_seconds": last_committed_age,
@@ -8252,39 +8986,19 @@ def _build_lifecycle_jobs_health() -> dict:
             "critical_queued_count": 50,
             "warning_oldest_queued_age_seconds": 120,
             "critical_oldest_queued_age_seconds": 600,
+            "warning_max_deferred_attempts": warning_deferred_attempts,
+            "critical_max_deferred_attempts": critical_deferred_attempts,
+            "warning_deferred_age_seconds": warning_deferred_age,
+            "critical_deferred_age_seconds": critical_deferred_age,
             "by_source": {
-                "session_learn": {
-                    "enabled": bool(_SESSION_LEARN_LIFECYCLE_JOBS_ENABLED),
-                    "queued_count": int(session_learn_summary["queued_count"]),
-                    "running_count": int(session_learn_summary["running_count"]),
-                    "retry_count": int(session_learn_summary["retry_count"]),
-                    "failed_count": int(session_learn_summary["failed_count"]),
-                    "committed_count": int(session_learn_summary["committed_count"]),
-                    "skipped_count": int(session_learn_summary["skipped_count"]),
-                    "stale_running_count": int(session_learn_summary["stale_running_count"]),
-                    "oldest_queued_age_seconds": _iso_age_seconds(
-                        session_learn_summary.get("oldest_queued_updated_at")
-                    ),
-                    "oldest_running_age_seconds": _iso_age_seconds(
-                        session_learn_summary.get("oldest_running_updated_at")
-                    ),
-                    "last_committed_age_seconds": _iso_age_seconds(
-                        session_learn_summary.get("last_committed_updated_at")
-                    ),
-                },
-                "reflection_full": {
-                    "enabled": bool(_cfg.REFLECTION_DURABLE_JOBS_ENABLED),
-                    "queued_count": int(reflection_summary["queued_count"]),
-                    "running_count": int(reflection_summary["running_count"]),
-                    "retry_count": int(reflection_summary["retry_count"]),
-                    "failed_count": int(reflection_summary["failed_count"]),
-                    "committed_count": int(reflection_summary["committed_count"]),
-                    "skipped_count": int(reflection_summary["skipped_count"]),
-                    "stale_running_count": int(reflection_summary["stale_running_count"]),
-                    "oldest_queued_age_seconds": _iso_age_seconds(reflection_summary.get("oldest_queued_updated_at")),
-                    "oldest_running_age_seconds": _iso_age_seconds(reflection_summary.get("oldest_running_updated_at")),
-                    "last_committed_age_seconds": _iso_age_seconds(reflection_summary.get("last_committed_updated_at")),
-                },
+                "session_learn": source_payload(
+                    session_learn_summary,
+                    enabled=bool(_SESSION_LEARN_LIFECYCLE_JOBS_ENABLED),
+                ),
+                "reflection_full": source_payload(
+                    reflection_summary,
+                    enabled=bool(_cfg.REFLECTION_DURABLE_JOBS_ENABLED),
+                ),
             },
         }
     except Exception as exc:
@@ -8294,6 +9008,17 @@ def _build_lifecycle_jobs_health() -> dict:
             "reason": "lifecycle_jobs_health_failed",
             "error": _safe_error(exc),
         }
+
+
+def _build_observability_background_tasks() -> dict[str, int]:
+    """Project durable lifecycle queue state into the legacy API shape."""
+    lifecycle_health = _build_lifecycle_jobs_health()
+    if lifecycle_health.get("status") == "unknown":
+        raise RuntimeError("lifecycle job health unavailable")
+    return {
+        "running": int(lifecycle_health.get("running_count") or 0),
+        "queued": int(lifecycle_health.get("queued_count") or 0),
+    }
 
 
 def _build_autolearn_maintenance_health(defer_reason: str | None = None) -> dict[str, Any]:
@@ -8575,10 +9300,26 @@ def _lifecycle_job_blocks_session_learn_replay(lifecycle_job: dict | None, now_d
 
 
 def _run_session_learn_lifecycle_job(job: dict) -> dict:
-    request_id = job.get("idempotency_key") or job.get("request_id")
+    managed = job.get("binding_hash") is not None
+    replay_state = _managed_replay_state_from_job(job, endpoint="session_learn") if managed else None
+    request_id = (
+        replay_state.request_id if replay_state is not None else (job.get("idempotency_key") or job.get("request_id"))
+    )
     if not request_id:
         raise ValueError("session_learn lifecycle job missing idempotency_key")
-    committed = _load_committed_session_learn_replay(str(request_id))
+    if replay_state is not None:
+        replay_row = load_write_request_replay(
+            "session_learn",
+            str(job.get("profile") or ""),
+            str(replay_state.storage_request_id),
+        )
+        committed = (
+            dict(replay_row["response"])
+            if replay_row and replay_row.get("status") == "committed" and replay_row.get("response")
+            else None
+        )
+    else:
+        committed = _load_committed_session_learn_replay(str(request_id))
     if committed is not None:
         _record_session_learn_contract_metric("session_learn_lifecycle_replay_already_committed")
         return {"status": "replay_already_committed", "request_id": request_id}
@@ -8589,8 +9330,35 @@ def _run_session_learn_lifecycle_job(job: dict) -> dict:
         raise ValueError("session_learn lifecycle job missing learn_request payload")
     request_payload.setdefault("request_id", request_id)
     request = SessionLearnRequest(**request_payload)
-    result = _run_session_learn_replay_payload(request.model_dump(mode="json"))
-    _commit_session_learn_result(str(request_id), result)
+
+    def _run_effect():
+        binding = None
+        prepare_binding = getattr(session_manager, "prepare_session_learn_binding", None)
+        if callable(prepare_binding):
+            binding = prepare_binding(request)
+        try:
+            return _run_session_learn_replay_payload(request.model_dump(mode="json"))
+        finally:
+            if binding is not None:
+                session_manager._pop_request_session(
+                    binding["session_token"],
+                    binding["active_token"],
+                )
+
+    if managed:
+        from app.session.binding import BindingBusyError, run_managed_session_learn_effect
+        from app.session.lifecycle_jobs_runtime import LifecycleJobDeferred
+
+        try:
+            result = run_managed_session_learn_effect(job, run_effect=_run_effect)
+        except BindingBusyError as exc:
+            raise LifecycleJobDeferred("managed_episode_guard_busy", retry_after_seconds=1) from exc
+    else:
+        result = _run_effect()
+    if replay_state is not None:
+        _commit_session_learn_result(str(request_id), result, replay_state=replay_state)
+    else:
+        _commit_session_learn_result(str(request_id), result)
     _record_session_learn_contract_metric("session_learn_lifecycle_committed")
     return {"status": "committed", "request_id": request_id}
 
@@ -8797,13 +9565,26 @@ def _run_write_replay_reclaimer(endpoint: str, reason: str, batch_size: int | No
     return result
 
 
-def _commit_session_learn_result(request_id: str, result) -> dict:
+def _commit_session_learn_result(
+    request_id: str,
+    result,
+    *,
+    replay_state: WriteReplayState | None = None,
+) -> dict:
     payload = result.model_dump()
     if not payload.get("request_id"):
         payload["request_id"] = request_id
     if not payload.get("processing_state"):
         payload["processing_state"] = "committed"
-    payload = commit_write_request("session_learn", request_id, payload)
+    if replay_state is not None:
+        payload = commit_write_request(
+            "session_learn",
+            request_id,
+            payload,
+            replay_state=replay_state,
+        )
+    else:
+        payload = commit_write_request("session_learn", request_id, payload)
     _record_successful_write()
     return payload
 
@@ -8821,9 +9602,22 @@ def _coerce_session_end_payload(request_id: str, result) -> dict:
     return payload
 
 
-def _commit_session_end_result(request_id: str, result) -> dict:
+def _commit_session_end_result(
+    request_id: str,
+    result,
+    *,
+    replay_state: WriteReplayState | None = None,
+) -> dict:
     payload = _coerce_session_end_payload(request_id, result)
-    payload = commit_write_request("session_end", request_id, payload)
+    if replay_state is not None:
+        payload = commit_write_request(
+            "session_end",
+            request_id,
+            payload,
+            replay_state=replay_state,
+        )
+    else:
+        payload = commit_write_request("session_end", request_id, payload)
     _record_successful_write()
     return payload
 
@@ -8857,78 +9651,143 @@ def session_learn_endpoint(request: SessionLearnRequest):
     Fast requests return synchronously; slow requests return replayable processing state."""
     start = time.perf_counter()
     request, request_id = _ensure_session_learn_request_id(request)
+    managed_context = None
+    managed_guard = None
+    replay_state = None
     try:
-        replay_state = begin_write_request(
-            "session_learn",
-            request_id,
-            request_payload=request.model_dump(mode="json"),
-        )
-    except HTTPException as exc:
-        if exc.status_code == 409:
-            _record_session_learn_initial_response_latency(start, "processing_duplicate")
+        if request.binding is not None:
+            _require_managed_session_learn_runtime(request)
+            from app.core.profile import get_active_profile
+            from app.session.binding import resolve_managed_learning
+
+            managed_context, managed_guard = resolve_managed_learning(
+                request,
+                profile=get_active_profile(),
+            )
+            authority = ManagedReplayAuthority(
+                profile=managed_context.profile,
+                binding_hash=managed_context.binding_hash,
+                session_id=managed_context.session_id,
+            )
+        else:
+            authority = None
+
+        try:
+            replay_state = begin_write_request(
+                "session_learn",
+                request_id,
+                request_payload=request.model_dump(mode="json"),
+                authority=authority,
+            )
+        except HTTPException as exc:
+            if exc.status_code == 409:
+                _record_session_learn_initial_response_latency(start, "processing_duplicate")
+                return _session_learn_processing_payload(
+                    request_id,
+                    processing_time_ms=(time.perf_counter() - start) * 1000,
+                )
+            _record_session_learn_initial_response_latency(start, "error")
+            raise
+        if replay_state.replay is not None:
+            _record_session_learn_initial_response_latency(start, "replay")
+            return replay_state.replay
+
+        structured_fast_path = managed_context is None and _should_commit_structured_session_learn_fast_path(request)
+        if structured_fast_path:
+            _prepare_structured_session_learn_fast_path(request)
+
+        def _do_session_learn():
+            binding = None
+            prepare_binding = getattr(session_manager, "prepare_session_learn_binding", None)
+            if callable(prepare_binding):
+                binding = prepare_binding(request)
+            try:
+                return _with_db_retry(lambda: session_manager.session_learn(request))
+            finally:
+                if binding is not None:
+                    session_manager._pop_request_session(
+                        binding["session_token"],
+                        binding["active_token"],
+                    )
+
+        if managed_context is not None or (_SESSION_LEARN_LIFECYCLE_JOBS_ENABLED and not structured_fast_path):
+            try:
+                if managed_context is not None:
+                    _enqueue_session_learn_lifecycle_job(
+                        request,
+                        request_id,
+                        managed_context=managed_context,
+                        replay_state=replay_state,
+                    )
+                else:
+                    _enqueue_session_learn_lifecycle_job(request, request_id)
+            except Exception as exc:
+                abandon_write_request(
+                    "session_learn",
+                    request_id,
+                    error_class=type(exc).__name__,
+                    replay_state=replay_state if managed_context is not None else None,
+                )
+                _record_session_learn_initial_response_latency(start, "error")
+                logger.error("session_learn lifecycle enqueue error: %s", exc, exc_info=True)
+                if managed_context is not None:
+                    from app.session.binding import ManagedBindingError
+
+                    raise ManagedBindingError(
+                        "managed_learning_registration_unavailable",
+                        status_code=503,
+                    ) from exc
+                raise HTTPException(status_code=500, detail=_safe_error(exc)) from exc
+            _record_session_learn_contract_metric("session_learn_lifecycle_deferred")
+            _record_session_learn_lifecycle_latency("session_learn_lifecycle_ack_latency_ms", start)
+            _record_session_learn_initial_response_latency(start, "lifecycle_processing")
+            payload = _session_learn_processing_payload(
+                request_id,
+                processing_time_ms=(time.perf_counter() - start) * 1000,
+            )
+            if managed_context is not None:
+                payload["_protocol"] = {
+                    "binding_mode": "managed",
+                    "binding_protocol_version": managed_context.protocol_version,
+                    "binding_generation": managed_context.generation,
+                    "lifecycle_phase": "active",
+                }
+            return payload
+
+        future = _get_session_learn_executor().submit(_do_session_learn)
+        try:
+            result = future.result(timeout=_remaining_session_learn_sync_wait(start))
+            _record_session_learn_initial_response_latency(start, "committed")
+            return _commit_session_learn_result(request_id, result)
+        except concurrent.futures.TimeoutError:
+            future.add_done_callback(lambda done_future: _finalize_deferred_session_learn(done_future, request_id))
+            _record_session_learn_contract_metric("session_learn_deferred")
+            _schedule_session_learn_reclaimer("deferred_session_learn")
+            _record_session_learn_initial_response_latency(start, "processing_deferred")
             return _session_learn_processing_payload(
                 request_id,
                 processing_time_ms=(time.perf_counter() - start) * 1000,
             )
-        _record_session_learn_initial_response_latency(start, "error")
-        raise
-    if replay_state.replay is not None:
-        _record_session_learn_initial_response_latency(start, "replay")
-        return replay_state.replay
-
-    structured_fast_path = _should_commit_structured_session_learn_fast_path(request)
-    if structured_fast_path:
-        _prepare_structured_session_learn_fast_path(request)
-
-    def _do_session_learn():
-        binding = None
-        prepare_binding = getattr(session_manager, "prepare_session_learn_binding", None)
-        if callable(prepare_binding):
-            binding = prepare_binding(request)
-        try:
-            return _with_db_retry(lambda: session_manager.session_learn(request))
-        finally:
-            if binding is not None:
-                session_manager._pop_request_session(
-                    binding["session_token"],
-                    binding["active_token"],
-                )
-
-    if _SESSION_LEARN_LIFECYCLE_JOBS_ENABLED and not structured_fast_path:
-        try:
-            _enqueue_session_learn_lifecycle_job(request, request_id)
-        except Exception as e:
-            abandon_write_request("session_learn", request_id, error_class=type(e).__name__)
+        except Exception as exc:
+            abandon_write_request("session_learn", request_id, error_class=type(exc).__name__)
             _record_session_learn_initial_response_latency(start, "error")
-            logger.error("session_learn lifecycle enqueue error: %s", e, exc_info=True)
-            raise HTTPException(status_code=500, detail=_safe_error(e))
-        _record_session_learn_contract_metric("session_learn_lifecycle_deferred")
-        _record_session_learn_lifecycle_latency("session_learn_lifecycle_ack_latency_ms", start)
-        _record_session_learn_initial_response_latency(start, "lifecycle_processing")
-        return _session_learn_processing_payload(
-            request_id,
-            processing_time_ms=(time.perf_counter() - start) * 1000,
-        )
+            logger.error("session_learn error: %s", exc)
+            raise HTTPException(status_code=500, detail=_safe_error(exc)) from exc
+    except Exception as exc:
+        from app.session.binding import ManagedBindingError
 
-    future = _get_session_learn_executor().submit(_do_session_learn)
-    try:
-        result = future.result(timeout=_remaining_session_learn_sync_wait(start))
-        _record_session_learn_initial_response_latency(start, "committed")
-        return _commit_session_learn_result(request_id, result)
-    except concurrent.futures.TimeoutError:
-        future.add_done_callback(lambda done_future: _finalize_deferred_session_learn(done_future, request_id))
-        _record_session_learn_contract_metric("session_learn_deferred")
-        _schedule_session_learn_reclaimer("deferred_session_learn")
-        _record_session_learn_initial_response_latency(start, "processing_deferred")
-        return _session_learn_processing_payload(
-            request_id,
-            processing_time_ms=(time.perf_counter() - start) * 1000,
-        )
-    except Exception as e:
-        abandon_write_request("session_learn", request_id, error_class=type(e).__name__)
-        _record_session_learn_initial_response_latency(start, "error")
-        logger.error(f"session_learn error: {e}")
-        raise HTTPException(status_code=500, detail=_safe_error(e))
+        if isinstance(exc, ManagedBindingError):
+            _record_session_learn_initial_response_latency(start, "error")
+            headers = {"Retry-After": "1"} if exc.status_code in {423, 503} else None
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail={"error": exc.code, "request_id": request_id},
+                headers=headers,
+            ) from exc
+        raise
+    finally:
+        if managed_guard is not None:
+            managed_guard.release()
 
 
 @app.get("/sessions_list")
@@ -8940,13 +9799,71 @@ def sessions_list_endpoint(status: str = None, limit: int = 20, since: str = Non
 @app.post("/write_request_status", dependencies=[Depends(verify_api_key)])
 def write_request_status_endpoint(body: dict):
     """Redacted idempotent write-request status for lifecycle conformance."""
+    managed_guard = None
     try:
-        return get_write_request_status(
-            str(body.get("endpoint") or ""),
-            body.get("request_id"),
+        endpoint = str(body.get("endpoint") or "")
+        request_id = body.get("request_id")
+        if "binding" not in body:
+            return get_write_request_status(endpoint, request_id)
+        binding_payload = body.get("binding")
+
+        try:
+            envelope = SessionBindingEnvelope.model_validate(binding_payload)
+        except ValidationError as exc:
+            binding_errors = []
+            for error in exc.errors(include_context=False):
+                item = dict(error)
+                item["loc"] = ("binding", *(item.get("loc") or ()))
+                binding_errors.append(item)
+            raise HTTPException(
+                status_code=400,
+                detail=_redact_request_validation_errors(binding_errors),
+            ) from exc
+
+        from app.core.profile import get_active_profile
+        from app.session.binding import (
+            ManagedBindingError,
+            authorize_managed_write_request_status,
         )
+
+        context, lifecycle_phase, managed_guard = authorize_managed_write_request_status(
+            envelope,
+            session_id=body.get("session_id"),
+            binding_generation=body.get("binding_generation"),
+            profile=get_active_profile(),
+        )
+        result = get_write_request_status(
+            endpoint,
+            request_id,
+            authority=ManagedReplayAuthority(
+                profile=context.profile,
+                binding_hash=context.binding_hash,
+                session_id=context.session_id,
+            ),
+        )
+        result["_protocol"] = {
+            "binding_mode": "managed",
+            "binding_protocol_version": context.protocol_version,
+            "binding_generation": context.generation,
+            "lifecycle_phase": lifecycle_phase,
+        }
+        return result
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        from app.session.binding import ManagedBindingError
+
+        if isinstance(exc, ManagedBindingError):
+            headers = {"Retry-After": "1"} if exc.status_code in {423, 503} else None
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail={"error": exc.code, "request_id": body.get("request_id")},
+                headers=headers,
+            ) from exc
+        raise
+    finally:
+        if managed_guard is not None:
+            managed_guard.release()
 
 
 def _record_checkpoint_save_telemetry(body: dict) -> None:
@@ -10163,16 +11080,39 @@ async def metrics_dashboard(since: str | None = None):
     try:
         from app.ops.metrics import metrics
 
-        turn_latency = metrics.query_aggregate("conversation_turn_latency_ms", since=since)
-        tier2_calls = metrics.query_count("tier2_llm_cost_calls", since=since)
-        tier2_latency = metrics.query_aggregate("tier2_llm_latency_ms", since=since)
-        contradiction_rate = metrics.query_aggregate("contradiction_detection_rate", since=since)
-        cascade_count = metrics.query_count("cascade_propagation_count", since=since)
-        cb_trips = metrics.query_count("circuit_breaker_trip_count", since=since)
-        retrieval_latency = metrics.query_aggregate("retrieval_search_latency_ms", since=since)
+        window_since = since or (_utc_now() - timedelta(hours=1)).isoformat()
+        turn_latency = metrics.query_aggregate("conversation_turn_latency_ms", since=window_since)
+        tier2_calls = metrics.query_count("tier2_llm_cost_calls", since=window_since)
+        tier2_latency = metrics.query_aggregate("tier2_llm_latency_ms", since=window_since)
+        contradiction_rate = metrics.query_aggregate("contradiction_detection_rate", since=window_since)
+        cascade_count = metrics.query_count("cascade_propagation_count", since=window_since)
+        cb_trips = metrics.query_count("circuit_breaker_trip_count", since=window_since)
+        retrieval_latency = metrics.query_aggregate("retrieval_search_latency_ms", since=window_since)
+        foreground_opens = metrics.query_counter_summary(
+            FOREGROUND_CONTRACT_CIRCUIT_OPEN_METRIC,
+            since=window_since,
+            strict=True,
+        )
+        foreground_enforce_opens = metrics.query_counter_summary(
+            FOREGROUND_CONTRACT_CIRCUIT_OPEN_METRIC,
+            since=window_since,
+            labels_filter={"mode": "enforce"},
+            strict=True,
+        )
+        foreground_decisions = metrics.query_counter_summary(
+            FOREGROUND_CONTRACT_DECISION_METRIC,
+            since=window_since,
+            strict=True,
+        )
+        foreground_decision_count = int(foreground_decisions["count"])
+        foreground_open_count = int(foreground_opens["count"])
+        foreground_enforce_open_count = int(foreground_enforce_opens["count"])
+        foreground_open_rate = (
+            round(foreground_open_count / foreground_decision_count * 100, 2) if foreground_decision_count else None
+        )
 
         # Budget overruns — return recent individual events
-        budget_overruns_raw = metrics.query("budget_overrun_ms", since=since, limit=50)
+        budget_overruns_raw = metrics.query("budget_overrun_ms", since=window_since, limit=50)
         budget_overruns = [
             {"overrun_ms": round(e["value"], 2), "timestamp": e["timestamp"]} for e in budget_overruns_raw
         ]
@@ -10200,6 +11140,11 @@ async def metrics_dashboard(since: str | None = None):
             "cascade_alert": cascade_count > _cascade_alert_threshold(),  # NITS-001: configurable
             "circuit_breaker_trips": cb_trips,
             "circuit_breaker_alert": cb_trips > _circuit_breaker_alert_threshold(),  # MONITOR-072
+            "foreground_contract_circuit_opens": foreground_open_count,
+            "foreground_contract_decisions": foreground_decision_count,
+            "foreground_contract_enforce_circuit_opens": foreground_enforce_open_count,
+            "foreground_contract_open_rate_pct": foreground_open_rate,
+            "foreground_contract_alert": foreground_enforce_open_count > 0,
             "retrieval_search_latency_ms": {
                 "p50": retrieval_latency["p50"],
                 "p95": retrieval_latency["p95"],
@@ -10224,10 +11169,22 @@ async def metrics_bg_tasks(since: str | None = None):
         if since is None:
             since = (_utc_now() - timedelta(hours=24)).isoformat()
         metrics.flush()
+        from app.ops.async_tasks import TASK_CONFIGS
         from app.storage import _db
 
         with _db() as conn:
-            rows = conn.execute(
+            try:
+                ledger_rows = conn.execute(
+                    """SELECT task_type, status, COUNT(*) as total
+                       FROM async_task_runs
+                       WHERE started_at >= ?
+                       GROUP BY task_type, status
+                       ORDER BY task_type, status""",
+                    (since,),
+                ).fetchall()
+            except Exception:
+                ledger_rows = []
+            metric_rows = conn.execute(
                 """SELECT metric, json_extract(labels, '$.task') as task_name,
                           SUM(value) as total
                    FROM metrics
@@ -10237,18 +11194,71 @@ async def metrics_bg_tasks(since: str | None = None):
                    ORDER BY task_name, metric""",
                 (since,),
             ).fetchall()
-        tasks = {}
-        for metric, task_name, total in rows:
+
+        expected_task_names = sorted(
+            task_type for task_type, config in TASK_CONFIGS.items() if config.interval_hours > 0
+        )
+        tasks = {
+            task_name: {
+                "success": 0,
+                "failure": 0,
+                "cancelled": 0,
+                "total": 0,
+                "failure_rate": 0,
+                "status": "never_observed",
+            }
+            for task_name in expected_task_names
+        }
+        ledger_observed_tasks = set()
+        for task_name, status, total in ledger_rows:
             task_name = task_name or "unknown"
+            if status == "success":
+                kind = "success"
+            elif status in ("failed", "timeout"):
+                kind = "failure"
+            elif status == "cancelled":
+                kind = "cancelled"
+            else:
+                continue
             if task_name not in tasks:
-                tasks[task_name] = {"success": 0, "failure": 0, "cancelled": 0}
+                tasks[task_name] = {
+                    "success": 0,
+                    "failure": 0,
+                    "cancelled": 0,
+                    "total": 0,
+                    "failure_rate": 0,
+                    "status": "observed_unregistered",
+                }
+            tasks[task_name][kind] += int(total or 0)
+            ledger_observed_tasks.add(task_name)
+        for metric, task_name, total in metric_rows:
+            task_name = task_name or "unknown"
+            if task_name in ledger_observed_tasks:
+                continue
+            if task_name not in tasks:
+                tasks[task_name] = {
+                    "success": 0,
+                    "failure": 0,
+                    "cancelled": 0,
+                    "total": 0,
+                    "failure_rate": 0,
+                    "status": "observed_unregistered",
+                }
             kind = metric.replace("bg_task_", "")
             tasks[task_name][kind] = int(total)
         for counts in tasks.values():
             total = counts["success"] + counts["failure"] + counts["cancelled"]
             counts["total"] = total
             counts["failure_rate"] = round(counts["failure"] / max(total, 1), 3)
-        return {"since": since, "tasks": tasks}
+            if total > 0:
+                counts["status"] = "degraded" if counts["failure"] > 0 else "ok"
+        observed_task_count = sum(1 for counts in tasks.values() if counts["total"] > 0)
+        return {
+            "since": since,
+            "expected_task_count": len(expected_task_names),
+            "observed_task_count": observed_task_count,
+            "tasks": tasks,
+        }
     except Exception as e:
         raise HTTPException(500, _safe_error(e))
 
@@ -10506,28 +11516,49 @@ async def pith_observability():
     try:
         from app.ops.metrics import metrics
 
-        turn_latency = metrics.query_aggregate("conversation_turn_latency_ms")
-        retrieval_latency = metrics.query_aggregate("retrieval_search_latency_ms")
-        cb_trips = metrics.query_count("circuit_breaker_trip_count")
-        budget_overruns = metrics.query_count("budget_overrun_ms")
+        window_since = (_utc_now() - timedelta(hours=1)).isoformat()
+        turn_latency = metrics.query_aggregate("conversation_turn_latency_ms", since=window_since)
+        retrieval_latency = metrics.query_aggregate("retrieval_search_latency_ms", since=window_since)
+        cb_trips = metrics.query_count("circuit_breaker_trip_count", since=window_since)
+        budget_overruns = metrics.query_count("budget_overrun_ms", since=window_since)
+        foreground_opens = metrics.query_counter_summary(
+            FOREGROUND_CONTRACT_CIRCUIT_OPEN_METRIC,
+            since=window_since,
+            strict=True,
+        )
+        foreground_enforce_opens = metrics.query_counter_summary(
+            FOREGROUND_CONTRACT_CIRCUIT_OPEN_METRIC,
+            since=window_since,
+            labels_filter={"mode": "enforce"},
+            strict=True,
+        )
+        foreground_decisions = metrics.query_counter_summary(
+            FOREGROUND_CONTRACT_DECISION_METRIC,
+            since=window_since,
+            strict=True,
+        )
+        foreground_decision_count = int(foreground_decisions["count"])
+        foreground_open_count = int(foreground_opens["count"])
+        foreground_enforce_open_count = int(foreground_enforce_opens["count"])
         result["performance"] = {
             "conversation_turn_latency_p95_ms": turn_latency.get("p95"),
             "retrieval_latency_p95_ms": retrieval_latency.get("p95"),
             "circuit_breaker_trips": cb_trips,
             "budget_overruns": budget_overruns,
+            "foreground_contract_circuit_opens": foreground_open_count,
+            "foreground_contract_decisions": foreground_decision_count,
+            "foreground_contract_enforce_circuit_opens": foreground_enforce_open_count,
+            "foreground_contract_open_rate_pct": (
+                round(foreground_open_count / foreground_decision_count * 100, 2) if foreground_decision_count else None
+            ),
+            "foreground_contract_alert": foreground_enforce_open_count > 0,
         }
     except Exception as e:
         result["performance"] = {"error": _safe_error(e)}
 
     # --- Background tasks ---
     try:
-        from app.ops.metrics import metrics
-
-        bg = metrics.query_bg_tasks()
-        result["background_tasks"] = {
-            "running": bg.get("running", 0),
-            "queued": bg.get("queued", 0),
-        }
+        result["background_tasks"] = _build_observability_background_tasks()
     except Exception as e:
         result["background_tasks"] = {"error": _safe_error(e)}
 
@@ -10535,10 +11566,11 @@ async def pith_observability():
     try:
         stability = result.get("cognitive", {}).get("stability_score") or 0
         cb = result.get("performance", {}).get("circuit_breaker_trips") or 0
+        foreground_enforce_opens = result.get("performance", {}).get("foreground_contract_enforce_circuit_opens") or 0
         p95 = result.get("performance", {}).get("conversation_turn_latency_p95_ms") or 0
         if stability < 0.4 or cb >= 5:
             result["status"] = "unhealthy"
-        elif stability < 0.7 or cb > 0 or (p95 and p95 > 5000):
+        elif stability < 0.7 or cb > 0 or foreground_enforce_opens > 0 or (p95 and p95 > 5000):
             result["status"] = "degraded"
         else:
             result["status"] = "healthy"
@@ -11391,4 +12423,8 @@ def verbatim_stats():
 if __name__ == "__main__":
     import uvicorn
 
+    if sys.platform.startswith("win"):
+        policy_factory = getattr(asyncio, "WindowsSelectorEventLoopPolicy", None)
+        if policy_factory is not None:
+            asyncio.set_event_loop_policy(policy_factory())
     uvicorn.run(app, host=PITH_HOST, port=PITH_PORT)

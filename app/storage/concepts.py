@@ -10,7 +10,7 @@ import re
 import sqlite3
 import threading
 import time as _time_mod
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -100,6 +100,65 @@ class LifecycleTransitionError(ValueError):
     """Raised when a caller asks for an invalid concept lifecycle transition."""
 
 
+_GOVERNANCE_CURRENCY_STATUSES = frozenset({"CONTESTED", "CONTRADICTED"})
+
+
+def apply_current_governance_currency_conn(
+    conn: sqlite3.Connection,
+    concept_id: str,
+    target_status: str,
+    *,
+    excluded_current_statuses: Collection[str] = (),
+    now: str | None = None,
+) -> int:
+    """Set governance currency only for a canonical current concept.
+
+    DATA-078: historical governance decisions can outlive the concept lifecycle.
+    Eligibility is therefore checked in the final UPDATE, and SQL/JSON currency
+    mirrors move together. The caller owns the transaction.
+    """
+    if target_status not in _GOVERNANCE_CURRENCY_STATUSES:
+        raise ValueError(f"unsupported governance currency status: {target_status!r}")
+
+    exclusions = tuple(dict.fromkeys(excluded_current_statuses))
+    invalid_exclusions = [value for value in exclusions if value not in _GOVERNANCE_CURRENCY_STATUSES]
+    if invalid_exclusions:
+        raise ValueError(f"unsupported excluded governance currency statuses: {invalid_exclusions!r}")
+
+    params: dict[str, object] = {
+        "concept_id": concept_id,
+        "target_status": target_status,
+        "now": now or _utc_now_iso(),
+    }
+    exclusion_sql = ""
+    if exclusions:
+        placeholders: list[str] = []
+        for index, value in enumerate(exclusions):
+            key = f"excluded_{index}"
+            params[key] = value
+            placeholders.append(f":{key}")
+        exclusion_sql = f"AND COALESCE(currency_status, '') NOT IN ({', '.join(placeholders)})"
+
+    cursor = conn.execute(
+        f"""UPDATE concepts
+            SET currency_status = :target_status,
+                data = json_set(COALESCE(data, '{{}}'), '$.currency_status', :target_status),
+                updated_at = :now
+            WHERE id = :concept_id
+              AND status = 'active'
+              AND is_current = 1
+              AND (superseded_by IS NULL OR superseded_by = '')
+              AND COALESCE(currency_status, '') != :target_status
+              {exclusion_sql}
+              AND CASE
+                    WHEN json_valid(COALESCE(data, '{{}}'))
+                    THEN json_type(COALESCE(data, '{{}}'))
+                  END = 'object'""",
+        params,
+    )
+    return cursor.rowcount
+
+
 def _json_set_status_expr(*paths: tuple[str, str]) -> str:
     """Build a json_set expression with literal JSON paths and bound values."""
     if not paths:
@@ -148,6 +207,63 @@ def _data_update_sql(
         removes = ", ".join(f"'{path}'" for path in remove_paths)
         expr = f"json_remove({expr}, {removes})"
     return f", data = {expr}"
+
+
+@dataclass(frozen=True)
+class _PersistedLifecycleState:
+    status: str | None
+    is_current: int
+    currency_status: str | None
+    superseded_by: str | None
+
+
+def _load_persisted_lifecycle_state(
+    conn: sqlite3.Connection,
+    concept_id: str,
+) -> _PersistedLifecycleState | None:
+    row = conn.execute(
+        """SELECT status, is_current, currency_status, superseded_by
+           FROM concepts WHERE id = ?""",
+        (concept_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return _PersistedLifecycleState(
+        status=row[0],
+        is_current=int(row[1] or 0),
+        currency_status=row[2],
+        superseded_by=row[3],
+    )
+
+
+def _apply_persisted_lifecycle_to_data(
+    data: dict,
+    lifecycle: _PersistedLifecycleState,
+    concept_id: str,
+) -> None:
+    incoming = (
+        data.get("status"),
+        data.get("currency_status"),
+        data.get("superseded_by"),
+    )
+    persisted = (
+        lifecycle.status,
+        lifecycle.currency_status,
+        lifecycle.superseded_by,
+    )
+    if incoming != persisted:
+        logger.warning(
+            "Preserving persisted lifecycle state for %s; incoming=%r persisted=%r",
+            concept_id,
+            incoming,
+            persisted,
+        )
+    data["status"] = lifecycle.status
+    data["currency_status"] = lifecycle.currency_status
+    if lifecycle.superseded_by is None:
+        data.pop("superseded_by", None)
+    else:
+        data["superseded_by"] = lifecycle.superseded_by
 
 
 def apply_lifecycle_transition_conn(
@@ -607,28 +723,36 @@ def _sync_fts5(conn, concept_id: str, summary: str | None = None, delete: bool =
     try:
         if delete:
             conn.execute("DELETE FROM fts_concepts WHERE concept_id = ?", (concept_id,))
-        elif summary:
-            # INGEST-037 L4: Self-read fragment keywords from DB
-            enriched = summary
-            try:
-                fk_row = conn.execute(
-                    "SELECT fragment_keywords FROM concepts WHERE id = ?",
-                    (concept_id,),
-                ).fetchone()
-                fk = fk_row[0] if fk_row and fk_row[0] else None
-                if fk:
-                    enriched = f"{summary} [frag: {fk}]"
-            except Exception:
-                pass  # Column may not exist yet (pre-migration) — degrade gracefully
+            return
+        if not summary:
+            return
 
-            # Upsert: delete old entry then insert new
-            conn.execute("DELETE FROM fts_concepts WHERE concept_id = ?", (concept_id,))
-            conn.execute(
-                "INSERT INTO fts_concepts(concept_id, summary) VALUES (?, ?)",
-                (concept_id, enriched),
-            )
-    except Exception as e:
-        logger.warning(f"FTS5 sync failed for {concept_id}: {e}")
+        conn.execute("DELETE FROM fts_concepts WHERE concept_id = ?", (concept_id,))
+        lifecycle = conn.execute(
+            "SELECT status, is_current FROM concepts WHERE id = ?",
+            (concept_id,),
+        ).fetchone()
+        if lifecycle is None or lifecycle[0] != "active" or int(lifecycle[1] or 0) != 1:
+            return
+
+        enriched = summary
+        try:
+            fk_row = conn.execute(
+                "SELECT fragment_keywords FROM concepts WHERE id = ?",
+                (concept_id,),
+            ).fetchone()
+            fk = fk_row[0] if fk_row and fk_row[0] else None
+            if fk:
+                enriched = f"{summary} [frag: {fk}]"
+        except Exception:
+            pass
+
+        conn.execute(
+            "INSERT INTO fts_concepts(concept_id, summary) VALUES (?, ?)",
+            (concept_id, enriched),
+        )
+    except Exception as exc:
+        logger.warning("FTS5 sync failed for %s: %s", concept_id, exc)
 
 def save_concept(concept: Concept) -> bool | None:
     """Save concept to SQLite. Writes to both concepts (latest) and concept_versions.
@@ -675,29 +799,14 @@ def save_concept(concept: Concept) -> bool | None:
             data["confidence"] = PSIS_QUARANTINE_CONFIDENCE_CAP
 
     with _conn._db() as conn:
-        # Check if concept already exists
-        exists = conn.execute("SELECT 1 FROM concepts WHERE id = ?", (concept.id,)).fetchone()
+        lifecycle = _load_persisted_lifecycle_state(conn, concept.id)
 
-        resolved_ka = _apply_ka_admission_storage_guard(data, resolved_ka, is_new=not bool(exists), now=now)
+        resolved_ka = _apply_ka_admission_storage_guard(data, resolved_ka, is_new=lifecycle is None, now=now)
 
-        if exists:
+        if lifecycle is not None:
             # UPDATE existing — preserves always_activate and other flag columns
             summary_changed, _ = _apply_summary_change_reset(conn, concept.id, data, concept.summary)
-            # FIX-1 (EVOLUTION_CHAIN_BREAK): Prevent in-memory model from overwriting
-            # DB superseded_by back to NULL. If DB has a non-NULL superseded_by but
-            # the in-memory model has None (loaded before supersession), preserve DB value.
-            _superseded_by_val = getattr(concept, "superseded_by", None)
-            if _superseded_by_val is None:
-                _db_superseded = conn.execute(
-                    "SELECT superseded_by FROM concepts WHERE id = ?", (concept.id,)
-                ).fetchone()
-                if _db_superseded and _db_superseded[0] is not None:
-                    _superseded_by_val = _db_superseded[0]
-                    logger.info(
-                        "FIX-1: Preserving DB superseded_by=%s for %s (in-memory was None)",
-                        _superseded_by_val,
-                        concept.id,
-                    )
+            _apply_persisted_lifecycle_to_data(data, lifecycle, concept.id)
 
             # AGENT-004: Include session_id only if concept has one
             # (don't overwrite existing session_id with NULL on evolution)
@@ -732,7 +841,7 @@ def save_concept(concept: Concept) -> bool | None:
                         concept.stability,
                         resolved_ka,  # DEBT-185: use pre-resolved KA (synced to blob)
                         getattr(concept, "concept_type", "insight"),
-                        concept.status,
+                        lifecycle.status,
                         getattr(concept, "salience", 0.5),
                         getattr(concept, "salience_source", "system"),
                         getattr(concept, "maturity", "ESTABLISHED"),
@@ -743,9 +852,9 @@ def save_concept(concept: Concept) -> bool | None:
                         _clamp_score(getattr(concept, "authority_score", None)),  # DEBT-182
                         _clamp_score(getattr(concept, "effective_authority", None)),  # DEBT-182
                         _clamp_score(getattr(concept, "currency_score", None)),  # DEBT-182
-                        getattr(concept, "currency_status", None),
+                        lifecycle.currency_status,
                         *_stale_risk_field_values(data),
-                        _superseded_by_val,  # FIX-1: Use guarded value
+                        lifecycle.superseded_by,
                         getattr(concept, "epistemic_network", None),
                         getattr(concept, "reinforcement_count", None),
                         getattr(concept, "original_date", None),  # TEMPORAL-002
@@ -785,7 +894,7 @@ def save_concept(concept: Concept) -> bool | None:
                         concept.stability,
                         resolved_ka,  # DEBT-185: use pre-resolved KA (synced to blob)
                         getattr(concept, "concept_type", "insight"),
-                        concept.status,
+                        lifecycle.status,
                         getattr(concept, "salience", 0.5),
                         getattr(concept, "salience_source", "system"),
                         getattr(concept, "maturity", "ESTABLISHED"),
@@ -795,9 +904,9 @@ def save_concept(concept: Concept) -> bool | None:
                         _clamp_score(getattr(concept, "authority_score", None)),  # DEBT-182
                         _clamp_score(getattr(concept, "effective_authority", None)),  # DEBT-182
                         _clamp_score(getattr(concept, "currency_score", None)),  # DEBT-182
-                        getattr(concept, "currency_status", None),
+                        lifecycle.currency_status,
                         *_stale_risk_field_values(data),
-                        _superseded_by_val,  # FIX-1: Use guarded value
+                        lifecycle.superseded_by,
                         getattr(concept, "epistemic_network", None),
                         getattr(concept, "reinforcement_count", None),
                         getattr(concept, "original_date", None),  # TEMPORAL-002
@@ -1843,6 +1952,67 @@ def get_association_triples_for_pairs(
     return existing
 
 
+def _normalized_concept_ids(concept_ids: Iterable[str]) -> list[str]:
+    """Return non-empty concept IDs once, preserving caller order."""
+    return list(dict.fromkeys(concept_id for concept_id in concept_ids if concept_id))
+
+
+def get_associated_concept_ids(
+    concept_ids: Iterable[str],
+    *,
+    chunk_size: int = 450,
+) -> set[str]:
+    """Return candidate IDs that participate in any association edge."""
+    normalized = _normalized_concept_ids(concept_ids)
+    if not normalized:
+        return set()
+
+    associated: set[str] = set()
+    safe_chunk_size = max(1, min(chunk_size, 450))
+    with read_snapshot_db("get_associated_concept_ids") as conn:
+        for idx in range(0, len(normalized), safe_chunk_size):
+            chunk = normalized[idx : idx + safe_chunk_size]
+            placeholders = ",".join("?" * len(chunk))
+            rows = conn.execute(
+                f"SELECT source AS id FROM associations WHERE source IN ({placeholders}) "
+                f"UNION SELECT target AS id FROM associations WHERE target IN ({placeholders})",
+                chunk + chunk,
+            ).fetchall()
+            associated.update(row["id"] for row in rows)
+    return associated
+
+
+def get_knowledge_area_map_for_ids(
+    concept_ids: Iterable[str],
+    *,
+    chunk_size: int = 900,
+) -> dict[str, str | None]:
+    """Return active/current knowledge areas for candidate concept IDs."""
+    normalized = _normalized_concept_ids(concept_ids)
+    if not normalized:
+        return {}
+
+    knowledge_areas: dict[str, str | None] = {}
+    safe_chunk_size = max(1, min(chunk_size, 900))
+    with read_snapshot_db("get_knowledge_area_map_for_ids") as conn:
+        for idx in range(0, len(normalized), safe_chunk_size):
+            chunk = normalized[idx : idx + safe_chunk_size]
+            placeholders = ",".join("?" * len(chunk))
+            rows = conn.execute(
+                f"SELECT id, knowledge_area, status, is_current FROM concepts "
+                f"WHERE id IN ({placeholders})",
+                chunk,
+            ).fetchall()
+            knowledge_areas.update(
+                {
+                    row["id"]: row["knowledge_area"]
+                    for row in rows
+                    if row["status"] == "active" and row["is_current"] == 1
+                }
+            )
+    return knowledge_areas
+
+
 def get_knowledge_area_map() -> dict:
     """Return a dict of concept_id → knowledge_area for all active concepts.
 
@@ -2085,11 +2255,12 @@ def save_concept_conn(conn, concept: "Concept") -> None:
     resolved_ka = _resolve_knowledge_area(concept, meta)
     data["knowledge_area"] = resolved_ka
 
-    exists = conn.execute("SELECT 1 FROM concepts WHERE id = ?", (concept.id,)).fetchone()
-    resolved_ka = _apply_ka_admission_storage_guard(data, resolved_ka, is_new=not bool(exists), now=now)
+    lifecycle = _load_persisted_lifecycle_state(conn, concept.id)
+    resolved_ka = _apply_ka_admission_storage_guard(data, resolved_ka, is_new=lifecycle is None, now=now)
 
-    if exists:
+    if lifecycle is not None:
         summary_changed, _ = _apply_summary_change_reset(conn, concept.id, data, concept.summary)
+        _apply_persisted_lifecycle_to_data(data, lifecycle, concept.id)
         # AGENT-004: Include session_id only if concept has one
         # (don't overwrite existing session_id with NULL on evolution)
         session_id_val = getattr(concept, "session_id", None)
@@ -2123,7 +2294,7 @@ def save_concept_conn(conn, concept: "Concept") -> None:
                     concept.stability,
                     resolved_ka,  # DEBT-185: use pre-resolved KA (synced to blob)
                     getattr(concept, "concept_type", "insight"),
-                    concept.status,
+                    lifecycle.status,
                     getattr(concept, "salience", 0.5),
                     getattr(concept, "salience_source", "system"),
                     getattr(concept, "maturity", "ESTABLISHED"),
@@ -2134,9 +2305,9 @@ def save_concept_conn(conn, concept: "Concept") -> None:
                     _clamp_score(getattr(concept, "authority_score", None)),  # DEBT-187
                     _clamp_score(getattr(concept, "effective_authority", None)),  # DEBT-187
                     _clamp_score(getattr(concept, "currency_score", None)),  # DEBT-187
-                    getattr(concept, "currency_status", None),
+                    lifecycle.currency_status,
                     *_stale_risk_field_values(data),
-                    getattr(concept, "superseded_by", None),
+                    lifecycle.superseded_by,
                     getattr(concept, "epistemic_network", None),
                     getattr(concept, "reinforcement_count", None),
                     getattr(concept, "original_date", None),  # TEMPORAL-002
@@ -2176,7 +2347,7 @@ def save_concept_conn(conn, concept: "Concept") -> None:
                     concept.stability,
                     resolved_ka,  # DEBT-185: use pre-resolved KA (synced to blob)
                     getattr(concept, "concept_type", "insight"),
-                    concept.status,
+                    lifecycle.status,
                     getattr(concept, "salience", 0.5),
                     getattr(concept, "salience_source", "system"),
                     getattr(concept, "maturity", "ESTABLISHED"),
@@ -2186,9 +2357,9 @@ def save_concept_conn(conn, concept: "Concept") -> None:
                     _clamp_score(getattr(concept, "authority_score", None)),  # DEBT-187
                     _clamp_score(getattr(concept, "effective_authority", None)),  # DEBT-187
                     _clamp_score(getattr(concept, "currency_score", None)),  # DEBT-187
-                    getattr(concept, "currency_status", None),
+                    lifecycle.currency_status,
                     *_stale_risk_field_values(data),
-                    getattr(concept, "superseded_by", None),
+                    lifecycle.superseded_by,
                     getattr(concept, "epistemic_network", None),
                     getattr(concept, "reinforcement_count", None),
                     getattr(concept, "original_date", None),  # TEMPORAL-002
@@ -2247,7 +2418,7 @@ def save_concept_conn(conn, concept: "Concept") -> None:
                 json.dumps(data),  # 35: data (always last)
             ),
         )
-    if not exists:
+    if lifecycle is None:
         # New concept: content_updated_at = now
         conn.execute(
             "UPDATE concepts SET content_updated_at = ? WHERE id = ?",

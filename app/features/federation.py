@@ -100,6 +100,7 @@ class SessionRegistry:
                 cursor = conn.execute(
                     """UPDATE sessions SET status = 'idle'
                        WHERE status = 'active'
+                       AND binding_hash IS NULL
                        AND last_heartbeat IS NOT NULL
                        AND last_heartbeat < datetime('now', ?)""",
                     (f"-{HEARTBEAT_STALE_MINUTES} minutes",),
@@ -110,6 +111,7 @@ class SessionRegistry:
                     """UPDATE sessions SET status = 'ended',
                        ended_at = datetime('now')
                        WHERE status IN ('active', 'idle')
+                       AND binding_hash IS NULL
                        AND last_heartbeat IS NOT NULL
                        AND last_heartbeat < datetime('now', ?)""",
                     (f"-{HEARTBEAT_ENDED_MINUTES} minutes",),
@@ -154,6 +156,7 @@ class SessionRegistry:
                     """UPDATE sessions SET status = 'ended',
                        ended_at = datetime('now')
                        WHERE status IN ('active', 'idle')
+                       AND binding_hash IS NULL
                        AND last_heartbeat IS NOT NULL"""
                 )
                 count = cursor.rowcount

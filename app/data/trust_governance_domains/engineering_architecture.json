@@ -1,0 +1,62 @@
+{
+  "schema_version": "trust_governance_domain.v1",
+  "domain_id": "engineering_architecture",
+  "title": "Engineering architecture decisions",
+  "current_item_id": "architecture_domain_neutral_governance_registry_2026_07_10",
+  "scope_terms": [
+    "architecture decision",
+    "technical design",
+    "resolver architecture",
+    "governance registry architecture",
+    "engineering architecture",
+    "architecture source of truth"
+  ],
+  "items": [
+    {
+      "id": "architecture_domain_neutral_governance_registry_2026_07_10",
+      "title": "Domain-neutral governance registry architecture",
+      "state": "current",
+      "scope": "trust_governance_architecture",
+      "governs": true,
+      "replaces": [
+        "architecture_launch_copy_specific_resolver_2026_07_08"
+      ],
+      "aliases": [
+        "current architecture decision",
+        "domain-neutral governance registry",
+        "governance registry architecture",
+        "trust governance architecture",
+        "resolver architecture source of truth"
+      ],
+      "source_path": "docs/design/GENERALIZED_TRUST_GOVERNANCE_V1_DESIGN_2026_07_10.md",
+      "source_commit": "pending-generalized-trust-governance-v1",
+      "source_url": null,
+      "reason": "This design governs architecture decisions for trust governance because it generalizes authority resolution across arbitrary user domains while keeping launch copy as a fixture.",
+      "concept_ids": [
+        "trust_governance_architecture_current"
+      ]
+    },
+    {
+      "id": "architecture_launch_copy_specific_resolver_2026_07_08",
+      "title": "Launch-copy-specific authority resolver",
+      "state": "superseded",
+      "scope": "launch_copy_only_architecture",
+      "governs": false,
+      "superseded_by": "architecture_domain_neutral_governance_registry_2026_07_10",
+      "replaces": [],
+      "aliases": [
+        "launch copy specific resolver",
+        "old authority chain architecture",
+        "authority chain launch copy architecture",
+        "legacy architecture decision"
+      ],
+      "source_path": "docs/design/AUTHORITY_CHAIN_V1_DESIGN_2026_07_08.md",
+      "source_commit": "historical-authority-chain-v1",
+      "source_url": null,
+      "reason": "This resolver remains useful as historical context but no longer represents the product architecture because it was scoped to launch/public-copy artifacts.",
+      "concept_ids": [
+        "trust_governance_architecture_superseded_launch_only"
+      ]
+    }
+  ]
+}
