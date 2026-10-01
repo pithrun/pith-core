@@ -4,13 +4,14 @@
 # ============================================================
 # Syncs the latest backup to additional locations for
 # redundancy. Auto-detects Google Drive and iCloud on macOS.
-# Also supports a custom BACKUP_DIR for any platform.
+# Also supports a custom PITH_BACKUP_SYNC_DIR or BACKUP_DIR for any platform.
 #
 # Usage: bash scripts/backup/sync_backups.sh
 #
 # Environment:
-#   BACKUP_DIR    — Custom sync target (e.g., ~/my-backups, /mnt/nas/pith)
-#   KEEP_SYNCED   — Max backups to retain per tier (default: 5)
+#   PITH_BACKUP_SYNC_DIR  - Custom sync target (e.g., ~/my-backups, /mnt/nas/pith)
+#   BACKUP_DIR            - Legacy custom sync target
+#   KEEP_SYNCED           - Max backups to retain per tier (default: 5)
 #
 # Cron example (daily at 2:30am):
 #   30 2 * * * cd /path/to/pith && bash scripts/backup/sync_backups.sh >> data/sync.log 2>&1
@@ -28,6 +29,7 @@ else
 fi
 LOG_FILE="$PROJECT_DIR/data/sync.log"
 KEEP=${KEEP_SYNCED:-5}
+CUSTOM_DIR="${PITH_BACKUP_SYNC_DIR:-${BACKUP_DIR:-}}"
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S'): $1" | tee -a "$LOG_FILE"; }
 
@@ -43,6 +45,7 @@ fi
 LATEST_NAME=$(basename "$LATEST")
 SYNCED=0
 ERRORS=0
+TARGETS=0
 
 # Helper: sync to a directory with retention
 sync_to_dir() {
@@ -53,6 +56,7 @@ sync_to_dir() {
         log "SKIP $LABEL: directory not found ($DIR)"
         return
     fi
+    TARGETS=$((TARGETS + 1))
 
     if cp "$LATEST" "$DIR/"; then
         SYNCED=$((SYNCED + 1))
@@ -68,9 +72,13 @@ sync_to_dir() {
 }
 
 # --- Tier 1: Custom backup directory (any platform) ---
-if [ -n "$BACKUP_DIR" ]; then
-    mkdir -p "$BACKUP_DIR" 2>/dev/null || true
-    sync_to_dir "$BACKUP_DIR" "Custom"
+if [ -n "$CUSTOM_DIR" ]; then
+    if mkdir -p "$CUSTOM_DIR" 2>/dev/null; then
+        sync_to_dir "$CUSTOM_DIR" "Custom"
+    else
+        ERRORS=$((ERRORS + 1))
+        log "ERROR Custom: failed to create directory ($CUSTOM_DIR)"
+    fi
 fi
 
 # --- Tier 2: Google Drive (macOS auto-detect) ---
@@ -83,15 +91,23 @@ elif [ -d "$HOME/Library/CloudStorage" ]; then
 fi
 if [ -n "$GDRIVE_BASE" ]; then
     GDRIVE_DIR="$GDRIVE_BASE/pith-backups"
-    mkdir -p "$GDRIVE_DIR" 2>/dev/null || true
-    sync_to_dir "$GDRIVE_DIR" "GDrive"
+    if mkdir -p "$GDRIVE_DIR" 2>/dev/null; then
+        sync_to_dir "$GDRIVE_DIR" "GDrive"
+    else
+        ERRORS=$((ERRORS + 1))
+        log "ERROR GDrive: failed to create directory ($GDRIVE_DIR)"
+    fi
 fi
 
 # --- Tier 3: iCloud (macOS auto-detect) ---
 ICLOUD_DIR="$HOME/Library/Mobile Documents/com~apple~CloudDocs/pith-backups"
 if [ -d "$HOME/Library/Mobile Documents/com~apple~CloudDocs" ]; then
-    mkdir -p "$ICLOUD_DIR" 2>/dev/null || true
-    sync_to_dir "$ICLOUD_DIR" "iCloud"
+    if mkdir -p "$ICLOUD_DIR" 2>/dev/null; then
+        sync_to_dir "$ICLOUD_DIR" "iCloud"
+    else
+        ERRORS=$((ERRORS + 1))
+        log "ERROR iCloud: failed to create directory ($ICLOUD_DIR)"
+    fi
 fi
 
 # --- Tier 4: Local redundancy (canonical backup dir) ---
@@ -108,5 +124,13 @@ fi
 log "Sync complete: $SYNCED succeeded, $ERRORS failed (from $LATEST_NAME)"
 
 if [ "$ERRORS" -gt 0 ]; then
+    exit 1
+fi
+if [ "$TARGETS" -eq 0 ]; then
+    log "ERROR: No sync targets available. Set PITH_BACKUP_SYNC_DIR or BACKUP_DIR, or enable Google Drive/iCloud."
+    exit 1
+fi
+if [ "$SYNCED" -eq 0 ]; then
+    log "ERROR: No backups synced successfully."
     exit 1
 fi

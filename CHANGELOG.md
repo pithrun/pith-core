@@ -4,6 +4,21 @@ All notable changes to Pith are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.7] - 2026-10-01
+
+### Added
+- Adds a Windows x64 developer preview with a checksum-verified PowerShell installer and dedicated server ZIP.
+- Adds managed Windows Python provisioning, a short external virtual-environment path, Task Scheduler auto-start and backups, and platform-aware client configuration.
+- Adds hosted Windows release proof for deep user paths, semantic embeddings, installed Claude hook lifecycle, repeated start, restart, uninstall, cleanup, and post-uninstall refusal.
+
+### Changed
+- Expands public install and quick-start guidance from macOS-only to scoped macOS and Windows developer previews.
+- Requires release validation to check the Windows installer scripts, ZIP checksum, Claude extension package checksum, and archive cache hygiene.
+
+### Fixed
+- Makes repeated Windows starts idempotent and keeps uninstall terminal even while Windows releases owned files and scheduled tasks.
+- Waits for the owned child process to be reaped after forced launcher shutdown, eliminating an intermittent end-of-input failure.
+
 ## [1.0.6] - 2026-07-07
 
 ### Changed

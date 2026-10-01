@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# Pith Installer v1.0.6
+# Pith Installer v1.0.7
 # macOS developer preview installer; Linux remains an unverified source/developer path.
 
 # Configuration
@@ -15,7 +15,7 @@ PITH_REPAIR_RUNTIME="${PITH_REPAIR_RUNTIME:-0}"
 PITH_FORCE_MANAGED_PYTHON="${PITH_FORCE_MANAGED_PYTHON:-0}"
 # Keep PITH_VERSION on line 18.
 # scripts/version-bump.sh and TEST-090 depend on this exact location.
-PITH_VERSION="1.0.6"
+PITH_VERSION="1.0.7"
 PITH_INSTALL_TELEMETRY_URL="${PITH_INSTALL_TELEMETRY_URL-https://pith.run/telemetry/install}"
 PITH_INSTALL_TELEMETRY_EVENT_VERSION="${PITH_INSTALL_TELEMETRY_EVENT_VERSION:-1}"
 PITH_RELEASE_CHANNEL="${PITH_RELEASE_CHANNEL:-unknown}"
@@ -498,7 +498,7 @@ print_ai_client_readiness() {
     print_readiness_line "Claude Cowork" "ready" "managed lifecycle automation is available after the Cowork system prompt is installed; no separate local MCP config is required inside Cowork"
     if surface_selected_and_detected claude_desktop; then
         if [[ "$CLAUDE_DESKTOP_MANUAL_STATE" == "manual_action_confirmed" ]]; then
-            print_readiness_line "Claude Desktop" "manual_action_confirmed" "Instructions for Claude were confirmed by the installer operator; restart Claude Desktop, then verify an observed pith_conversation_turn call or explicitly ask Claude to use Pith"
+            print_readiness_line "Claude Desktop" "manual_action_confirmed" "Instructions for Claude were confirmed by the installer operator; restart Claude Desktop, then run pith_connection_proof or verify an observed pith_conversation_turn call"
         else
             print_readiness_line "Claude Desktop" "manual_action_required" "paste $SYSTEM_PROMPT_PATH into Settings -> General -> Instructions for Claude"
         fi
@@ -506,7 +506,7 @@ print_ai_client_readiness() {
         print_readiness_line "Claude Desktop" "manual_action_required" "Claude Desktop was selected but not detected; rerun setup after installing it"
     fi
     if surface_selected_and_detected claude_code; then
-        print_readiness_line "Claude Code" "partial_hook_capture" "hooks are installed for turn registration/capture; verify an observed model-visible pith_conversation_turn call for full lifecycle proof"
+        print_readiness_line "Claude Code" "partial_hook_capture" "MCP config, lifecycle hooks, and user instructions are installed; verify /mcp and an observed model-visible pith_conversation_turn call for full lifecycle proof"
     elif surface_selected claude_code; then
         print_readiness_line "Claude Code" "manual_action_required" "Claude Code was selected but not detected"
     fi
@@ -520,7 +520,7 @@ print_ai_client_readiness() {
         print_readiness_line "Cursor" "manual_action_required" "Cursor was selected but not detected; rerun setup after installing it"
     fi
     if surface_selected_and_detected codex; then
-        print_readiness_line "Codex" "ready" "~/.codex/AGENTS.md contains the local API cognitive-loop instructions"
+        print_readiness_line "Codex" "ready" "configure_clients reconciled one hook-primary conversation-turn owner; restart Codex and verify a fresh turn"
     elif surface_selected codex; then
         print_readiness_line "Codex" "manual_action_required" "Codex was selected but not detected; rerun setup after installing it"
     fi
@@ -590,6 +590,7 @@ PY
 surface_label() {
     case "$1" in
         claude_desktop) echo "Claude Desktop" ;;
+        chatgpt) echo "ChatGPT" ;;
         codex) echo "Codex" ;;
         vscode) echo "VS Code" ;;
         claude_code) echo "Claude Code / Claude CLI" ;;
@@ -604,7 +605,8 @@ surface_label() {
 surface_detail() {
     case "$1" in
         claude_desktop) echo "MCP config plus manual Instructions for Claude step" ;;
-        codex) echo "HTTP/API lifecycle instructions in ~/.codex/AGENTS.md plus optional MCP config for tool access" ;;
+        chatgpt) echo "Local plugin marketplace package plus Plugins Directory install step" ;;
+        codex) echo "single-owner UserPromptSubmit lifecycle hook plus managed suppression instructions and optional MCP tool access" ;;
         vscode) echo "MCP config plus Copilot Agent Chat instruction file" ;;
         claude_code) echo "MCP config plus Pith lifecycle instructions/hooks where supported by the installed Claude Code version" ;;
         cursor) echo "MCP config template; add Cursor User Rule or AGENTS.md for default Pith invocation" ;;
@@ -619,6 +621,9 @@ surface_detected() {
     case "$1" in
         claude_desktop)
             [[ -d "$HOME/Library/Application Support/Claude" || -d "$HOME/.config/Claude" ]]
+            ;;
+        chatgpt)
+            [[ -d "/Applications/ChatGPT.app" || -d "$HOME/Applications/ChatGPT.app" ]]
             ;;
         codex)
             [[ -d "$HOME/.codex" ]]
@@ -677,14 +682,14 @@ select_install_surfaces() {
     fi
 
     PITH_SELECTED_SURFACES="$(normalize_surface_list "${PITH_CLIENTS:-all}")"
-    local surfaces=(claude_desktop codex vscode claude_code cursor windsurf cline project)
+    local surfaces=(claude_desktop chatgpt codex vscode claude_code cursor windsurf cline project)
 
     if [[ -n "${PITH_CLIENTS:-}" ]]; then
         return
     fi
 
     if [[ "${PITH_PRIVATE_BETA:-0}" != "1" || "${PITH_SKIP_PAUSES:-0}" == "1" || ! -t 0 ]]; then
-        PITH_SELECTED_SURFACES="claude_desktop,claude_code,codex,vscode,cursor,project"
+        PITH_SELECTED_SURFACES="claude_desktop,claude_code,chatgpt,codex,vscode,cursor,project"
         return
     fi
 
@@ -810,74 +815,6 @@ remove_managed_python_runtime() {
         rm -rf "$PITH_RUNTIME_ROOT" "$PITH_RUNTIME_META"
         mark_warning "Removed corrupt Pith-managed Python runtime"
     fi
-}
-
-configure_codex_agents_instructions() {
-    python3 - <<'PY'
-from pathlib import Path
-import shutil
-import time
-
-home = Path.home()
-codex_dir = home / ".codex"
-if not codex_dir.is_dir():
-    raise SystemExit(0)
-
-path = codex_dir / "AGENTS.md"
-start = "<!-- PITH COGNITIVE LOOP: START -->"
-end = "<!-- PITH COGNITIVE LOOP: END -->"
-body = """# Pith Cognitive Loop
-
-Pith is installed locally. For Codex, use the local HTTP/API command as the primary cognitive lifecycle path because Codex MCP stdio transport can restart or close between turns.
-
-On every substantive user message, run `conversation_turn` before composing the response. Include `"surface_id": "codex_local_api"` and a stable `origin_id` for this Codex thread/workspace. The `origin_id` must match `^[A-Za-z0-9._:-]{1,128}$`; use a compact value such as `codex_<short-workspace-or-thread-id>` with no slashes or spaces. Send JSON on stdin and parse the last non-empty output line as JSON because the wrapper may print a profile banner first:
-
-```bash
-~/.pith/bin/pith api conversation_turn --stdin-json
-```
-
-Use this first-turn payload shape:
-
-```json
-{
-  "surface_id": "codex_local_api",
-  "origin_id": "codex_<short-workspace-or-thread-id>",
-  "workspace_id": "<absolute workspace path>",
-  "message": "<current user message>",
-  "extracted_concepts_json": "[]"
-}
-```
-
-After the first successful call returns `resolved_session_id`, include that value as `session_id` on later lifecycle calls when available. Also include `previous_message`, `previous_response`, and `extracted_concepts_json` after the first exchange. For trivial exchanges, the outer JSON value for `extracted_concepts_json` must be the string value `"[]"`, not a JSON array. For substantive implementation or deployment work, use a JSON string containing extracted concepts with concrete `verified: <check>` evidence.
-
-For checkpoints and closeout, use the matching lifecycle operations:
-
-```bash
-~/.pith/bin/pith api checkpoint --stdin-json
-~/.pith/bin/pith api session_end --stdin-json
-```
-
-For lifecycle evidence reports, use `~/.pith/bin/pith api lifecycle_status --stdin-json` with the relevant `surface_id`, `session_id`, `origin_id`, or `workspace_id`. For cross-surface source coverage evidence, use `~/.pith/bin/pith api surface_activity --stdin-json` with `requested_surfaces` such as `"claude_code,codex_local_api,local_api_cli"` and `include_codex_local=true`. Unsupported or sparse surfaces must report that state rather than inferring success from instructions or memory.
-
-`pith api-fallback ...` remains as a legacy/recovery alias. Pith MCP tools with the `pith_` prefix may also be available in Codex and are useful for richer tool access when the MCP transport is healthy. Do not depend on MCP-only access for the core cognitive lifecycle.
-"""
-block = f"{start}\n{body}\n{end}\n"
-
-existing = path.read_text(encoding="utf-8") if path.exists() else ""
-if start in existing and end in existing:
-    before, rest = existing.split(start, 1)
-    _, after = rest.split(end, 1)
-    new_text = before.rstrip() + "\n\n" + block + after.lstrip()
-else:
-    new_text = (existing.rstrip() + "\n\n" if existing.strip() else "") + block
-
-if new_text != existing:
-    if path.exists():
-        backup_path = path.with_name(path.name + f".backup.{int(time.time())}")
-        shutil.copy2(path, backup_path)
-    path.write_text(new_text, encoding="utf-8")
-    print(f"Codex AGENTS instructions configured: {path}")
-PY
 }
 
 find_existing_python() {
@@ -1255,7 +1192,14 @@ PITH_SERVER_PATH="$PITH_HOME/pith-server"
 SCRIPT_SOURCE="${BASH_SOURCE[0]:-}"
 if [[ -n "$SCRIPT_SOURCE" ]]; then
     SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_SOURCE")" && pwd)"
-    DIST_DIR="$(dirname "$SCRIPT_DIR")"
+    if [[ -f "$SCRIPT_DIR/pith-server-latest.tar.gz" ]] || \
+       { [[ -f "$SCRIPT_DIR/app/api/server.py" ]] && [[ -f "$SCRIPT_DIR/pith_mcp.py" ]]; }; then
+        # Packaged releases place root install.sh beside the payload. Source
+        # checkouts invoke scripts/install.sh one level below the distribution.
+        DIST_DIR="$SCRIPT_DIR"
+    else
+        DIST_DIR="$(dirname "$SCRIPT_DIR")"
+    fi
 else
     SCRIPT_DIR=""
     DIST_DIR=""
@@ -1536,6 +1480,7 @@ elif [[ -f "$CONFIGURE_SCRIPT" ]] && python3 "$CONFIGURE_SCRIPT" \
     --project-dir "$PITH_SERVER_PATH" \
     --platform "$OS_TYPE" \
     --api-url "http://localhost:$PITH_PORT" \
+    --pith-version "$PITH_VERSION" \
     --clients "${PITH_SELECTED_SURFACES:-all}" \
     --json > "$CLIENT_CONFIG_RESULT_JSON" 2> "$CLIENT_CONFIG_RESULT_ERR"; then
     summarize_client_config_result "$CLIENT_CONFIG_RESULT_JSON"
@@ -1732,7 +1677,7 @@ if surface_selected_and_detected claude_desktop; then
             echo "  2. Paste the contents of:"
             echo -e "     ${YELLOW}$SYSTEM_PROMPT_PATH${NC}"
         fi
-        echo "  3. Save — Claude has Pith's cognitive-loop instructions; verify a pith_conversation_turn call in a fresh chat"
+        echo "  3. Save — Claude has Pith's cognitive-loop instructions; run pith_connection_proof or verify a pith_conversation_turn call in a fresh chat"
         echo ""
         echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
         echo ""
@@ -1799,11 +1744,13 @@ elif surface_selected cursor; then
     mark_warning "Cursor was selected but not detected. Cursor Global Rule snippet is saved at $CURSOR_GLOBAL_RULE_PATH."
 fi
 
-if surface_selected_and_detected codex; then
-    configure_codex_agents_instructions
-    echo -e "${GREEN}✓${NC} Codex cognitive-loop instructions configured"
-elif surface_selected codex; then
-    mark_warning "Codex not detected. If you install Codex later, rerun this installer or client configuration so ~/.codex/AGENTS.md receives Pith instructions."
+if surface_selected codex && ! surface_selected_and_detected codex; then
+    mark_warning "Codex not detected. If you install Codex later, rerun this installer or client configuration so lifecycle ownership is reconciled."
+fi
+if surface_selected_and_detected chatgpt; then
+    echo "  ${VERIFY_STEP}. ChatGPT: open Plugins, select the local marketplace source reported by the installer, open Pith, and select +"
+    echo "     Fully restart ChatGPT, then start new Chat and Work conversations and invoke @Pith"
+    VERIFY_STEP=$((VERIFY_STEP + 1))
 fi
 if surface_selected vscode && [[ -f "$HOME/.copilot/instructions/pith-cognitive-loop.instructions.md" ]]; then
     echo -e "${GREEN}✓${NC} VS Code Copilot cognitive-loop instructions configured"
@@ -1968,6 +1915,25 @@ if [[ "$OS_TYPE" == "macos" ]]; then
     <string>$PITH_HOME/logs/backup.log</string>
     <key>StandardErrorPath</key>
     <string>$PITH_HOME/logs/backup.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>$HOME</string>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>PITH_HOME</key>
+        <string>$PITH_HOME</string>
+$(if [ -n "${PITH_PROFILE:-}" ]; then cat << BACKUP_PROFILE_ENV
+        <key>PITH_PROFILE</key>
+        <string>$PITH_PROFILE</string>
+BACKUP_PROFILE_ENV
+fi)
+$(if [ -n "${PITH_DATA_DIR:-}" ]; then cat << BACKUP_DATA_DIR_ENV
+        <key>PITH_DATA_DIR</key>
+        <string>$PITH_DATA_DIR</string>
+BACKUP_DATA_DIR_ENV
+fi)
+    </dict>
 </dict>
 </plist>
 BACKUP_PLIST_CONTENT
@@ -2393,6 +2359,131 @@ print_runtime_provenance() {
     echo "  Runtime sha:  $sha"
 }
 
+print_runtime_json() {
+    "$VENV_PATH/bin/python3" - <<'PY'
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+meta_path = Path(os.environ["PITH_RUNTIME_META"])
+try:
+    meta = json.loads(meta_path.read_text(encoding="utf-8-sig"))
+except Exception:
+    meta = {}
+
+python_executable = str(meta.get("python_executable") or sys.executable)
+python_exists = Path(python_executable).is_file()
+python_launch_ok = False
+python_version = None
+python_launch_error = None
+if python_exists:
+    try:
+        completed = subprocess.run(
+            [python_executable, "--version"],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=3,
+        )
+        python_launch_ok = completed.returncode == 0
+        python_version = (completed.stdout or completed.stderr).strip() or None
+        if not python_launch_ok:
+            python_launch_error = (completed.stderr or completed.stdout).strip() or "python_launch_failed"
+    except Exception as exc:
+        python_launch_error = f"{type(exc).__name__}: {exc}"
+
+api_url = os.environ.get("PITH_API_URL", "http://localhost:8000").rstrip("/")
+
+def probe(path, headers=None):
+    request = Request(api_url + path, headers=headers or {})
+    try:
+        with urlopen(request, timeout=3) as response:
+            payload = response.read().decode("utf-8", errors="replace")
+            try:
+                body = json.loads(payload)
+            except Exception:
+                body = None
+            return {
+                "reachable": True,
+                "ok": 200 <= response.status < 300,
+                "status_code": response.status,
+                "body": body,
+                "error_code": None,
+            }
+    except HTTPError as exc:
+        return {
+            "reachable": True,
+            "ok": False,
+            "status_code": exc.code,
+            "body": None,
+            "error_code": "HTTP_ERROR",
+        }
+    except (URLError, TimeoutError, OSError) as exc:
+        return {
+            "reachable": False,
+            "ok": False,
+            "status_code": None,
+            "body": None,
+            "error_code": type(exc).__name__,
+        }
+
+health_probe = probe("/health")
+health_body = health_probe.get("body") or {}
+backend_health_ok = health_probe["ok"] and health_body.get("service") == "pith"
+api_key = os.environ.get("PITH_API_KEY", "").strip()
+auth_probe = probe("/auth/validate", {"X-API-Key": api_key}) if api_key else {
+    "reachable": backend_health_ok,
+    "ok": False,
+    "status_code": None,
+    "body": None,
+    "error_code": "API_KEY_MISSING",
+}
+overall_ok = python_launch_ok and backend_health_ok and auth_probe["ok"]
+reasons = []
+if not python_launch_ok:
+    reasons.append("python_launch_failed")
+if not backend_health_ok:
+    reasons.append("backend_health_failed")
+if not api_key:
+    reasons.append("api_key_missing")
+elif not auth_probe["ok"]:
+    reasons.append("api_auth_failed")
+
+result = {
+    "schema_version": "pith_macos_runtime_diagnostic.v2",
+    "status": "ok" if overall_ok else "degraded",
+    "diagnostic_status_reason": reasons or ["ok"],
+    "diagnostic_boundary": "Wrapper/runtime/backend/auth capability evidence only; this does not prove semantic context retrieval or lifecycle enforcement.",
+    "pith_home": os.environ.get("PITH_HOME"),
+    "pith_server_path": str(Path(os.environ["PITH_HOME"]) / "pith-server"),
+    "api_url": api_url,
+    "wrapper_invoked": True,
+    "runtime_managed_by": meta.get("managed_by"),
+    "runtime_id": meta.get("runtime_id"),
+    "runtime_source": meta.get("source"),
+    "runtime_python_executable": meta.get("python_executable"),
+    "expected_python_executable": python_executable,
+    "python_executable": python_executable,
+    "python_executable_exists": python_exists,
+    "python_launch_ok": python_launch_ok,
+    "python_version": python_version,
+    "python_launch_error": python_launch_error,
+    "backend_health_reachable": health_probe["reachable"],
+    "backend_health_ok": backend_health_ok,
+    "backend_health_status_code": health_probe["status_code"],
+    "api_key_present": bool(api_key),
+    "api_auth_valid": auth_probe["ok"],
+    "protected_auth_valid": auth_probe["ok"],
+    "protected_auth_probe": {key: value for key, value in auth_probe.items() if key != "body"},
+}
+print(json.dumps(result, indent=2, sort_keys=True))
+PY
+}
+
 port_in_use() {
     PITH_CHECK_PORT="$PITH_PORT" python3 - <<'PY'
 import os
@@ -2460,7 +2551,7 @@ print_wrapper_help() {
             echo "  repair  Reinstall the managed Python runtime when eligible"
             ;;
         uninstall)
-            echo "Usage: pith uninstall"
+            echo "Usage: pith uninstall [--yes]"
             echo "  Remove Pith after an interactive confirmation prompt."
             ;;
         profiles)
@@ -2478,12 +2569,31 @@ print_wrapper_help() {
             echo "Usage: pith stats"
             echo "  Show quick knowledge-base statistics from the active profile database."
             ;;
+        trust)
+            echo "Usage: pith trust [--json] [--question QUESTION] [QUESTION]"
+            echo "       pith trust explain [--json] [--question QUESTION] [QUESTION]"
+            echo "       pith trust correct --question QUESTION --message MESSAGE [--apply --confirm] [--json]"
+            echo "       pith trust review {next|status|list|focus|show|decide|run|export|consume|measure|calibration} ..."
+            echo "  Inspect or explicitly correct what Pith currently trusts for a question."
+            echo "  Use pith trust explain for the same read-only trust answer with self-explanatory guidance."
+            echo "  Use pith trust review next to choose the safest trust-maintenance action."
+            echo "  Use pith trust review status/list/focus/show to inspect implicit supersession proposals by default."
+            echo "  Add --queue edge-risk to review list/focus/show to inspect broad Trust Health edge-risk rows."
+            echo "  Add --queue edge-risk to review decide/run/export to capture read-only edge decision artifacts."
+            echo "  Use pith trust review consume --queue edge-risk --decision-file PATH to build measured repair dry-run evidence."
+            echo "  Edge-risk decisions: approve_repair, reject_repair, needs_context, not_supersession, uncertain."
+            echo "  Review and consume do not mutate authority; live repair uses the separate hash-pinned command printed by consume."
+            ;;
+        trust-health)
+            echo "Usage: pith trust-health [--json]"
+            echo "  Show local Trust Health evidence and the internal scorecard claim boundary."
+            ;;
         protocol)
             echo "Usage: pith protocol"
             echo "  Print Pith cognitive-loop instructions and copy them to clipboard when available."
             ;;
         *)
-            echo "Usage: pith [--profile NAME] {serve|start|stop|restart|status|health|stats|logs|search|concept|orient|sessions|metrics|doctor|clients|support|import|api|api-fallback|backup|restore|update|version|report|profiles|maintenance|protocol|runtime|uninstall}"
+            echo "Usage: pith [--profile NAME] {serve|start|stop|restart|status|health|stats|trust|trust-health|logs|search|concept|orient|sessions|metrics|doctor|clients|support|import|api|api-fallback|backup|restore|update|version|report|profiles|maintenance|protocol|runtime|uninstall}"
             ;;
     esac
 }
@@ -2816,7 +2926,14 @@ PY
         if is_help_request; then print_wrapper_help runtime; exit 0; fi
         case "${2:-status}" in
             status)
-                print_runtime_provenance
+                if [[ "${3:-}" == "--json" ]]; then
+                    print_runtime_json
+                else
+                    print_runtime_provenance
+                fi
+                ;;
+            --json)
+                print_runtime_json
                 ;;
             repair)
                 INSTALLER="$PITH_SERVER_PATH/scripts/install.sh"
@@ -2846,7 +2963,11 @@ PY
         if [[ -f "$PITH_RUNTIME_META" ]]; then
             echo "  Python:  $(runtime_meta_value managed_by || echo unknown) runtime at $(runtime_meta_value python_executable || echo unknown)"
         fi
-        read -p "Are you sure? (type 'yes' to confirm): " -r
+        if [[ "${2:-}" == "--yes" || "${2:-}" == "-y" ]]; then
+            REPLY="yes"
+        else
+            read -p "Are you sure? (type 'yes' to confirm): " -r
+        fi
         if [[ $REPLY == "yes" ]]; then
             $0 stop
             if [[ "$OSTYPE" == "darwin"* ]]; then
@@ -2876,6 +2997,7 @@ PY
             echo "Pith uninstalled"
         else
             echo "Uninstall cancelled"
+            exit 1
         fi
         ;;
     profiles)
@@ -2976,6 +3098,16 @@ finally:
     conn.close()
 " || { echo "Error: failed to read stats from $DB_PATH"; exit 1; }
         ;;
+    trust-health)
+        if is_help_request; then print_wrapper_help trust-health; exit 0; fi
+        cd "$PITH_SERVER_PATH"
+        python3 scripts/trust_health_status.py "${ARGS[@]:1}"
+        ;;
+    trust)
+        if is_help_request; then print_wrapper_help trust; exit 0; fi
+        cd "$PITH_SERVER_PATH"
+        python3 scripts/trust_control.py "${ARGS[@]:1}"
+        ;;
     protocol)
         if is_help_request; then print_wrapper_help protocol; exit 0; fi
         # Show Pith cognitive loop instructions for Claude Desktop Instructions for Claude
@@ -2998,7 +3130,7 @@ finally:
         fi
         ;;
     *)
-        echo "Usage: pith [--profile NAME] {serve|start|stop|restart|status|health|stats|logs|search|concept|orient|sessions|metrics|doctor|clients|support|import|api|api-fallback|backup|restore|update|version|report|profiles|maintenance|protocol|runtime|uninstall}"
+        echo "Usage: pith [--profile NAME] {serve|start|stop|restart|status|health|stats|trust|trust-health|logs|search|concept|orient|sessions|metrics|doctor|clients|support|import|api|api-fallback|backup|restore|update|version|report|profiles|maintenance|protocol|runtime|uninstall}"
         exit 1
         ;;
 esac
@@ -3197,6 +3329,8 @@ echo -e "  • ${YELLOW}pith start${NC}   - Start the Pith server"
 echo -e "  • ${YELLOW}pith stop${NC}    - Stop the server"
 echo -e "  • ${YELLOW}pith status${NC}  - Check server status"
 echo -e "  • ${YELLOW}pith health${NC}  - Check operational health/readiness"
+echo -e "  • ${YELLOW}pith trust${NC}   - Inspect or explicitly correct what Pith currently trusts"
+echo -e "  • ${YELLOW}pith trust-health${NC} - Show local Trust Health evidence"
 echo -e "  • ${YELLOW}pith logs${NC}    - View server logs"
 echo -e "  • ${YELLOW}pith import${NC}  - Import conversation exports safely"
 echo -e "  • ${YELLOW}pith api${NC}     - First-class local HTTP/API lifecycle calls"
@@ -3237,16 +3371,17 @@ VERIFY_STEP=2
 echo "  ${VERIFY_STEP}. Claude Cowork: confirm the Cowork system prompt is installed; managed Cowork sessions then have full lifecycle automation"
 VERIFY_STEP=$((VERIFY_STEP + 1))
 if surface_selected_and_detected claude_desktop; then
-    echo "  ${VERIFY_STEP}. Claude Desktop / Claude Chat: start a fresh conversation and confirm an observed pith_conversation_turn call; if Claude does not choose it, ask Claude to use Pith for the request"
+    echo "  ${VERIFY_STEP}. Claude Desktop / Claude Chat: start a fresh conversation and run pith_connection_proof; a same-turn pith_conversation_turn is also valid"
+    echo "     Bridge/status checks or MCP config presence alone are not connected proof"
     echo -e "     Log: ${YELLOW}~/Library/Logs/Claude/mcp-server-pith.log${NC}"
     VERIFY_STEP=$((VERIFY_STEP + 1))
 fi
 if surface_selected_and_detected claude_code; then
-    echo -e "  ${VERIFY_STEP}. Claude Code: run ${YELLOW}claude mcp get pith${NC}, then start a fresh Claude Code session and confirm an observed model-visible pith_conversation_turn call"
+    echo -e "  ${VERIFY_STEP}. Claude Code: run ${YELLOW}/mcp${NC} and ${YELLOW}/status${NC}, then start a fresh Claude Code turn and confirm an observed model-visible pith_conversation_turn call"
     VERIFY_STEP=$((VERIFY_STEP + 1))
 fi
 if surface_selected_and_detected codex; then
-    echo -e "  ${VERIFY_STEP}. Codex: confirm ${YELLOW}~/.codex/AGENTS.md${NC} exists and references ${YELLOW}pith api conversation_turn${NC}"
+    echo -e "  ${VERIFY_STEP}. Codex: confirm ${YELLOW}~/.codex/AGENTS.md${NC} declares ${YELLOW}PITH_CODEX_LIFECYCLE_OWNER=hook_primary${NC} and hooks.json has one Pith UserPromptSubmit handler"
     echo "     If Codex was installed after Pith, rerun this installer or client configuration"
     VERIFY_STEP=$((VERIFY_STEP + 1))
 fi

@@ -10,11 +10,12 @@ import logging
 import os
 import time
 
+from app.core.config import MAINTENANCE_LLM_MODEL
 from app.core.models import Experiment, ExperimentCandidate, ExperimentResult
 
 logger = logging.getLogger(__name__)
 
-MODEL = "google/gemini-2.0-flash-001"
+MODEL = os.environ.get("PITH_EXPERIMENT_RESOLUTION_MODEL", MAINTENANCE_LLM_MODEL)
 TIMEOUT_SECONDS = 10
 MAX_TOKENS = 300
 SUMMARY_TRUNCATE = 500  # [P-1] Max chars per concept summary in prompts

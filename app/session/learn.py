@@ -67,6 +67,7 @@ from app.cognitive.taxonomy import (  # DEBT-030/DEBT-108
 from app.session.self_model import self_model_manager
 from app.storage import (
     _get_connection,
+    archive_concept,
     cleanup_expired_snapshots,
     count_associations,
     count_sessions,
@@ -165,8 +166,13 @@ def _archive_lifecycle_probe_concept(concept_id: str, insight: dict) -> bool:
     metadata["archived_at"] = _utc_now_iso()
     metadata["archive_reason"] = "lifecycle_conformance_dogfood_probe"
     concept.metadata = metadata
-    concept.status = "archived"
-    save_concept(concept)
+    if save_concept(concept) is False:
+        logger.warning("session_learn: lifecycle probe metadata save failed: %s", concept_id)
+        return False
+    archived = archive_concept(concept_id)
+    if not archived:
+        logger.warning("session_learn: lifecycle probe archive failed: %s", concept_id)
+        return False
     logger.info("session_learn: archived lifecycle dogfood probe concept %s after learning proof", concept_id)
     return True
 
@@ -4350,7 +4356,9 @@ class SessionLearnMixin:
         _subject_key_started = time.perf_counter()
         try:
             from app.core.config import get_autolearn_subject_key_timeout_s
+            from app.retrieval import evict_lifecycle_concept
             from app.storage import apply_lifecycle_transition_conn, db_immediate
+
             _new_summary = summary
             _new_key = _extract_subject_key(_new_summary)
             _explicit_supersedes_declared = bool(insight.get("supersedes"))
@@ -4363,6 +4371,7 @@ class SessionLearnMixin:
                         source="session_learn_subject_key_fallback",
                     )
                 else:
+                    _subject_key_old_id = None
                     with db_immediate(
                         timeout_s=get_autolearn_subject_key_timeout_s(),
                         operation="autolearn_subject_key_supersession",
@@ -4371,24 +4380,61 @@ class SessionLearnMixin:
                         # instead of full-table scan + Python _extract_subject_key per row
                         _sk_candidates = _sk_conn.execute(
                             "SELECT id FROM concepts "
-                            "WHERE subject_key = ? AND superseded_by IS NULL AND id != ?",
+                            "WHERE subject_key = ? "
+                            "AND superseded_by IS NULL "
+                            "AND id != ? "
+                            "AND is_current = 1 "
+                            "AND status = 'active' "
+                            "LIMIT 1",
                             (_new_key, concept_id),
                         ).fetchall()
                         for (_sk_cid,) in _sk_candidates:
                             # Same subject key — supersede the old one
-                            apply_lifecycle_transition_conn(
+                            changed = apply_lifecycle_transition_conn(
                                 _sk_conn,
                                 _sk_cid,
                                 "supersede",
                                 superseded_by=concept_id,
                                 reason="RETRIEVAL-072: subject-key dedup",
                             )
-                            logger.info(
-                                "RETRIEVAL-072: Subject-key supersession: %s superseded %s "
-                                "(key='%s')",
-                                concept_id, _sk_cid, _new_key[:60],
-                            )
+                            if changed:
+                                _subject_key_old_id = _sk_cid
+                                logger.info(
+                                    "RETRIEVAL-072: Subject-key supersession: %s superseded %s "
+                                    "(key='%s')",
+                                    concept_id,
+                                    _sk_cid,
+                                    _new_key[:60],
+                                )
                             break  # One supersession per write
+
+                    if _subject_key_old_id:
+                        _inline_evicted = evict_lifecycle_concept(
+                            _subject_key_old_id,
+                            persist=False,
+                            source="subject_key_inline",
+                        )
+                        _subject_key_enqueue = enqueue_subject_key_supersession(
+                            concept_id,
+                            new_concept.version,
+                            source="session_learn_subject_key_persist",
+                        )
+                        if not _inline_evicted or _subject_key_enqueue.get("skipped"):
+                            _fallback_evicted = evict_lifecycle_concept(
+                                _subject_key_old_id,
+                                persist=True,
+                                source="subject_key_inline_fallback",
+                            )
+                            if not _fallback_evicted and _subject_key_enqueue.get("skipped"):
+                                raise RuntimeError(
+                                    f"failed to persist subject-key eviction for {_subject_key_old_id}"
+                                )
+                            if not _fallback_evicted:
+                                logger.warning(
+                                    "RETRIEVAL-072: Immediate eviction degraded for %s; "
+                                    "durable queue will retry",
+                                    _subject_key_old_id,
+                                )
             elif _new_key and _explicit_supersedes_declared:
                 logger.info(
                     "RETRIEVAL-072: Subject-key supersession skipped for %s because explicit supersedes is declared",
@@ -4398,16 +4444,27 @@ class SessionLearnMixin:
             _subject_key_deferred = True
             logger.warning(
                 "RETRIEVAL-072: Subject-key dedup failed for %s (non-fatal): %s",
-                concept_id, _sk_err,
+                concept_id,
+                _sk_err,
             )
             try:
-                enqueue_subject_key_supersession(
+                _recovery_enqueue = enqueue_subject_key_supersession(
                     concept_id,
                     new_concept.version,
                     source="session_learn_subject_key_fallback",
                 )
-            except Exception:
-                pass
+                if _recovery_enqueue.get("skipped"):
+                    logger.error(
+                        "RETRIEVAL-072: Subject-key recovery enqueue unavailable for %s: %s",
+                        concept_id,
+                        _recovery_enqueue,
+                    )
+            except Exception as _enqueue_err:
+                logger.error(
+                    "RETRIEVAL-072: Subject-key recovery enqueue raised for %s: %s",
+                    concept_id,
+                    _enqueue_err,
+                )
         finally:
             _record_elapsed_subphase("subject_key_supersession", _subject_key_started)
             try:

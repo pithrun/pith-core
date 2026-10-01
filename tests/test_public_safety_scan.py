@@ -159,7 +159,11 @@ def test_public_facing_classification_true_paths() -> None:
         [
             "README.md",
             "scripts/install.sh",
+            "scripts/install.ps1",
             "pith-server-latest.tar.gz",
+            "pith-server-latest.zip",
+            "pith-server-latest.zip.sha256",
+            "install.ps1",
             ".github/pull_request_template.md",
             ".github/scripts/public_safety_scan.py",
         ]
@@ -182,6 +186,27 @@ def test_public_facing_classification_adversarial_false_positives() -> None:
     ]
 
     assert not public_safety_scan.is_public_facing_change(paths)
+
+
+def test_windows_release_binaries_are_explicitly_allowed() -> None:
+    paths = [
+        public_safety_scan.REPO_ROOT / "pith-server-latest.zip",
+        public_safety_scan.REPO_ROOT
+        / "integrations"
+        / "claude-desktop-extension"
+        / "pith-claude-1.0.7.mcpb",
+    ]
+
+    assert public_safety_scan.binary_findings(paths) == []
+
+
+def test_unexpected_windows_binary_is_rejected() -> None:
+    path = public_safety_scan.REPO_ROOT / "unreviewed-windows-payload.zip"
+
+    findings = public_safety_scan.binary_findings([path])
+
+    assert len(findings) == 1
+    assert findings[0].label == "unexpected changed binary artifact"
 
 
 if __name__ == "__main__":

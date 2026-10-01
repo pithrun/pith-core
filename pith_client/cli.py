@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -24,6 +25,7 @@ TRANSPORT_LOG_PATH = Path.home() / ".pith" / "logs" / "pith_mcp_transport.jsonl"
 SURFACE_ID_VALUES = frozenset(
     {
         "claude_code",
+        "chatgpt_tunnel",
         "codex_local_api",
         "claude_desktop_mcp",
         "cursor_mcp",
@@ -34,6 +36,8 @@ SURFACE_ID_VALUES = frozenset(
     }
 )
 SURFACE_ID_ALIASES = {
+    "chatgpt": "chatgpt_tunnel",
+    "chatgpt_chat": "chatgpt_tunnel",
     "claude_chat": "claude_desktop_mcp",
     "claude_chat_mcp": "claude_desktop_mcp",
     "claude_cowork": "claude_desktop_mcp",
@@ -75,10 +79,32 @@ ALLOWED = {
     "workstreams": ("POST", "/pith_threads"),
 }
 AUTH_EXEMPT_OPERATIONS = frozenset({"health", "readyz"})
-PSEUDO_OPERATIONS = frozenset({"lifecycle_diagnostic", "lifecycle_status", "list"})
+PSEUDO_OPERATIONS = frozenset(
+    {"connection_proof", "lifecycle_diagnostic", "lifecycle_status", "list", "trust", "trust_health"}
+)
 OPERATION_DISCOVERY_SCHEMA_VERSION = "pith_cli_operation_discovery.v1"
+TRUST_HEALTH_STATUS_REQUEST_ERROR_SCHEMA_VERSION = "trust_health_status_request_error.v0"
 SURFACE_RELIABILITY_CONTRACT_SCHEMA_VERSION = "surface_reliability_contract.v1"
+CONNECTION_PROOF_SCHEMA_VERSION = "pith_connection_proof.v1"
 OPERATION_EXAMPLES = {
+    "connection_proof": {
+        "schema_version": OPERATION_DISCOVERY_SCHEMA_VERSION,
+        "operation": "connection_proof",
+        "kind": "example",
+        "command": "~/.pith/bin/pith api connection_proof --stdin-json",
+        "payload": {
+            "surface_id": "codex_local_api",
+            "origin_id": "codex_<short-workspace-or-thread-id>",
+            "workspace_id": "<absolute workspace path>",
+            "message": "Pith connection proof",
+            "extracted_concepts_json": "[]",
+        },
+        "notes": [
+            "Uses the current conversation_turn response as the only connected/not_connected proof.",
+            "Does not use lifecycle_status, process health, bridge status, or remembered context for the verdict.",
+            "If _protocol.session_active is absent, session_active is true only when bind_status is bound and resolved_session_id is present.",
+        ],
+    },
     "conversation_turn": {
         "schema_version": OPERATION_DISCOVERY_SCHEMA_VERSION,
         "operation": "conversation_turn",
@@ -95,6 +121,20 @@ OPERATION_EXAMPLES = {
             "Use message, not user_message.",
             "origin_id must match ^[A-Za-z0-9._:-]{1,128}$; do not use filesystem paths.",
             "extracted_concepts_json is a string containing JSON, not a raw array or object.",
+        ],
+    },
+    "search": {
+        "schema_version": OPERATION_DISCOVERY_SCHEMA_VERSION,
+        "operation": "search",
+        "kind": "example",
+        "command": "~/.pith/bin/pith api search --stdin-json",
+        "payload": {
+            "query": "<search query>",
+            "max_results": 5,
+        },
+        "notes": [
+            "query is required and must be a string.",
+            "Optional filters are documented by `pith api search --schema`.",
         ],
     },
     "lifecycle_diagnostic": {
@@ -115,8 +155,76 @@ OPERATION_EXAMPLES = {
             "Codex workspace-slug origin selectors normalize hyphen/underscore variants; session_id or workspace_id is preferred when available.",
         ],
     },
+    "trust_health": {
+        "schema_version": OPERATION_DISCOVERY_SCHEMA_VERSION,
+        "operation": "trust_health",
+        "kind": "example",
+        "command": "~/.pith/bin/pith api trust_health --stdin-json",
+        "payload": {},
+        "notes": [
+            "Local read-only inspection command; does not call conversation_turn or run the scorecard.",
+            "Use pith trust-health for the human-facing wrapper surface.",
+            "Human output explains current checks, evidence, and supersession edge risk counts.",
+        ],
+    },
+    "trust": {
+        "schema_version": OPERATION_DISCOVERY_SCHEMA_VERSION,
+        "operation": "trust",
+        "kind": "example",
+        "command": "~/.pith/bin/pith api trust --stdin-json",
+        "payload": {"question": "What is the pricing source of truth?"},
+        "notes": [
+            "Default payload is local trust inspection; it does not call conversation_turn or run scorecards.",
+            "Set operation=preview_correction to preview a correction without mutation.",
+            "Set operation=apply_correction with confirm=true to write a profile-local authority override.",
+            "Set operation=review_next for read-only trust-maintenance guidance.",
+            "Set operation=review_list, review_focus, review_batch, review_show, review_decide, review_run, review_export, review_consume, review_measure, or review_calibration for implicit supersession review.",
+            "Use queue=edge-risk with review_list, review_focus, review_batch, review_show, review_decide, review_run, review_export, or review_consume to inspect broad Trust Health edge-risk rows, capture read-only decision artifacts, and build measured repair dry-run evidence.",
+            "Edge-risk decisions use approve_repair, reject_repair, needs_context, not_supersession, or uncertain; they do not mutate Pith authority.",
+            'Use pith trust "<question>" for the plain-text user surface.',
+            'Use pith trust explain "<question>" for the read-only wrapper alias with self-explanatory guidance.',
+            "Use pith trust review focus for one guided read-only supersession candidate.",
+            "Use pith trust review run for the guided implicit supersession review workflow.",
+            "Use pith trust review consume --queue edge-risk --decision-file PATH to validate edge decisions and build a repair dry-run.",
+            "Use pith trust review calibration to build a deduplicated historical review queue.",
+            "Use pith trust-health for local Trust Health status and supersession risk evidence.",
+        ],
+    },
 }
 OPERATION_SCHEMAS = {
+    "connection_proof": {
+        "schema_version": OPERATION_DISCOVERY_SCHEMA_VERSION,
+        "operation": "connection_proof",
+        "kind": "operation_schema",
+        "command": "~/.pith/bin/pith api connection_proof --stdin-json",
+        "method": "LOCAL",
+        "path": "/conversation_turn",
+        "required": [],
+        "fields": {
+            "surface_id": {"type": "string", "recommended": "codex_local_api"},
+            "origin_id": {
+                "type": "string",
+                "pattern": r"^[A-Za-z0-9._:-]{1,128}$",
+                "example": "codex_new_project",
+            },
+            "workspace_id": {"type": "string", "example": "/absolute/workspace/path"},
+            "session_id": {"type": "string", "required": False},
+            "message": {"type": "string", "default": "Pith connection proof"},
+            "extracted_concepts_json": {
+                "type": "string",
+                "default": "[]",
+                "format": "JSON-encoded array string",
+            },
+        },
+        "output_schema_version": CONNECTION_PROOF_SCHEMA_VERSION,
+        "outputs": {
+            "bind_status": "conversation_turn.bind_status",
+            "resolved_session_id": "conversation_turn.resolved_session_id",
+            "auth_error": "conversation_turn.auth_error or HTTP/auth error payload; otherwise null",
+            "session_active": "_protocol.session_active when present; otherwise bind_status=bound plus resolved_session_id",
+            "verdict": "connected|not_connected",
+        },
+    },
     "conversation_turn": {
         "schema_version": OPERATION_DISCOVERY_SCHEMA_VERSION,
         "operation": "conversation_turn",
@@ -190,6 +298,197 @@ OPERATION_SCHEMAS = {
                 f"{SURFACE_RELIABILITY_CONTRACT_SCHEMA_VERSION}; present when requested_surface_coverage exists"
             ),
         },
+    },
+    "search": {
+        "schema_version": OPERATION_DISCOVERY_SCHEMA_VERSION,
+        "operation": "search",
+        "kind": "operation_schema",
+        "command": "~/.pith/bin/pith api search --stdin-json",
+        "method": "POST",
+        "path": "/pith_search",
+        "required": ["query"],
+        "fields": {
+            "query": {"type": "string", "required": True},
+            "context": {"type": ["string", "null"], "default": None},
+            "goal": {"type": ["string", "null"], "default": None},
+            "max_results": {"type": "integer", "default": 5},
+            "min_confidence": {"type": "number", "default": 0.0},
+            "since": {"type": ["string", "null"], "default": None},
+            "until": {"type": ["string", "null"], "default": None},
+            "time_field": {
+                "type": "string",
+                "default": "created_at",
+                "pattern": "^(created_at|valid_from|original_date|content_updated_at)$",
+            },
+            "ka_boost": {
+                "type": ["array", "null"],
+                "items": {"type": "string"},
+                "default": None,
+            },
+            "ka_boost_weight": {
+                "type": "number",
+                "default": 0.2,
+                "minimum": 0.0,
+                "maximum": 0.5,
+            },
+        },
+    },
+    "trust_health": {
+        "schema_version": OPERATION_DISCOVERY_SCHEMA_VERSION,
+        "operation": "trust_health",
+        "kind": "operation_schema",
+        "command": "~/.pith/bin/pith api trust_health --stdin-json",
+        "method": "LOCAL",
+        "path": "",
+        "required": [],
+        "defaults": {
+            "history_limit": 10,
+            "compact_log_path": "~/.pith/logs/monitoring/trust-governance-effectiveness-monitor.log",
+            "supersession_compact_log_path": "~/.pith/logs/monitoring/supersession-edge-semantics-monitor.log",
+            "reports_dir": "~/.pith/reports/monitoring",
+            "health_url": "http://127.0.0.1:8000/health",
+            "warn_after_seconds": 129600,
+            "critical_after_seconds": 259200,
+            "max_log_bytes": 2000000,
+            "runtime_health": True,
+            "scheduler": True,
+            "supersession_scheduler": True,
+        },
+        "fields": {
+            "history_limit": {"type": "integer", "minimum": 1, "required": False},
+            "compact_log_path": {"type": "string", "required": False},
+            "supersession_compact_log_path": {"type": "string", "required": False},
+            "reports_dir": {"type": "string", "required": False},
+            "health_url": {"type": "string", "required": False},
+            "warn_after_seconds": {"type": "integer", "minimum": 0, "required": False},
+            "critical_after_seconds": {"type": "integer", "minimum": 0, "required": False},
+            "max_log_bytes": {"type": "integer", "minimum": 1, "required": False},
+            "runtime_health": {"type": "boolean", "default": True},
+            "scheduler": {"type": "boolean", "default": True},
+            "supersession_scheduler": {"type": "boolean", "default": True},
+        },
+        "output_schema_version": "trust_health_status.v0",
+        "claim_boundary": (
+            "Internal product-continuity scorecard; not a public benchmark claim. "
+            "This proves recurring fixture effectiveness, not arbitrary user-domain governance."
+        ),
+    },
+    "trust": {
+        "schema_version": OPERATION_DISCOVERY_SCHEMA_VERSION,
+        "operation": "trust",
+        "kind": "operation_schema",
+        "command": "~/.pith/bin/pith api trust --stdin-json",
+        "method": "LOCAL",
+        "path": "",
+        "required": ["question"],
+        "fields": {
+            "operation": {
+                "type": "string",
+                "required": False,
+                "default": "status",
+                "allowed": [
+                    "status",
+                    "preview_correction",
+                    "apply_correction",
+                    "review_next",
+                    "review_status",
+                    "review_list",
+                    "review_show",
+                    "review_focus",
+                    "review_batch",
+                    "review_decide",
+                    "review_run",
+                    "review_export",
+                    "review_consume",
+                    "review_measure",
+                    "review_calibration",
+                ],
+            },
+            "question": {"type": "string", "required": True, "minimum_length": 1},
+            "message": {
+                "type": "string",
+                "required_for": ["preview_correction", "apply_correction"],
+                "minimum_length": 1,
+            },
+            "confirm": {"type": "boolean", "required_for": ["apply_correction"], "default": False},
+            "packet_path": {"type": "string", "required_for": ["review_show", "review_run"], "required": False},
+            "queue": {
+                "type": "string",
+                "required_for": [
+                    "review_list",
+                    "review_focus",
+                    "review_batch",
+                    "review_show",
+                    "review_decide",
+                    "review_run",
+                    "review_export",
+                    "review_consume",
+                ],
+                "required": False,
+            },
+            "edge_report_path": {
+                "type": "string",
+                "required_for": [
+                    "review_list",
+                    "review_focus",
+                    "review_batch",
+                    "review_show",
+                    "review_decide",
+                    "review_run",
+                    "review_export",
+                    "review_consume",
+                ],
+                "required": False,
+            },
+            "packet_paths": {"type": "array<string>", "required_for": ["review_calibration"], "required": False},
+            "old_id": {"type": "string", "required_for": ["review_show", "review_decide"], "required": False},
+            "new_id": {"type": "string", "required_for": ["review_show", "review_decide"], "required": False},
+            "decision": {"type": "string", "required_for": ["review_decide"], "required": False},
+            "retention_mode": {
+                "type": "string",
+                "required_for": ["review_decide"],
+                "required": False,
+                "notes": "Proposal queue only; edge-risk decisions ignore retention mode.",
+            },
+            "reviewer": {"type": "string", "required_for": ["review_decide", "review_run"], "required": False},
+            "rationale": {
+                "type": "string",
+                "required_for": ["approve_supersession", "partial_retain"],
+                "required": False,
+            },
+            "decisions": {"type": "array<object>", "required_for": ["review_run"], "required": False},
+            "decision_file": {"type": "string", "required_for": ["review_run", "review_export", "review_consume"], "required": False},
+            "output_path": {"type": "string", "required_for": ["review_run", "review_export"], "required": False},
+            "output_dir": {"type": "string", "required_for": ["review_batch", "review_consume", "review_calibration"], "required": False},
+            "db_path": {"type": "string", "required_for": ["review_consume"], "required": False},
+            "review_extension": {"type": "string", "required_for": ["review_measure"], "required": False},
+            "review_extension_dir": {"type": "string", "required_for": ["review_measure"], "required": False},
+            "min_reviewed_cases_for_readiness": {
+                "type": "integer",
+                "required_for": ["review_measure"],
+                "required": False,
+            },
+            "min_approved_cases_for_readiness": {
+                "type": "integer",
+                "required_for": ["review_measure"],
+                "required": False,
+            },
+            "min_rejected_or_needs_context_cases_for_readiness": {
+                "type": "integer",
+                "required_for": ["review_measure"],
+                "required": False,
+            },
+            "minimum_reviewable_cases": {"type": "integer", "required_for": ["review_calibration"], "required": False},
+            "limit": {"type": "integer", "required_for": ["review_calibration"], "required": False},
+            "include_reviewed": {"type": "boolean", "required_for": ["review_batch"], "required": False, "default": False},
+            "no_export": {"type": "boolean", "required": False, "default": False},
+            "no_measure": {"type": "boolean", "required": False, "default": False},
+            "no_write": {"type": "boolean", "required": False, "default": False},
+        },
+        "output_schema_version": "trust_control_status.v0|trust_correction_envelope.v1|trust_correction_apply_result.v1|trust_review_control.v1",
+        "claim_boundary": (
+            "Local trust inspection and explicit profile-local authority correction; not a public benchmark claim."
+        ),
     },
 }
 LIFECYCLE_STATUS_SCHEMA_VERSION = "surface_lifecycle_status.v1"
@@ -372,10 +671,7 @@ def _normalize_surface_activity_payload(payload: dict | None) -> dict | None:
 
     joined_requested_surfaces = ",".join(
         item
-        for item in (
-            _normalize_surface_id(surface) or str(surface).strip()
-            for surface in requested_surfaces
-        )
+        for item in (_normalize_surface_id(surface) or str(surface).strip() for surface in requested_surfaces)
         if item
     )
     next_payload = dict(payload)
@@ -481,6 +777,25 @@ def _lifecycle_selector(payload: dict[str, Any], surface_id: str) -> dict[str, s
 
 def _has_lifecycle_selector(selector: dict[str, str]) -> bool:
     return any(selector.get(key) for key in ("session_id", "origin_id", "workspace_id"))
+
+
+def _transport_session_split(matches: list[dict[str, Any]]) -> dict[str, Any] | None:
+    resolved_ids = []
+    seen = set()
+    for event in matches:
+        resolved_id = str(event.get("resolved_session_id") or event.get("session_id") or "").strip()
+        if not resolved_id or resolved_id in seen:
+            continue
+        seen.add(resolved_id)
+        resolved_ids.append(resolved_id)
+    if len(resolved_ids) <= 1:
+        return None
+    return {
+        "schema_version": "transport_session_split.v1",
+        "status": "session_split_detected",
+        "count": len(resolved_ids),
+        "resolved_session_ids": resolved_ids,
+    }
 
 
 class _LifecycleReporter:
@@ -1072,8 +1387,11 @@ class _TransportLifecycleReporter(_LifecycleReporter):
         ]
         if corrupt_records:
             limitations.append(f"Skipped {corrupt_records} unreadable transport lifecycle record(s).")
+        session_split = _transport_session_split(matches)
         if len(matches) > 1:
             limitations.append("Multiple matching transport lifecycle events found; newest selected.")
+        if session_split is not None:
+            limitations.append("Multiple resolved sessions matched this lifecycle selector.")
         result = _lifecycle_status_base(
             payload=payload,
             status="not_found" if not matches else "ok",
@@ -1096,6 +1414,9 @@ class _TransportLifecycleReporter(_LifecycleReporter):
                 },
             }
         )
+        if session_split is not None:
+            result["session_split_detected"] = True
+            result["session_split"] = session_split
         if not matches:
             route_events, route_corrupt_records = _transport_route_events(
                 max_scan_files=max_scan_files,
@@ -1312,7 +1633,7 @@ def _codex_context_phase(state: dict[str, Any]) -> dict[str, Any]:
         "session_id": str(session_id) if session_id else None,
         "origin_id": state.get("origin_id"),
         "workspace_id": state.get("workspace_id"),
-        "request_id": state.get("pre_response_ct_request_id"),
+        "request_id_hash": state.get("last_request_id_hash"),
         "additional_context_emitted": state.get("additional_context_emitted"),
     }
     if status == "ok" and session_id and state.get("additional_context_emitted"):
@@ -1379,6 +1700,12 @@ def _codex_model_visible_phase(state: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+def _codex_request_id_hash(value: Any) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
 def _codex_learning_phase(state: dict[str, Any]) -> dict[str, Any]:
     learn_status = state.get("learning_status")
     proof_prefix = ""
@@ -1402,7 +1729,9 @@ def _codex_learning_phase(state: dict[str, Any]) -> dict[str, Any]:
         "learning_events": event_count,
         "learning_capture_state": state.get(f"{proof_prefix}learning_capture_state"),
         "session_linkage_state": state.get(f"{proof_prefix}session_linkage_state"),
-        "request_id": state.get(f"{proof_prefix}learning_request_id"),
+        "request_id_hash": _codex_request_id_hash(
+            state.get(f"{proof_prefix}learning_request_id")
+        ),
         "stop_observed": state.get("last_stop_observed") if proof_prefix else state.get("stop_observed"),
         "proof_source": proof_source,
     }
@@ -1419,7 +1748,7 @@ def _codex_learning_phase(state: dict[str, Any]) -> dict[str, Any]:
         proof_source == "last_stop"
         and learn_status in {None, "", "skipped"}
         and accepted_count > 0
-        and evidence.get("request_id")
+        and evidence.get("request_id_hash")
         and evidence.get("stop_observed")
     ):
         learn_status = "committed"
@@ -1454,7 +1783,7 @@ def _codex_coherence_phase(state: dict[str, Any]) -> dict[str, Any]:
             verdict="matched",
             reason="codex_context_and_learning_share_pith_session_id",
             session_id=state.get("pith_session_id"),
-            request_id=learning_request_id,
+            request_id_hash=_codex_request_id_hash(learning_request_id),
         )
     return _lifecycle_phase(
         "not_observed",
@@ -1466,7 +1795,11 @@ def _codex_coherence_phase(state: dict[str, Any]) -> dict[str, Any]:
 def _codex_checkpoint_phase(state: dict[str, Any]) -> dict[str, Any]:
     status = state.get("checkpoint_status")
     if status == "ok":
-        return _lifecycle_phase("passed", verdict="observed", request_id=state.get("checkpoint_request_id"))
+        return _lifecycle_phase(
+            "passed",
+            verdict="observed",
+            request_id_hash=_codex_request_id_hash(state.get("checkpoint_request_id")),
+        )
     if status:
         return _lifecycle_phase("failed", verdict="not_observed", reason=str(status))
     return _lifecycle_phase("not_observed", verdict="not_observed", reason="codex_precompact_checkpoint_not_observed")
@@ -1767,8 +2100,7 @@ def _codex_transport_fallback_status(
     reporter = _TransportLifecycleReporter(
         "codex_local_api",
         enforcement_claim=(
-            "first-class Codex local API lifecycle call observed; "
-            "Codex state-file hook proof was not observed"
+            "first-class Codex local API lifecycle call observed; Codex state-file hook proof was not observed"
         ),
         learning_reason="first-class Codex local API learning evidence observed",
     )
@@ -1778,6 +2110,61 @@ def _codex_transport_fallback_status(
         timeout=timeout,
         transport_mode=transport_mode,
     )
+
+
+def _codex_owner_configuration() -> dict[str, Any]:
+    agents_path = Path.home() / ".codex" / "AGENTS.md"
+    hooks_path = Path.home() / ".codex" / "hooks.json"
+    script_path = Path.home() / ".pith" / "hooks" / "codex-pith-lifecycle.py"
+    try:
+        agents_text = agents_path.read_text(encoding="utf-8")
+    except OSError:
+        agents_text = ""
+    start = "<!-- PITH COGNITIVE LOOP: START -->"
+    end = "<!-- PITH COGNITIVE LOOP: END -->"
+    managed_count = max(agents_text.count(start), agents_text.count(end))
+    owner_mode = "invalid"
+    marker_count = 0
+    managed_block = ""
+    if agents_text.count(start) == 1 and agents_text.count(end) == 1:
+        managed_block = agents_text.split(start, 1)[1].split(end, 1)[0]
+        matches = re.findall(r"(?m)^\s*PITH_CODEX_LIFECYCLE_OWNER=([^\s]+)\s*$", managed_block)
+        marker_count = len(matches)
+        if len(matches) == 1 and matches[0] in {"hook_primary", "instruction_primary", "transition_hold"}:
+            owner_mode = matches[0]
+    try:
+        hooks_payload = json.loads(hooks_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        hooks_payload = {}
+    prompt_count = 0
+    groups = (hooks_payload.get("hooks") or {}).get("UserPromptSubmit", []) if isinstance(hooks_payload, dict) else []
+    for group in groups if isinstance(groups, list) else []:
+        for hook in group.get("hooks", []) if isinstance(group, dict) else []:
+            if not isinstance(hook, dict):
+                continue
+            command = str(hook.get("command") or "")
+            status = str(hook.get("statusMessage") or "")
+            if str(script_path) in command or script_path.name in command or status.startswith("Syncing Pith "):
+                prompt_count += 1
+    violations = []
+    if managed_count != 1 or marker_count != 1 or owner_mode == "invalid":
+        violations.append("managed_owner_marker_invalid")
+    expected_prompt_count = 1 if owner_mode == "hook_primary" else 0
+    if prompt_count != expected_prompt_count:
+        violations.append("pith_user_prompt_handler_count_mismatch")
+    if owner_mode == "hook_primary" and "must call" in managed_block.lower():
+        violations.append("unconditional_model_call_directive_present")
+    if owner_mode == "instruction_primary" and "exactly once" not in managed_block.lower():
+        violations.append("instruction_primary_call_directive_missing")
+    if owner_mode == "transition_hold":
+        violations.append("owner_reconciliation_incomplete")
+    return {
+        "owner_mode": owner_mode,
+        "marker_count": marker_count,
+        "pith_user_prompt_handler_count": prompt_count,
+        "predicate_status": "passed" if not violations else "failed",
+        "violations": violations,
+    }
 
 
 def _codex_lifecycle_status(
@@ -1829,7 +2216,7 @@ def _codex_lifecycle_status(
             matches.append((path, state))
 
     limitations: list[str] = [
-        "Codex hook trust state is not automatically verified; hook configuration alone is not an enforced claim."
+        "Installed owner predicates are read from disk; runtime enforcement still requires matching hook-state evidence."
     ]
     if corrupt_files:
         limitations.append(f"Skipped {corrupt_files} unreadable lifecycle state file(s).")
@@ -1844,6 +2231,9 @@ def _codex_lifecycle_status(
     )
     result.update(
         {
+            "owner_configuration": _codex_owner_configuration(),
+            "owner_violation_status": "unknown",
+            "last_request_id_hash": None,
             "selector": selector,
             "state_dir": str(CODEX_LIFECYCLE_STATE_DIR),
             "scan": {
@@ -1936,6 +2326,8 @@ def _codex_lifecycle_status(
                     "overall_verdict": "partial",
                 }
             )
+            if result["owner_configuration"]["predicate_status"] != "passed":
+                result["overall_verdict"] = "failed"
             return result
         result.update(
             {
@@ -1952,6 +2344,8 @@ def _codex_lifecycle_status(
                 "overall_verdict": "not_observed",
             }
         )
+        if result["owner_configuration"]["predicate_status"] != "passed":
+            result["overall_verdict"] = "failed"
         return result
 
     selected_path, state = matches[0]
@@ -1976,9 +2370,18 @@ def _codex_lifecycle_status(
             "lifecycle_proof_status": proof_fields["lifecycle_proof_status"],
             "context_delivery_status": proof_fields["context_delivery_status"],
             "can_claim_context_delivered": proof_fields["can_claim_context_delivered"],
+            "owner_violation_status": state.get("owner_violation_status") or "none",
+            "last_request_id_hash": (
+                state.get("last_request_id_hash")
+                if isinstance(state.get("last_request_id_hash"), str)
+                and re.fullmatch(r"[0-9a-f]{64}", state["last_request_id_hash"])
+                else None
+            ),
             "overall_verdict": _codex_overall_lifecycle_verdict(context_phase, learning_phase),
         }
     )
+    if result["owner_configuration"]["predicate_status"] != "passed" or result["owner_violation_status"] == "observed":
+        result["overall_verdict"] = "failed"
     return result
 
 
@@ -2003,6 +2406,11 @@ def _lifecycle_reporters() -> dict[str, _LifecycleReporter]:
             "claude_desktop_mcp",
             enforcement_claim="instruction-mediated; Claude Desktop MCP tool call observed but not hook-enforced",
             learning_reason="Claude Desktop MCP learning evidence observed",
+        ),
+        "chatgpt_tunnel": _TransportLifecycleReporter(
+            "chatgpt_tunnel",
+            enforcement_claim="instruction-mediated; ChatGPT Secure MCP Tunnel tool call observed but not hook-enforced",
+            learning_reason="ChatGPT Secure MCP Tunnel learning evidence observed",
         ),
         "vscode_copilot_mcp": _TransportLifecycleReporter(
             "vscode_copilot_mcp",
@@ -2312,6 +2720,8 @@ def _lifecycle_diagnostic_cross_plane_verdict(
         return "diagnostic_degraded"
     if proof_status == "transport_timeout":
         return "lifecycle_proof_transport_timeout"
+    if proof_status == "hook_backpressure":
+        return "lifecycle_hook_backpressure"
     if proof_status == "workstream_gate":
         return "lifecycle_workstream_gate"
     if proof_status == "semantic_sparse":
@@ -2361,15 +2771,11 @@ def _lifecycle_diagnostic_reliability_operator_action(state: str) -> str:
 def _lifecycle_diagnostic_reliability_label(state: str, surface_label: str) -> str:
     return {
         "reliable": f"{surface_label} lifecycle proof is reliable for this selector and window.",
-        "proof_observed_partial": (
-            f"{surface_label} lifecycle proof exists, but it is partial or not fully aligned."
-        ),
+        "proof_observed_partial": (f"{surface_label} lifecycle proof exists, but it is partial or not fully aligned."),
         "proof_supported_unobserved": (
             f"{surface_label} supports lifecycle proof, but no matching proof was observed."
         ),
-        "configured_unobserved": (
-            f"{surface_label} is configured, but lifecycle proof was not observed."
-        ),
+        "configured_unobserved": (f"{surface_label} is configured, but lifecycle proof was not observed."),
         "unsupported_for_proof": (
             f"{surface_label} is configured, but this surface cannot currently prove lifecycle execution."
         ),
@@ -2715,6 +3121,14 @@ def _lifecycle_diagnostic_findings(
                 f"{surface_id} could not reach Pith lifecycle before model-visible context was confirmed.",
             )
         )
+    if verdict == "lifecycle_hook_backpressure":
+        findings.append(
+            _lifecycle_diagnostic_finding(
+                "LIFECYCLE_HOOK_BACKPRESSURE",
+                "warning",
+                f"{surface_id} hook context lane was saturated; retry shortly before claiming model-visible context.",
+            )
+        )
     if verdict == "lifecycle_workstream_gate":
         findings.append(
             _lifecycle_diagnostic_finding(
@@ -2828,9 +3242,8 @@ def _build_lifecycle_diagnostic(
     body = dict(payload or {})
     raw_surface_id = str(body.get("surface_id") or "").strip()
     normalized_surface_id = _normalize_surface_id(raw_surface_id)
-    body["surface_id"] = (
-        normalized_surface_id
-        or (raw_surface_id.lower() if raw_surface_id else LIFECYCLE_DIAGNOSTIC_DEFAULT_SURFACE_ID)
+    body["surface_id"] = normalized_surface_id or (
+        raw_surface_id.lower() if raw_surface_id else LIFECYCLE_DIAGNOSTIC_DEFAULT_SURFACE_ID
     )
     lifecycle_status = _build_lifecycle_status(
         body,
@@ -2962,6 +3375,154 @@ def _build_headers(operation: str, transport_mode: str) -> dict[str, str]:
     return headers
 
 
+def _connection_proof_payload(payload: dict | None) -> dict[str, Any]:
+    proof_payload = dict(payload or {})
+    proof_payload.setdefault("surface_id", "local_api_cli")
+    proof_payload.setdefault("message", "Pith connection proof")
+    proof_payload.setdefault("extracted_concepts_json", "[]")
+    return proof_payload
+
+
+def _connection_proof_auth_error(error_body: Any) -> Any:
+    if isinstance(error_body, dict):
+        if error_body.get("auth_error"):
+            return error_body.get("auth_error")
+        code = str(error_body.get("code") or "")
+        if code in {"AUTH_FAILED", "UNAUTHORIZED"}:
+            return error_body
+        body = error_body.get("body")
+        if isinstance(body, dict):
+            detail = str(body.get("detail") or body.get("message") or "")
+            if "api key" in detail.lower() or "unauthorized" in detail.lower():
+                return body
+    return None
+
+
+def _connection_proof_from_turn_result(
+    turn_result: dict[str, Any] | None,
+    *,
+    request_payload: dict[str, Any] | None = None,
+    status_code: int | None = None,
+    transport_mode: str = "exec_http_fallback",
+    api_url: str = DEFAULT_BASE_URL,
+    error_body: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    request_payload = dict(request_payload or {})
+    turn_result = dict(turn_result or {})
+    diagnostic_error = error_body if isinstance(error_body, dict) and error_body else turn_result
+    auth_error = turn_result.get("auth_error") or _connection_proof_auth_error(diagnostic_error)
+    error_code = diagnostic_error.get("code") if isinstance(diagnostic_error, dict) else None
+    error_message = diagnostic_error.get("message") if isinstance(diagnostic_error, dict) else None
+    protocol = turn_result.get("_protocol")
+    protocol_session_active_present = isinstance(protocol, dict) and "session_active" in protocol
+    bind_status = turn_result.get("bind_status")
+    resolved_session_id = turn_result.get("resolved_session_id") or turn_result.get("session_id")
+    if protocol_session_active_present:
+        session_active = bool(protocol.get("session_active"))
+        session_active_source = "conversation_turn._protocol.session_active"
+    else:
+        session_active = bool(bind_status == "bound" and resolved_session_id)
+        session_active_source = "fallback_bind_status_bound_with_resolved_session_id"
+    same_turn = bool(turn_result and not turn_result.get("error") and (status_code is None or status_code < 400))
+    connected = bool(same_turn and bind_status == "bound" and resolved_session_id and session_active and not auth_error)
+    return {
+        "schema_version": CONNECTION_PROOF_SCHEMA_VERSION,
+        "verdict": "connected" if connected else "not_connected",
+        "same_turn": same_turn,
+        "evidence_source": "current_conversation_turn_response",
+        "transport_mode": transport_mode,
+        "api_url": api_url,
+        "status_code": status_code,
+        "surface_id": turn_result.get("surface_id") or request_payload.get("surface_id"),
+        "origin_id": turn_result.get("origin_id") or request_payload.get("origin_id"),
+        "workspace_id": turn_result.get("workspace_id") or request_payload.get("workspace_id"),
+        "bind_status": bind_status,
+        "resolved_session_id": resolved_session_id,
+        "auth_error": auth_error,
+        "error_code": error_code,
+        "error_message": error_message,
+        "session_active": session_active,
+        "session_active_source": session_active_source,
+        "claim_rule": (
+            "connected requires this command's conversation_turn response to bind a session, return resolved_session_id, "
+            "have session_active=true, and report no auth error; health or bridge reachability alone is insufficient"
+        ),
+    }
+
+
+def _build_connection_proof(
+    payload: dict | None,
+    *,
+    base_url: str = DEFAULT_BASE_URL,
+    timeout: float = DEFAULT_TIMEOUT,
+    transport_mode: str = "exec_http_fallback",
+) -> dict[str, Any]:
+    proof_payload = _connection_proof_payload(payload)
+    try:
+        headers = _build_headers("conversation_turn", transport_mode)
+    except SystemExit as exc:
+        return _connection_proof_from_turn_result(
+            None,
+            request_payload=proof_payload,
+            transport_mode=transport_mode,
+            api_url=base_url,
+            error_body={
+                "error": True,
+                "code": "AUTH_FAILED",
+                "message": str(exc),
+            },
+        )
+
+    try:
+        response = requests.post(
+            f"{base_url}{ALLOWED['conversation_turn'][1]}",
+            json=proof_payload,
+            headers=headers,
+            timeout=timeout,
+        )
+    except requests.RequestException as exc:
+        return _connection_proof_from_turn_result(
+            {"error": True, "code": "CONNECTION_FAILED", "message": str(exc)},
+            request_payload=proof_payload,
+            transport_mode=transport_mode,
+            api_url=base_url,
+            error_body={"error": True, "code": "CONNECTION_FAILED", "message": str(exc)},
+        )
+
+    try:
+        body: Any = response.json()
+    except ValueError:
+        body = {"error": True, "code": "NON_JSON_RESPONSE", "message": response.text[:500]}
+
+    if response.status_code >= 400:
+        return _connection_proof_from_turn_result(
+            body if isinstance(body, dict) else None,
+            request_payload=proof_payload,
+            status_code=response.status_code,
+            transport_mode=transport_mode,
+            api_url=base_url,
+            error_body={
+                "error": True,
+                "status_code": response.status_code,
+                "body": body,
+                "code": "AUTH_FAILED" if response.status_code in {401, 403} else "HTTP_ERROR",
+            },
+        )
+    if not isinstance(body, dict):
+        body = {
+            "error": True,
+            "code": "INVALID_RESPONSE_SHAPE",
+            "message": "conversation_turn did not return an object",
+        }
+    return _connection_proof_from_turn_result(
+        body,
+        request_payload=proof_payload,
+        status_code=response.status_code,
+        transport_mode=transport_mode,
+        api_url=base_url,
+    )
+
+
 def _operation_catalog() -> list[dict[str, Any]]:
     operations = [
         {
@@ -3005,6 +3566,134 @@ def _operation_discovery_payload(operation: str, kind: str) -> dict[str, Any]:
     raise SystemExit(f"No local {kind} registered for operation {operation!r}. Available operations: {available}")
 
 
+def _trust_health_payload_error(message: str, field: str | None = None) -> dict[str, Any]:
+    result = {
+        "error": True,
+        "code": "INVALID_TRUST_HEALTH_PAYLOAD",
+        "schema_version": TRUST_HEALTH_STATUS_REQUEST_ERROR_SCHEMA_VERSION,
+        "message": message,
+    }
+    if field:
+        result["field"] = field
+    return result
+
+
+def _trust_health_int(
+    payload: dict[str, Any],
+    field: str,
+    default: int,
+    *,
+    minimum: int,
+) -> tuple[int | None, dict[str, Any] | None]:
+    if field not in payload:
+        return default, None
+    value = payload[field]
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None, _trust_health_payload_error(f"{field} must be an integer >= {minimum}", field)
+    if value < minimum:
+        return None, _trust_health_payload_error(f"{field} must be an integer >= {minimum}", field)
+    return value, None
+
+
+def _trust_health_str(payload: dict[str, Any], field: str, default: str) -> tuple[str | None, dict[str, Any] | None]:
+    if field not in payload:
+        return default, None
+    value = payload[field]
+    if not isinstance(value, str) or not value.strip():
+        return None, _trust_health_payload_error(f"{field} must be a non-empty string", field)
+    return value, None
+
+
+def _trust_health_bool(
+    payload: dict[str, Any],
+    field: str,
+    default: bool,
+) -> tuple[bool | None, dict[str, Any] | None]:
+    if field not in payload:
+        return default, None
+    value = payload[field]
+    if not isinstance(value, bool):
+        return None, _trust_health_payload_error(f"{field} must be a boolean", field)
+    return value, None
+
+
+def _build_trust_health_status(payload: Any) -> dict[str, Any]:
+    if payload is None:
+        payload = {}
+    if not isinstance(payload, dict):
+        return _trust_health_payload_error("trust_health payload must be a JSON object")
+
+    from scripts import trust_health_status
+
+    int_fields = {
+        "history_limit": (trust_health_status.DEFAULT_HISTORY_LIMIT, 1),
+        "warn_after_seconds": (trust_health_status.DEFAULT_WARN_AFTER_SECONDS, 0),
+        "critical_after_seconds": (trust_health_status.DEFAULT_CRITICAL_AFTER_SECONDS, 0),
+        "max_log_bytes": (trust_health_status.DEFAULT_MAX_LOG_BYTES, 1),
+    }
+    parsed_ints: dict[str, int] = {}
+    for field, (default, minimum) in int_fields.items():
+        value, error = _trust_health_int(payload, field, default, minimum=minimum)
+        if error:
+            return error
+        parsed_ints[field] = value if value is not None else default
+
+    compact_log_path, error = _trust_health_str(
+        payload,
+        "compact_log_path",
+        str(trust_health_status.DEFAULT_COMPACT_LOG_PATH),
+    )
+    if error:
+        return error
+    supersession_compact_log_path, error = _trust_health_str(
+        payload,
+        "supersession_compact_log_path",
+        str(trust_health_status.DEFAULT_SUPERSESSION_COMPACT_LOG_PATH),
+    )
+    if error:
+        return error
+    reports_dir, error = _trust_health_str(
+        payload,
+        "reports_dir",
+        str(trust_health_status.DEFAULT_REPORTS_DIR),
+    )
+    if error:
+        return error
+    health_url, error = _trust_health_str(payload, "health_url", trust_health_status.DEFAULT_HEALTH_URL)
+    if error:
+        return error
+    runtime_health, error = _trust_health_bool(payload, "runtime_health", True)
+    if error:
+        return error
+    scheduler, error = _trust_health_bool(payload, "scheduler", True)
+    if error:
+        return error
+    supersession_scheduler, error = _trust_health_bool(payload, "supersession_scheduler", True)
+    if error:
+        return error
+
+    args = argparse.Namespace(
+        compact_log_path=compact_log_path,
+        supersession_compact_log_path=supersession_compact_log_path,
+        reports_dir=reports_dir,
+        health_url=health_url,
+        history_limit=parsed_ints["history_limit"],
+        warn_after_seconds=parsed_ints["warn_after_seconds"],
+        critical_after_seconds=parsed_ints["critical_after_seconds"],
+        max_log_bytes=parsed_ints["max_log_bytes"],
+        no_runtime_health=not bool(runtime_health),
+        no_scheduler=not bool(scheduler),
+        no_supersession_scheduler=not bool(supersession_scheduler),
+    )
+    return trust_health_status.build_status(args)
+
+
+def _build_trust_control_status(payload: Any) -> dict[str, Any]:
+    from scripts import trust_control
+
+    return trust_control.build_status_from_payload(payload)
+
+
 def _response_detail(body: Any) -> str:
     if isinstance(body, dict):
         detail = body.get("detail")
@@ -3035,6 +3724,34 @@ def _retry_after_seconds(response: requests.Response, attempt: int) -> float:
         except ValueError:
             pass
     return min(0.5 * (2**attempt), CONVERSATION_TURN_STARTUP_RETRY_CAP_S)
+
+
+def _retry_delay_seconds(attempt: int) -> float:
+    return min(0.5 * (2**attempt), CONVERSATION_TURN_STARTUP_RETRY_CAP_S)
+
+
+def _is_retryable_conversation_turn_connection_drop(operation: str, exc: requests.RequestException) -> bool:
+    if operation != "conversation_turn":
+        return False
+    message = str(exc).lower()
+    retryable_markers = (
+        "remote end closed connection without response",
+        "connection aborted",
+        "connection reset by peer",
+        "server disconnected",
+        "connection refused",
+    )
+    return any(marker in message for marker in retryable_markers)
+
+
+def _is_retry_safe_conversation_turn_payload(payload: dict[str, Any] | None) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    return not bool(payload.get("session_id") or payload.get("previous_response"))
+
+
+def _is_codex_conversation_turn_payload(payload: dict[str, Any] | None) -> bool:
+    return isinstance(payload, dict) and _normalize_surface_id(payload.get("surface_id")) == "codex_local_api"
 
 
 def _transport_iso_now() -> str:
@@ -3809,6 +4526,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     payload = _load_payload(args)
+    if args.operation == "connection_proof":
+        result = _build_connection_proof(
+            payload,
+            base_url=args.base_url,
+            timeout=args.timeout,
+            transport_mode=args.transport_mode,
+        )
+        print(json.dumps(result, sort_keys=True))
+        return 0 if result.get("verdict") == "connected" else 1
     if args.operation == "lifecycle_status":
         result = _build_lifecycle_status(
             payload,
@@ -3827,6 +4553,14 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(json.dumps(result, sort_keys=True))
         return 1 if result.get("status") == "error" else 0
+    if args.operation == "trust_health":
+        result = _build_trust_health_status(payload)
+        print(json.dumps(result, sort_keys=True))
+        return 1 if result.get("error") is True else 0
+    if args.operation == "trust":
+        result = _build_trust_control_status(payload)
+        print(json.dumps(result, sort_keys=True))
+        return 1 if result.get("error") is True else 0
 
     method, endpoint = ALLOWED[args.operation]
     payload = _with_default_surface_payload(args.operation, payload)
@@ -3842,6 +4576,7 @@ def main(argv: list[str] | None = None) -> int:
     max_attempts = max(1, CONVERSATION_TURN_STARTUP_MAX_ATTEMPTS) if args.operation == "conversation_turn" else 1
     response = None
     body: Any = None
+    retry_suppression: dict[str, Any] = {}
     for attempt in range(max_attempts):
         try:
             if method == "GET":
@@ -3859,6 +4594,25 @@ def main(argv: list[str] | None = None) -> int:
                     timeout=args.timeout,
                 )
         except requests.RequestException as exc:
+            retryable_drop = _is_retryable_conversation_turn_connection_drop(args.operation, exc)
+            retry_safe = _is_retry_safe_conversation_turn_payload(payload)
+            codex_no_retry = _is_codex_conversation_turn_payload(payload)
+            if attempt < max_attempts - 1 and retryable_drop and retry_safe and not codex_no_retry:
+                delay_s = _retry_delay_seconds(attempt)
+                _transport_event(
+                    "conversation_turn_connection_retry",
+                    operation=args.operation,
+                    transport_mode=args.transport_mode,
+                    attempt=attempt + 1,
+                    max_attempts=max_attempts,
+                    retry_after_s=delay_s,
+                    error_class=exc.__class__.__name__,
+                    message_preview=_active_workstream_truncate(str(exc), 180),
+                    api_url=args.base_url,
+                    elapsed_ms=round((time.perf_counter() - started) * 1000, 2),
+                )
+                time.sleep(delay_s)
+                continue
             body = {
                 "error": True,
                 "code": "CONNECTION_FAILED",
@@ -3866,6 +4620,37 @@ def main(argv: list[str] | None = None) -> int:
                 "operation": args.operation,
                 "transport_mode": args.transport_mode,
             }
+            if retryable_drop:
+                body.update(
+                    {
+                        "transport_degraded": True,
+                        "retryable_connection_drop": True,
+                        "retry_safe": retry_safe,
+                        "attempts": attempt + 1,
+                        "degraded_reason": "conversation_turn_connection_drop",
+                    }
+                )
+                if codex_no_retry:
+                    body.update(
+                        {
+                            "same_turn_retry_suppressed": True,
+                            "retry_recommended_next_turn": True,
+                            "attempts": 1,
+                        }
+                    )
+                    _transport_event(
+                        "conversation_turn_retry_suppressed",
+                        operation=args.operation,
+                        transport_mode=args.transport_mode,
+                        reason="connection_drop",
+                        same_turn_retry_suppressed=True,
+                        retry_recommended_next_turn=True,
+                        attempts=1,
+                        degraded_reason="conversation_turn_connection_drop",
+                        error_class=exc.__class__.__name__,
+                        api_url=args.base_url,
+                        elapsed_ms=round((time.perf_counter() - started) * 1000, 2),
+                    )
             _emit_active_workstream_render_event(
                 args.operation,
                 payload,
@@ -3904,11 +4689,34 @@ def main(argv: list[str] | None = None) -> int:
                 "message": response.text[:500],
             }
 
-        if attempt < max_attempts - 1 and _is_retryable_conversation_turn_startup_503(
+        retryable_startup = _is_retryable_conversation_turn_startup_503(
             args.operation,
             response.status_code,
             body,
-        ):
+        )
+        if retryable_startup and _is_codex_conversation_turn_payload(payload):
+            delay_s = _retry_after_seconds(response, attempt)
+            retry_suppression = {
+                "same_turn_retry_suppressed": True,
+                "retry_recommended_next_turn": True,
+                "attempts": 1,
+                "degraded_reason": "conversation_turn_startup_not_ready",
+                "retry_after_s": delay_s,
+            }
+            if isinstance(body, dict):
+                body.update(retry_suppression)
+            _transport_event(
+                "conversation_turn_retry_suppressed",
+                operation=args.operation,
+                transport_mode=args.transport_mode,
+                reason="startup_not_ready",
+                status_code=response.status_code,
+                api_url=args.base_url,
+                **retry_suppression,
+                elapsed_ms=round((time.perf_counter() - started) * 1000, 2),
+            )
+            break
+        if attempt < max_attempts - 1 and retryable_startup:
             delay_s = _retry_after_seconds(response, attempt)
             _transport_event(
                 "conversation_turn_startup_retry",
@@ -3935,6 +4743,7 @@ def main(argv: list[str] | None = None) -> int:
             "operation": args.operation,
             "transport_mode": args.transport_mode,
         }
+        error_body.update(retry_suppression)
         _emit_active_workstream_render_event(
             args.operation,
             payload,

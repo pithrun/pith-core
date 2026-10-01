@@ -471,7 +471,7 @@ async def run_edge_reclassification(conn, batch_size: int = 100) -> int:
 
 
 # STABILITY-032: Shared LLM JSON response parser
-_JSON_OBJECT_RE = re.compile(r'\{[^{}]*\}')  # Flat JSON only — sufficient for LLM classification responses
+_JSON_OBJECT_RE = re.compile(r"\{[^{}]*\}")  # Flat JSON only — sufficient for LLM classification responses
 
 
 def _strip_llm_json(raw_text: str) -> dict | None:
@@ -490,9 +490,9 @@ def _strip_llm_json(raw_text: str) -> dict | None:
     # Strip markdown code block wrapper
     if text.startswith("```"):
         # Remove opening ``` line (with optional language tag)
-        text = re.sub(r'^```\w*\n?', '', text)
+        text = re.sub(r"^```\w*\n?", "", text)
         # Remove closing ```
-        text = re.sub(r'\n?```$', '', text)
+        text = re.sub(r"\n?```$", "", text)
         text = text.strip()
 
     # Attempt 1: Direct parse
@@ -663,8 +663,7 @@ async def _classify_edge_llm(src: tuple, tgt: tuple) -> tuple[str | None, float]
             if isinstance(e, _anthropic.AuthenticationError):
                 _EDGE_LLM_AUTH_FAILED = True
                 logger.error(
-                    "OPS-027: Edge LLM disabled — API key rejected (401). "
-                    "Rotate ANTHROPIC_API_KEY in .env. Error: %s",
+                    "OPS-027: Edge LLM disabled — API key rejected (401). Rotate ANTHROPIC_API_KEY in .env. Error: %s",
                     e,
                 )
                 return None, 0.0
@@ -1185,8 +1184,8 @@ async def run_ka_reclassification(conn, batch_size: int = 50, full_corpus: bool 
 
     reclassified = 0
 
-    from app.core.config import KA_LLM_MAX_PER_RUN, KA_LLM_RECLASSIFICATION_ENABLED
     from app.cognitive.taxonomy import _CANONICAL_KA_DESCRIPTIONS
+    from app.core.config import KA_LLM_MAX_PER_RUN, KA_LLM_RECLASSIFICATION_ENABLED
 
     # LLM budget cap per run
     llm_calls_remaining = KA_LLM_MAX_PER_RUN if KA_LLM_RECLASSIFICATION_ENABLED else 0
@@ -1326,6 +1325,7 @@ async def run_ka_reclassification(conn, batch_size: int = 50, full_corpus: bool 
 # KA-ARCH-001: Dynamic KA embedding rebuild
 # ======================================================================
 
+
 def _rebuild_ka_embeddings():
     """Rebuild the embedding cache for embedding-based KA classification.
 
@@ -1347,6 +1347,7 @@ def _rebuild_ka_embeddings():
             return
 
         from app.storage.embedding import embedding_engine
+
         if not embedding_engine.is_available:
             return
 
@@ -1360,10 +1361,7 @@ def _rebuild_ka_embeddings():
 
         # Persist embeddings to DB for faster cold start
         for i, name in enumerate(names):
-            db.execute(
-                "UPDATE knowledge_areas SET embedding = ? WHERE name = ?",
-                (embeddings[i].tobytes(), name)
-            )
+            db.execute("UPDATE knowledge_areas SET embedding = ? WHERE name = ?", (embeddings[i].tobytes(), name))
         db.commit()
 
         logger.info(f"KA embeddings rebuilt: {len(names)} areas")
@@ -1417,7 +1415,9 @@ class AsyncTaskRunner:
                 t0 = time.perf_counter()
                 with owned_connection() as task_conn:
                     ensure_async_tables(task_conn)
-                    items = await self._execute_task(task_type, task_conn, config, **kwargs)
+                    dispatch_kwargs = dict(kwargs)
+                    dispatch_kwargs["_task_run_id"] = run_id
+                    items = await self._execute_task(task_type, task_conn, config, **dispatch_kwargs)
                     record_task_complete(run_id, TaskStatus.SUCCESS.value, items, None, task_conn)
                 elapsed = time.perf_counter() - t0
 
@@ -1487,9 +1487,7 @@ class AsyncTaskRunner:
             return await asyncio.wait_for(run_edge_reclassification(conn, config.batch_size), timeout=timeout)
         elif task_type == "ka_reclassification":
             return await asyncio.wait_for(
-                run_ka_reclassification(
-                    conn, config.batch_size, full_corpus=kwargs.get("full_corpus", False)
-                ),
+                run_ka_reclassification(conn, config.batch_size, full_corpus=kwargs.get("full_corpus", False)),
                 timeout=timeout,
             )
         elif task_type == "staleness_alerts":
@@ -1523,8 +1521,12 @@ class AsyncTaskRunner:
             from app.cognitive.association import auto_associate_batch
             from app.core.models import AutoAssociateBatchRequest
 
-            result = auto_associate_batch(AutoAssociateBatchRequest())
-            return result.edges_created if hasattr(result, "edges_created") else 0
+            result = auto_associate_batch(
+                AutoAssociateBatchRequest(selection_mode="unlinked"),
+                invocation_source="async_task",
+                parent_run_id=kwargs.get("_task_run_id"),
+            )
+            return int(getattr(result, "tier1_edges_created", 0)) + int(getattr(result, "tier2_edges_created", 0))
         elif task_type == "evidence_consolidation":
             return await asyncio.wait_for(run_evidence_consolidation(conn, config.batch_size), timeout=timeout)
         elif task_type == "experiment_generation":
@@ -1535,9 +1537,7 @@ class AsyncTaskRunner:
             )
 
             try:
-                concepts, associations, assoc_counts, salience_ranks, tfidf_cache = (
-                    _load_experiment_corpus()
-                )
+                concepts, associations, assoc_counts, salience_ranks, tfidf_cache = _load_experiment_corpus()
             except Exception as prep_err:
                 logger.warning(f"EXP-032: corpus prep failed: {prep_err}")
                 return 0
@@ -1563,7 +1563,7 @@ class AsyncTaskRunner:
             logger.warning(f"No implementation for async task: {task_type}")
             return 0
 
-    async def run_scheduled_tasks(self) -> dict[str, dict]:
+    async def run_scheduled_tasks(self, *, complete_pass: bool = False) -> dict[str, dict]:
         """Run all tasks that are due based on their interval.
 
         Called periodically (e.g., every hour) or on session_end.
@@ -1612,15 +1612,18 @@ class AsyncTaskRunner:
             logger.warning("Scheduled task due-state lookup failed: %s", schedule_err)
             return {"scheduler": {"status": "failed", "error": str(schedule_err)}}
 
-        deferred_heavy_tasks = heavy_tasks[1:]
+        # Interactive callers keep one heavy task; dedicated maintenance must
+        # service every daily task instead of rotating them across several days.
+        selected_heavy_tasks = heavy_tasks if complete_pass else heavy_tasks[:1]
+        deferred_heavy_tasks = [] if complete_pass else heavy_tasks[1:]
         for task_type, _config in deferred_heavy_tasks:
             results[task_type] = {
                 "status": "deferred_budget",
                 "reason": "heavy_task_budget_isolation",
             }
 
-        for task_type, config in fast_tasks + heavy_tasks[:1]:
-
+        execution_tasks = fast_tasks + selected_heavy_tasks
+        for task_index, (task_type, config) in enumerate(execution_tasks):
             try:
                 result = await self.run_task(task_type)
                 results[task_type] = result
@@ -1634,6 +1637,11 @@ class AsyncTaskRunner:
                     "error": "Phase 1 timeout — outer budget exhausted",
                 }
                 logger.warning("STABILITY-036: Phase 1 budget exhausted during %s", task_type)
+                for pending_type, _ in execution_tasks[task_index + 1 :]:
+                    results[pending_type] = {
+                        "status": "deferred_budget",
+                        "reason": "phase_budget_exhausted",
+                    }
                 break
             except Exception as e:
                 results[task_type] = {
@@ -1661,6 +1669,7 @@ class AsyncTaskRunner:
         # KA-ARCH-001: Dynamic KA lifecycle evolution
         try:
             from app.cognitive.taxonomy import _run_lease_guarded_ka_promotion, detect_ka_merges
+
             transitions = _run_lease_guarded_ka_promotion("session_end")
             merge_candidates = detect_ka_merges()
 

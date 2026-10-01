@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import os
 import threading
 import time
@@ -13,8 +14,10 @@ from typing import Any
 from app.core.config import (
     LIFECYCLE_DRAIN_STUCK_SECONDS,
     LIFECYCLE_DRAIN_WALL_BUDGET_SECONDS,
+    LIFECYCLE_JOB_DEFER_MAX_AGE_SECONDS,
     LIFECYCLE_JOB_LEASE_SECONDS,
     LIFECYCLE_JOB_MAX_ATTEMPTS,
+    LIFECYCLE_JOB_MAX_DEFERRALS,
     LIFECYCLE_JOB_RETRY_SECONDS,
 )
 from app.core.profile import get_active_profile
@@ -28,6 +31,7 @@ from app.storage.lifecycle_jobs import (
     retry_lifecycle_job,
     summarize_lifecycle_jobs,
     summarize_lifecycle_jobs_by_source,
+    terminalize_exhausted_deferred_lifecycle_jobs,
     terminalize_exhausted_stale_lifecycle_jobs,
 )
 
@@ -39,10 +43,21 @@ _DRAIN_SUBMITTED_AT: dict[str, float] = {}
 _DRAIN_LOCK = threading.Lock()
 _DRAIN_EXECUTION_LOCK = threading.Lock()
 _LIFECYCLE_JOB_RUNNERS: dict[str, Callable[[dict[str, Any]], Any]] = {}
+_LIFECYCLE_MAINTENANCE_CALLBACKS: dict[str, Callable[..., dict[str, Any]]] = {}
 _RUNNER_LOCK = threading.Lock()
 _SUPERVISOR_LOCK = threading.Lock()
 _SUPERVISOR_STOP: threading.Event | None = None
 _SUPERVISOR_THREAD: threading.Thread | None = None
+DEFERRED_BUDGET_TERMINAL_ERROR = "LifecycleJobTerminalized: deferred lifecycle job exhausted deferral budget"
+_MAINTENANCE_COUNT_FIELDS = (
+    "inspected",
+    "due",
+    "closed",
+    "busy",
+    "skipped",
+    "shadow_only",
+    "wall_budget_exhausted",
+)
 
 
 class LifecycleJobDeferred(RuntimeError):
@@ -116,6 +131,7 @@ def _shutdown_lifecycle_executors_for_tests() -> None:
 def _clear_lifecycle_job_runners_for_tests() -> None:
     with _RUNNER_LOCK:
         _LIFECYCLE_JOB_RUNNERS.clear()
+        _LIFECYCLE_MAINTENANCE_CALLBACKS.clear()
 
 
 def shutdown_lifecycle_runtime(*, wait: bool = True) -> None:
@@ -132,6 +148,18 @@ def _record_metric(metric: str, value: float = 1.0, labels: dict[str, str] | Non
         metrics.flush()
     except Exception:
         pass
+
+
+def _record_maintenance_result(name: str, result: dict[str, Any]) -> None:
+    """Record only fixed-cardinality aggregate fields from maintenance callbacks."""
+
+    mode = str(result.get("mode") or "unknown")
+    labels = {"callback": name, "mode": mode}
+    for field in _MAINTENANCE_COUNT_FIELDS:
+        value = result.get(field)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        _record_metric(f"lifecycle_maintenance_{field}", float(value), labels)
 
 
 def _pressure_backpressure_active() -> tuple[bool, str, str]:
@@ -259,20 +287,56 @@ def enqueue_session_learn_job(
     learn_request: Any,
     request_id: str,
     priority: int = 60,
+    managed_context: Any | None = None,
+    replay_state: Any | None = None,
 ) -> dict[str, Any]:
     """Persist an explicit session_learn job for durable post-response processing."""
+    profile = get_active_profile()
+    request_payload = (
+        learn_request.model_dump(mode="json") if hasattr(learn_request, "model_dump") else dict(learn_request)
+    )
     payload = {
-        "learn_request": learn_request.model_dump(mode="json")
-        if hasattr(learn_request, "model_dump")
-        else dict(learn_request),
+        "learn_request": request_payload,
     }
+    idempotency_key = request_id
+    managed_kwargs: dict[str, Any] = {}
+    if managed_context is not None:
+        if replay_state is None:
+            raise ValueError("managed session_learn enqueue requires replay state")
+        if managed_context.profile != profile:
+            raise ValueError("managed session_learn profile mismatch")
+        if not replay_state.request_hash or not replay_state.storage_request_id or not replay_state.claim_token:
+            raise ValueError("managed session_learn replay state is incomplete")
+        request_payload.pop("binding", None)
+        payload["managed_context"] = {
+            "profile": managed_context.profile,
+            "binding_hash": managed_context.binding_hash,
+            "binding_generation": managed_context.generation,
+            "session_id": managed_context.session_id,
+        }
+        payload["managed_replay"] = {
+            "external_request_id": request_id,
+            "storage_request_id": replay_state.storage_request_id,
+            "request_hash": replay_state.request_hash,
+            "claim_token": replay_state.claim_token,
+        }
+        raw_identity = (
+            f"v1\0{profile}\0{managed_context.binding_hash}\0session_learn\0{request_id}\0{replay_state.request_hash}"
+        )
+        idempotency_key = hashlib.sha256(raw_identity.encode("utf-8")).hexdigest()
+        managed_kwargs = {
+            "session_id": managed_context.session_id,
+            "binding_hash": managed_context.binding_hash,
+            "binding_generation": managed_context.generation,
+        }
     job = enqueue_lifecycle_job(
-        profile=get_active_profile(),
+        profile=profile,
         source="session_learn",
-        idempotency_key=request_id,
+        idempotency_key=idempotency_key,
         stage="learn",
         payload=payload,
         priority=priority,
+        **managed_kwargs,
     )
     _record_metric("lifecycle_job_enqueued", 1.0, {"source": "session_learn", "stage": "learn"})
     _record_metric("session_learn_lifecycle_enqueued", 1.0)
@@ -289,9 +353,7 @@ def _load_turn_ingestion_diagnostic(raw_capture_ref: dict[str, Any] | None) -> d
 def _build_lifecycle_commit_result(job: dict[str, Any], run_result: Any) -> dict[str, Any]:
     """Build a backward-compatible lifecycle result payload."""
     result: dict[str, Any] = (
-        {"status": "ok", **run_result}
-        if isinstance(run_result, dict)
-        else {"status": "ok", "result": str(run_result)}
+        {"status": "ok", **run_result} if isinstance(run_result, dict) else {"status": "ok", "result": str(run_result)}
     )
     if job.get("source") != "conversation_turn":
         return result
@@ -328,12 +390,40 @@ def run_lifecycle_drain_once(
     """
     profile = get_active_profile()
     start_monotonic = time.monotonic()
-    result = {"claimed": 0, "committed": 0, "retried": 0, "deferred": 0, "failed": 0, "reason": reason}
+    result = {
+        "claimed": 0,
+        "committed": 0,
+        "retried": 0,
+        "deferred": 0,
+        "failed": 0,
+        "stale_claims": 0,
+        "reason": reason,
+    }
     max_jobs = max(0, int(limit or 0))
     with _DRAIN_EXECUTION_LOCK:
         if max_jobs > 0:
             now = datetime.now(UTC)
             stale_before = (now - timedelta(seconds=LIFECYCLE_JOB_LEASE_SECONDS)).isoformat()
+            if source in {None, "session_end"}:
+                from app.session.binding import terminalize_exhausted_stale_managed_session_end_jobs
+
+                managed_terminalized = terminalize_exhausted_stale_managed_session_end_jobs(
+                    profile=profile,
+                    stale_before_iso=stale_before,
+                    max_attempts=LIFECYCLE_JOB_MAX_ATTEMPTS,
+                    error="LifecycleJobTerminalized: stale managed close exhausted max attempts",
+                    now=now.isoformat(),
+                )
+                for outcome in ("failed", "committed"):
+                    count = int(managed_terminalized.get(outcome, 0))
+                    if count:
+                        key = f"managed_terminalized_{outcome}"
+                        result[key] = count
+                        _record_metric(
+                            f"lifecycle_job_{key}",
+                            float(count),
+                            {"source": "session_end", "reason": reason},
+                        )
             terminalized = terminalize_exhausted_stale_lifecycle_jobs(
                 profile=profile,
                 stale_before_iso=stale_before,
@@ -347,6 +437,24 @@ def run_lifecycle_drain_once(
                 _record_metric(
                     "lifecycle_job_terminalized_failed",
                     float(terminalized),
+                    {"source": _source_key(source), "reason": reason},
+                )
+            deferred_before = (
+                now - timedelta(seconds=max(1.0, float(LIFECYCLE_JOB_DEFER_MAX_AGE_SECONDS)))
+            ).isoformat()
+            terminalized_deferred = terminalize_exhausted_deferred_lifecycle_jobs(
+                profile=profile,
+                max_deferrals=LIFECYCLE_JOB_MAX_DEFERRALS,
+                first_deferred_before_iso=deferred_before,
+                error=DEFERRED_BUDGET_TERMINAL_ERROR,
+                now=now.isoformat(),
+                source=source,
+            )
+            if terminalized_deferred:
+                result["terminalized_deferred_failed"] = terminalized_deferred
+                _record_metric(
+                    "lifecycle_job_terminalized_deferred_failed",
+                    float(terminalized_deferred),
                     {"source": _source_key(source), "reason": reason},
                 )
         while int(result["claimed"]) < max_jobs:
@@ -390,13 +498,26 @@ def run_lifecycle_drain_once(
                 _record_metric("lifecycle_job_claimed", 1.0, {"source": job["source"], "stage": job["stage"]})
                 try:
                     run_result = run_job(job)
-                    commit_lifecycle_job(
+                    committed = commit_lifecycle_job(
                         profile=profile,
                         job_id=job["job_id"],
+                        expected_claim_token=job["claim_token"],
                         result=_build_lifecycle_commit_result(job, run_result),
                     )
-                    _record_metric("lifecycle_job_committed", 1.0, {"source": job["source"], "stage": job["stage"]})
-                    result["committed"] += 1
+                    if committed is not False:
+                        _record_metric(
+                            "lifecycle_job_committed",
+                            1.0,
+                            {"source": job["source"], "stage": job["stage"]},
+                        )
+                        result["committed"] += 1
+                    else:
+                        _record_metric(
+                            "lifecycle_job_stale_claim",
+                            1.0,
+                            {"source": job["source"], "stage": job["stage"], "outcome": "commit"},
+                        )
+                        result["stale_claims"] += 1
                 except LifecycleJobDeferred as exc:
                     error = f"{type(exc).__name__}: {exc}"
                     retry_after = (
@@ -405,20 +526,73 @@ def run_lifecycle_drain_once(
                         else float(LIFECYCLE_JOB_RETRY_SECONDS)
                     )
                     retry_at = (datetime.now(UTC) + timedelta(seconds=max(0.0, retry_after))).isoformat()
-                    defer_lifecycle_job(profile=profile, job_id=job["job_id"], error=error, next_retry_at=retry_at)
-                    _record_metric("lifecycle_job_deferred", 1.0, {"source": job["source"], "stage": job["stage"]})
-                    result["deferred"] += 1
+                    deferred = defer_lifecycle_job(
+                        profile=profile,
+                        job_id=job["job_id"],
+                        expected_claim_token=job["claim_token"],
+                        error=error,
+                        next_retry_at=retry_at,
+                    )
+                    if deferred is not False:
+                        _record_metric(
+                            "lifecycle_job_deferred",
+                            1.0,
+                            {"source": job["source"], "stage": job["stage"]},
+                        )
+                        result["deferred"] += 1
+                    else:
+                        _record_metric(
+                            "lifecycle_job_stale_claim",
+                            1.0,
+                            {"source": job["source"], "stage": job["stage"], "outcome": "defer"},
+                        )
+                        result["stale_claims"] += 1
                 except Exception as exc:
                     error = f"{type(exc).__name__}: {exc}"
                     if int(job.get("attempts") or 0) >= LIFECYCLE_JOB_MAX_ATTEMPTS:
-                        fail_lifecycle_job(profile=profile, job_id=job["job_id"], error=error)
-                        _record_metric("lifecycle_job_failed", 1.0, {"source": job["source"], "stage": job["stage"]})
-                        result["failed"] += 1
+                        failed = fail_lifecycle_job(
+                            profile=profile,
+                            job_id=job["job_id"],
+                            expected_claim_token=job["claim_token"],
+                            error=error,
+                        )
+                        if failed is not False:
+                            _record_metric(
+                                "lifecycle_job_failed",
+                                1.0,
+                                {"source": job["source"], "stage": job["stage"]},
+                            )
+                            result["failed"] += 1
+                        else:
+                            _record_metric(
+                                "lifecycle_job_stale_claim",
+                                1.0,
+                                {"source": job["source"], "stage": job["stage"], "outcome": "fail"},
+                            )
+                            result["stale_claims"] += 1
                     else:
                         retry_at = (datetime.now(UTC) + timedelta(seconds=LIFECYCLE_JOB_RETRY_SECONDS)).isoformat()
-                        retry_lifecycle_job(profile=profile, job_id=job["job_id"], error=error, next_retry_at=retry_at)
-                        _record_metric("lifecycle_job_retry", 1.0, {"source": job["source"], "stage": job["stage"]})
-                        result["retried"] += 1
+                        retried = retry_lifecycle_job(
+                            profile=profile,
+                            job_id=job["job_id"],
+                            expected_claim_token=job["claim_token"],
+                            error=error,
+                            next_retry_at=retry_at,
+                        )
+                        if retried is not False:
+                            _record_metric(
+                                "lifecycle_job_retry",
+                                1.0,
+                                {"source": job["source"], "stage": job["stage"]},
+                            )
+                            result["retried"] += 1
+                        else:
+                            _record_metric(
+                                "lifecycle_job_stale_claim",
+                                1.0,
+                                {"source": job["source"], "stage": job["stage"], "outcome": "retry"},
+                            )
+                            result["stale_claims"] += 1
                 pressure_defer, pressure_mode, pressure_level = _pressure_backpressure_active()
                 if pressure_defer:
                     if _should_override_pressure_for_starvation(source, pressure_starvation_seconds):
@@ -475,6 +649,35 @@ def register_lifecycle_job_runner(source: str, run_job: Callable[[dict[str, Any]
         _LIFECYCLE_JOB_RUNNERS[source] = run_job
 
 
+def lifecycle_job_runner_registered(source: str) -> bool:
+    """Return whether startup registered the exact durable source runner."""
+
+    if source not in VALID_SOURCES:
+        return False
+    with _RUNNER_LOCK:
+        return source in _LIFECYCLE_JOB_RUNNERS
+
+
+def register_lifecycle_maintenance_callback(
+    name: str,
+    callback: Callable[..., dict[str, Any]],
+) -> None:
+    """Register bounded maintenance that runs before each supervisor drain."""
+
+    normalized = name.strip()
+    if not normalized:
+        raise ValueError("lifecycle maintenance callback name is required")
+    with _RUNNER_LOCK:
+        _LIFECYCLE_MAINTENANCE_CALLBACKS[normalized] = callback
+
+
+def lifecycle_maintenance_callback_registered(name: str) -> bool:
+    """Return whether startup registered the named maintenance callback."""
+
+    with _RUNNER_LOCK:
+        return name in _LIFECYCLE_MAINTENANCE_CALLBACKS
+
+
 def run_lifecycle_supervisor_once(
     *,
     reason: str = "lifecycle_supervisor",
@@ -486,6 +689,7 @@ def run_lifecycle_supervisor_once(
     started = time.monotonic()
     result: dict[str, Any] = {
         "reason": reason,
+        "maintenance": {},
         "sources": {},
         "claimed": 0,
         "committed": 0,
@@ -495,6 +699,25 @@ def run_lifecycle_supervisor_once(
     }
     with _RUNNER_LOCK:
         runners = list(_LIFECYCLE_JOB_RUNNERS.items())
+        maintenance_callbacks = list(_LIFECYCLE_MAINTENANCE_CALLBACKS.items())
+    for name, callback in maintenance_callbacks:
+        remaining = max(0.0, float(max_wall_seconds) - (time.monotonic() - started))
+        if remaining <= 0:
+            result["wall_budget_exhausted"] = 1
+            break
+        try:
+            result["maintenance"][name] = callback(max_wall_seconds=remaining)
+            _record_maintenance_result(name, result["maintenance"][name])
+        except Exception as exc:
+            result["maintenance"][name] = {
+                "status": "error",
+                "error_class": type(exc).__name__,
+            }
+            _record_metric(
+                "lifecycle_maintenance_error_total",
+                1.0,
+                {"callback": name, "error_class": type(exc).__name__},
+            )
     pressure_defer, _, _ = _pressure_backpressure_active()
     per_source_limit = 1 if pressure_defer else max(1, int(batch_size or 1))
     if pressure_defer:

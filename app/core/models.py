@@ -24,16 +24,18 @@ import json
 import re
 import uuid
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.core.datetime_utils import _utc_now_iso
+from app.core.request_identity import normalize_optional_request_id
 
 ORIGIN_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
 SURFACE_ID_VALUES = {
     "claude_code",
+    "chatgpt_tunnel",
     "codex_local_api",
     "claude_desktop_mcp",
     "cursor_mcp",
@@ -1184,6 +1186,30 @@ class SessionStartResponse(BaseModel):
 # --- P1.2: conversation_turn + session_learn Models ---
 
 
+class SessionBindingEnvelope(BaseModel):
+    """Strict, capability-bearing authority envelope for managed sessions."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    capability: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+        repr=False,
+    )
+    native_conversation_hash: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    protocol_version: Literal[1] = 1
+    client_interturn_seconds: float | None = Field(
+        default=None,
+        ge=0,
+        le=2592000,
+    )
+
+
 class ConversationTurnRequest(BaseModel):
     """Pre-response context activation + auto-learning request.
 
@@ -1203,6 +1229,12 @@ class ConversationTurnRequest(BaseModel):
     message: str
     request_id: str | None = None
     conversation_context: str = ""
+
+    @field_validator("request_id", mode="before")
+    @classmethod
+    def validate_request_id(cls, value):
+        return normalize_optional_request_id(value)
+
     session_id: str | None = None
     max_concepts: int = Field(default=8, ge=1, le=200)  # TEST-088: floor=1 (0 returns empty silently), ceil=200 (RETRIEVAL-096 combo needs 60)
     include_predictions: bool = False
@@ -1237,6 +1269,7 @@ class ConversationTurnRequest(BaseModel):
     transport_mode: str | None = None  # SESSION-012 binding safety: route header plumbing
     surface_id: str = "unknown"
     workspace_id: str | None = None
+    binding: SessionBindingEnvelope | None = None
     context_delivery_mode: str = "unknown"
     surface_lifecycle_version: str = "1.0"
     workspace_context: WorkspaceContext | None = None
@@ -1455,9 +1488,13 @@ class ConversationTurnResponse(BaseModel):
 
     activated_concepts: list[ActivatedConcept]
     activation_count: int
+    request_id: str | None = None
     bind_status: str | None = None  # SESSION-012: bound / unbound
     binding_source: str | None = None  # SESSION-012: explicit_request / auto_create / in_memory_active / exec_fallback_omitted
     resolved_session_id: str | None = None  # SESSION-012: authoritative session chosen for this turn
+    session_active: bool | None = None  # App-surface proof: true when this response bound an active session
+    session_active_source: str | None = None  # App-surface proof provenance for session_active
+    auth_error: str | None = None  # Explicit null on success so clients do not infer from absence
     predictions: list[dict] = []
     graph_density: float = 0.0  # associations / concepts ratio
     processing_time_ms: float
@@ -1565,6 +1602,8 @@ class SessionLearnRequest(BaseModel):
     assistant_response: str
     request_id: str | None = None
     session_id: str | None = None
+    binding: SessionBindingEnvelope | None = None
+    binding_generation: int | None = Field(default=None, ge=0)
     knowledge_area: str = "conversation"
     auto_associate: bool = True
     extracted_concepts: list[dict] | None = None  # P0.2: client-extracted concepts
@@ -1619,6 +1658,8 @@ class SessionEndRequest(BaseModel):
 
     request_id: str | None = None
     session_id: str | None = None
+    binding: SessionBindingEnvelope | None = None
+    binding_generation: int | None = Field(default=None, ge=0)
     origin_id: str | None = None
     previous_response: str | None = None
     previous_message: str | None = None
@@ -1714,6 +1755,10 @@ class AutoAssociateBatchRequest(BaseModel):
     tier1_threshold: float = Field(default=0.18, ge=0.05, le=0.50)  # ARCH-O07: raised from 0.12
     tier2_threshold: float = Field(default=0.06, ge=0.03, le=0.30)
     max_edges_per_concept: int = Field(default=8, ge=1, le=20)
+    max_pairs_evaluated: int = Field(default=5000, ge=1, le=100000)
+    selection_mode: Literal["global_pairs", "unlinked"] = "global_pairs"
+    max_concepts_evaluated: int = Field(default=100, ge=1, le=500)
+    max_candidates_per_concept: int = Field(default=20, ge=5, le=100)
     tier2_enabled: bool = Field(default=True)
     dry_run: bool = Field(default=False)
 
@@ -1729,6 +1774,8 @@ class AutoAssociateBatchResponse(BaseModel):
 
     index_synced: int
     pairs_evaluated: int
+    pairs_available: int
+    pair_budget_exhausted: bool = False
     tier1_edges_created: int
     tier2_edges_created: int
     edges_skipped_existing: int
@@ -1737,6 +1784,16 @@ class AutoAssociateBatchResponse(BaseModel):
     orphans_after: int
     processing_time_ms: float
     dry_run: bool
+    selection_mode: Literal["global_pairs", "unlinked"] = "global_pairs"
+    concepts_available: int = 0
+    concepts_evaluated: int = 0
+    concepts_matched: int = 0
+    concepts_no_match: int = 0
+    concepts_deferred: int = 0
+    concepts_unavailable: int = 0
+    concept_budget_exhausted: bool = False
+    cursor_start: str | None = None
+    cursor_end: str | None = None
 
 
 class AutoAssociateMatch(BaseModel):

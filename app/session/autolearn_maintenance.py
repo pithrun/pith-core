@@ -505,27 +505,49 @@ def _process_subject_key_row(conn, row: dict[str, Any]) -> None:
         _mark_done(conn, int(row["id"]), "skipped", "missing subject_key")
         return
 
+    from app.retrieval import evict_lifecycle_concept
     from app.storage import apply_lifecycle_transition_conn
 
-    candidates = conn.execute(
+    candidate = conn.execute(
         """SELECT id FROM concepts
            WHERE subject_key = ?
              AND superseded_by IS NULL
              AND id != ?
              AND is_current = 1
-             AND status = 'active'""",
+             AND status = 'active'
+           LIMIT 1""",
         (subject_key, row["concept_id"]),
-    ).fetchall()
-    for candidate in candidates:
+    ).fetchone()
+    if candidate:
         old_id = candidate["id"] if hasattr(candidate, "keys") else candidate[0]
-        apply_lifecycle_transition_conn(
+        changed = apply_lifecycle_transition_conn(
             conn,
             old_id,
             "supersede",
             superseded_by=row["concept_id"],
             reason="RETRIEVAL-072: subject-key dedup",
         )
-        break
+        if changed:
+            conn.commit()
+
+    recovery_rows = conn.execute(
+        """SELECT id FROM concepts
+           WHERE subject_key = ?
+             AND superseded_by = ?
+             AND id != ?
+             AND is_current = 0
+             AND status = 'superseded'
+           ORDER BY id""",
+        (subject_key, row["concept_id"], row["concept_id"]),
+    ).fetchall()
+    for recovery_row in recovery_rows:
+        old_id = recovery_row["id"] if hasattr(recovery_row, "keys") else recovery_row[0]
+        if not evict_lifecycle_concept(
+            old_id,
+            persist=True,
+            source="subject_key_deferred",
+        ):
+            raise RuntimeError(f"failed to persist subject-key eviction for {old_id}")
     _mark_done(conn, int(row["id"]), "done")
 
 

@@ -5,7 +5,9 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-TRACE_SCHEMA_VERSION = "turn_latency_trace.v1"
+from app.core.request_identity import is_request_id_hash, normalize_optional_request_id
+
+TRACE_SCHEMA_VERSION = "turn_latency_trace.v2"
 MAX_PHASE_KEYS = 16
 MAX_SUBPHASE_KEYS = 24
 MAX_COUNT_KEYS = 24
@@ -74,6 +76,13 @@ def _clean_string(value: Any) -> str:
     return text[: MAX_STRING_CHARS - 3] + "..."
 
 
+def _trace_request_id(value: Any) -> str | None:
+    try:
+        return normalize_optional_request_id(value)
+    except ValueError:
+        return None
+
+
 def _bounded_numeric_map(
     values: Mapping[str, Any],
     *,
@@ -128,6 +137,9 @@ def _bounded_pressure_state(pressure_state: Mapping[str, Any] | None) -> dict[st
 def build_turn_latency_trace(
     *,
     request_id: str | None,
+    request_id_hash: str | None,
+    surface_id: str,
+    context_delivery_mode: str,
     elapsed_ms: float,
     deadline: Any | None,
     phases_ms: Mapping[str, Any],
@@ -164,7 +176,10 @@ def build_turn_latency_trace(
     rounded_elapsed = _round_ms(elapsed_ms) or 0.0
     return {
         "schema_version": TRACE_SCHEMA_VERSION,
-        "request_id": _clean_string(request_id) if request_id else None,
+        "request_id": _trace_request_id(request_id),
+        "request_id_hash": request_id_hash if is_request_id_hash(request_id_hash) else None,
+        "surface_id": _clean_string(surface_id),
+        "context_delivery_mode": _clean_string(context_delivery_mode),
         "elapsed_ms": rounded_elapsed,
         "budget_ms": budget_ms,
         "remaining_ms": remaining_ms,

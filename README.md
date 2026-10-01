@@ -3,7 +3,7 @@
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB.svg)](https://python.org)
-![Platform: macOS developer preview](https://img.shields.io/badge/Platform-macOS%20developer%20preview-lightgrey.svg)
+![Platform: macOS + Windows developer preview](https://img.shields.io/badge/Platform-macOS%20%2B%20Windows%20developer%20preview-lightgrey.svg)
 
 > Governed memory for AI agents that works across models: persistent project context, contradiction detection, durable learning, and checkpoints across sessions.
 
@@ -49,11 +49,11 @@ For methodology, score terms, caveats, and evidence files, see the [Pith benchma
 
 ### Prerequisites
 
-- **macOS developer preview** — Pith's current public preview is macOS-first.
-- **Python 3.10+** — on macOS arm64, the installer can provision a Pith-managed Python 3.12 runtime inside `~/.pith` if no compatible Python is present. It does not replace or modify system Python.
+- **macOS developer preview and Windows developer preview** — macOS uses the shell installer; Windows x64 uses the PowerShell installer.
+- **Python 3.10+** — the installers can provision a Pith-managed Python 3.12 runtime inside the Pith install directory when no compatible Python is present. They do not replace or modify system Python.
 - **A supported AI app** — verified launch workflows are Claude Cowork, Claude Desktop, Claude Code, Cursor, VS Code, and Codex.
 
-### macOS Developer Preview Client Matrix
+### Developer Preview Client Matrix
 
 The fully automated Pith lifecycle clients today are **Claude Cowork** and **Codex**. Other clients may have verified setup, MCP tool access, or hook capture, but they still require manual instruction setup, model tool choice, or proof checks before you should treat them as full lifecycle surfaces.
 
@@ -62,15 +62,17 @@ The fully automated Pith lifecycle clients today are **Claude Cowork** and **Cod
 | Claude Cowork | Fully automated Pith lifecycle after Cowork system prompt setup | Pith-managed Cowork sessions run the full lifecycle automatically once the Cowork system prompt/instructions are installed: pre-response context, response learning, checkpointing, and session closeout. No separate local MCP config is required inside Cowork. |
 | Codex app | Fully automated Pith lifecycle after `~/.codex/AGENTS.md` setup | Codex uses the local HTTP/API lifecycle path: `conversation_turn` before substantive responses, then `checkpoint` or `session_end` at the right lifecycle boundary. MCP remains optional for richer tools when healthy; `api-fallback` is only a legacy/recovery alias. |
 | Terminal CLI | Verified local operations | `pith status`, `pith health`, `pith start`, `pith logs`, `pith doctor`, `pith clients`, `pith support bundle`, `pith import`, and backups run locally. |
-| launchd service | Verified macOS auto-start | macOS auto-start is installed by the native installer. |
+| Background service | Verified auto-start | macOS uses launchd; Windows uses a current-user Task Scheduler entry. |
 | Claude Desktop | Verified config + manual instructions step; not fully automated by default | MCP config is written automatically; if you did not complete the instructions step during install, run `pith protocol` and paste into Claude Desktop `Settings > General > Instructions for Claude`. Tools are available after restart, but Claude decides whether to call them for a given turn; full lifecycle proof requires an observed `pith_conversation_turn` call or an explicit user request for Claude to use Pith. |
 | Claude Code | Hook capture + model-visible proof required; not listed as fully automated | Hooks register/capture Claude Code turns and ask the model to call `pith_conversation_turn`. Full model-visible lifecycle proof requires observing the Claude Code MCP tool call, not just hook installation. |
-| VS Code | Configurable MCP + Copilot instruction file; beta behavior not yet equivalent to Claude Cowork/Codex | User config lives at `~/Library/Application Support/Code/User/mcp.json`; project config lives at `~/.pith/pith-server/.vscode/mcp.json`; Copilot instruction lives at `~/.copilot/instructions/pith-cognitive-loop.instructions.md`. Agent Chat must be in Agent mode with Pith tools enabled, and the model may not call Pith automatically on every turn. |
-| Cursor | MCP config template + Global/User Rule step | The installer writes `~/.cursor/mcp.json`, saves a Cursor rule snippet at `~/.pith/CURSOR_GLOBAL_RULE.txt`, and copies it to the clipboard on macOS. Cursor can see the Pith server, but current user testing shows Cursor does not automatically call Pith every turn from MCP config alone. Paste the snippet into Cursor Settings > Rules as a Global/User Rule, or use project `AGENTS.md`, until the installer has a verified automatic Cursor instruction flow. |
+| VS Code | Configurable MCP + Copilot instruction file; beta behavior not yet equivalent to Claude Cowork/Codex | User config lives at `~/Library/Application Support/Code/User/mcp.json` on macOS and `%APPDATA%\Code\User\mcp.json` on Windows. Agent Chat must be in Agent mode with Pith tools enabled, and the model may not call Pith automatically on every turn. |
+| Cursor | MCP config template + Global/User Rule step | The installer writes the platform-specific Cursor MCP config, saves a Cursor rule snippet at `~/.pith/CURSOR_GLOBAL_RULE.txt` on macOS or under `%USERPROFILE%\.pith` on Windows, and copies it to the clipboard on macOS. Cursor can see the Pith server, but current user testing shows Cursor does not automatically call Pith every turn from MCP config alone. Paste the snippet into Cursor Settings > Rules as a Global/User Rule, or use project `AGENTS.md`, until the installer has a verified automatic Cursor instruction flow. |
 
 ### Install (5 minutes)
 
-Pith currently ships a macOS developer preview.
+Pith currently ships macOS and Windows developer previews.
+
+**macOS**
 
 ```bash
 curl -fsSL https://pith.run/install | bash
@@ -82,9 +84,16 @@ Older macOS machines may only have Apple's Python 3.9. In a normal interactive i
 curl -fsSL https://pith.run/install | PITH_AUTO_PYTHON=1 bash
 ```
 
-Windows support is not part of the current public preview.
+**Windows PowerShell**
 
-The installer handles everything: Python venv, dependencies, semantic embeddings, API key generation, AI app surface selection, MCP client configuration, auto-start setup, scheduled backups, and health verification. On macOS, auto-start uses launchd.
+```powershell
+Invoke-WebRequest https://github.com/pithrun/pith-core/releases/latest/download/install.ps1 -UseBasicParsing -OutFile install.ps1
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+The Windows preview uses a checksum-verified ZIP, a Pith-managed Python runtime when needed, an external short-path virtual environment, and Task Scheduler for auto-start and backups. The release workflow exercises install, embeddings, client-hook setup, repeated start, restart, uninstall, cleanup, and post-uninstall refusal on a hosted Windows runner.
+
+The installers handle the Python environment, dependencies, semantic embeddings, API key generation, AI app surface selection, MCP client configuration, auto-start setup, scheduled backups, and health verification. macOS uses launchd; Windows uses Task Scheduler.
 
 ### After Install
 
@@ -92,16 +101,16 @@ The installer handles everything: Python venv, dependencies, semantic embeddings
 
 1. Open a new terminal window so your shell picks up the `pith` command.
 2. Claude Desktop users: if you pasted Pith's instructions during install, this is already done. If you skipped it or need to redo it, run `pith protocol`, then paste the copied prompt into Claude Desktop `Settings > General > Instructions for Claude`. The same prompt is saved at `~/.pith/SYSTEM_PROMPT.md`.
-3. Restart each configured AI client completely before testing it. For Claude Desktop, use Cmd+Q / Ctrl+Q, then reopen.
+3. Restart each configured AI client completely before testing it. For Claude Desktop, quit the app completely, then reopen it.
 
 **Verification checks**
 
 1. **Core install:** run `pith status` and confirm it reports `Health: OK (Pith)`.
 2. **Claude Cowork:** confirm the Cowork system prompt/instructions are installed and active. After that, Pith-managed Cowork sessions have full lifecycle automation built in; use local diagnostics only when you need evidence reporting.
-3. **Claude Desktop / Claude Chat:** open a fresh conversation and ask a normal project-context question. Verify a real `pith_conversation_turn` call in `~/Library/Logs/Claude/mcp-server-pith.log`; MCP startup alone only proves tool availability. If Claude does not choose the tool, explicitly ask Claude to use Pith for the request and verify the observed call.
+3. **Claude Desktop / Claude Chat:** open a fresh conversation and ask a normal project-context question. Verify a real `pith_conversation_turn` call in the client diagnostics; on macOS the bridge log is `~/Library/Logs/Claude/mcp-server-pith.log`. MCP startup alone only proves tool availability. If Claude does not choose the tool, explicitly ask Claude to use Pith for the request and verify the observed call.
 4. **Claude Code:** run `claude mcp get pith`, then start a fresh Claude Code session. Hooks should register the turn, but full proof requires an observed model-visible `pith_conversation_turn` tool call.
 5. **Codex:** confirm `~/.codex/AGENTS.md` exists and references `pith api conversation_turn`. If Codex was installed after Pith, rerun the installer or client configuration.
-6. **VS Code:** restart VS Code, run **MCP: List Servers**, and confirm `pith` appears from `~/Library/Application Support/Code/User/mcp.json`. Open Chat Diagnostics and confirm `~/.copilot/instructions/pith-cognitive-loop.instructions.md` is loaded for Agent Chat. If Agent Chat says Pith is not connected but can find the active server/config, treat that as a VS Code tool-selection/instruction-loading issue, not a failed Pith service.
+6. **VS Code:** restart VS Code, run **MCP: List Servers**, and confirm `pith` appears from the platform-specific user MCP config. Open Chat Diagnostics and confirm the Pith cognitive-loop instruction is loaded for Agent Chat. If Agent Chat says Pith is not connected but can find the active server/config, treat that as a VS Code tool-selection/instruction-loading issue, not a failed Pith service.
 
 ### Verify
 
@@ -109,6 +118,7 @@ The installer handles everything: Python venv, dependencies, semantic embeddings
 pith status    # Should show "running" + health OK
 pith stats     # Shows concept count, knowledge areas, DB size
 scripts/macos-surface-smoke.sh  # macOS surface inventory and smoke report
+# Windows: pith status and pith clients status --json
 ```
 
 ## How It Works
@@ -185,7 +195,7 @@ pith restore                   # Restore from most recent backup
 pith restore ~/my_backup.db    # Restore from specific file
 ```
 
-Manual backups are saved to `~/pith-data/{profile}/backups/` with timestamps. The macOS installer also sets up automated daily backups at 2:00 AM via launchd.
+Manual backups are saved under the active profile's `backups` directory with timestamps. The installers also configure scheduled backups through launchd on macOS and Task Scheduler on Windows.
 
 > **Important:** Never copy `pith.db` directly while the server is running — use `pith backup` or let the automatic backup handle it.
 

@@ -455,7 +455,17 @@ class CompactionMixin:
         recovery_quality = 0.0  # CTX-005: quality score for observability
 
         try:
-            snapshot = load_resume_snapshot()
+            from app.session.binding import current_managed_episode_context
+
+            managed_context = current_managed_episode_context()
+            if managed_context is not None:
+                if managed_context.prior_session_id is None:
+                    return None, None, None, recovery_quality
+                snapshot = load_resume_snapshot(
+                    prior_session_id=managed_context.prior_session_id,
+                )
+            else:
+                snapshot = load_resume_snapshot()
             if snapshot:
                 # Build re-injection from snapshot (same format as Resume Context)
                 active_task = snapshot.get("active_task", "")

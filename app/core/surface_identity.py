@@ -6,6 +6,7 @@ from app.core.models import CONTROL_CHARS_RE, SURFACE_ID_VALUES
 
 
 SURFACE_TO_PLATFORM_HINT = {
+    "chatgpt_tunnel": "chatgpt",
     "codex_local_api": "codex",
     "claude_code": "claude_code",
     "claude_desktop_mcp": "claude_desktop",

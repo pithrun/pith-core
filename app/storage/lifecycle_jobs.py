@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 VALID_SOURCES = {"conversation_turn", "session_learn", "session_end", "maintenance", "reflection_full"}
-VALID_STAGES = {"learn", "reflect"}
+VALID_STAGES = {"learn", "reflect", "close"}
 VALID_STATUSES = {"queued", "running", "committed", "retry", "failed", "skipped"}
 
 
@@ -119,8 +122,42 @@ def enqueue_lifecycle_job(
     payload: dict[str, Any],
     priority: int = 50,
     now: str | None = None,
+    session_id: str | None = None,
+    binding_hash: str | None = None,
+    binding_generation: int | None = None,
 ) -> dict[str, Any]:
     """Insert a queued lifecycle job, returning the existing row on duplicate."""
+    with _db(operation="lifecycle_enqueue") as conn:
+        return enqueue_lifecycle_job_conn(
+            conn,
+            profile=profile,
+            source=source,
+            idempotency_key=idempotency_key,
+            stage=stage,
+            payload=payload,
+            priority=priority,
+            now=now,
+            session_id=session_id,
+            binding_hash=binding_hash,
+            binding_generation=binding_generation,
+        )
+
+
+def enqueue_lifecycle_job_conn(
+    conn,
+    *,
+    profile: str,
+    source: str,
+    idempotency_key: str,
+    stage: str,
+    payload: dict[str, Any],
+    priority: int = 50,
+    now: str | None = None,
+    session_id: str | None = None,
+    binding_hash: str | None = None,
+    binding_generation: int | None = None,
+) -> dict[str, Any]:
+    """Connection-aware enqueue for atomic episode transitions plus intent."""
     if source not in VALID_SOURCES:
         raise ValueError(f"invalid lifecycle job source: {source}")
     if stage not in VALID_STAGES:
@@ -129,17 +166,24 @@ def enqueue_lifecycle_job(
         raise ValueError("profile is required")
     if not idempotency_key:
         raise ValueError("idempotency_key is required")
+    managed_values = (session_id, binding_hash, binding_generation)
+    if any(value is not None for value in managed_values) and not all(value is not None for value in managed_values):
+        raise ValueError("managed lifecycle jobs require session_id, binding_hash, and binding_generation")
+    if binding_generation is not None and int(binding_generation) < 0:
+        raise ValueError("binding_generation must be non-negative")
 
     ts = now or _utc_now_iso()
     job_id = f"lj_{uuid.uuid4().hex[:16]}"
     payload_json = json.dumps(payload, sort_keys=True)
-    with _db(operation="lifecycle_enqueue") as conn:
+    with _managed_queue_permit(binding_hash):
         conn.execute(
             """INSERT OR IGNORE INTO lifecycle_jobs
                (job_id, profile, source, idempotency_key, priority, stage, status,
                 payload_json, result_json, attempts, last_error, lease_owner,
-                lease_expires_at, next_retry_at, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, NULL, 0, NULL, NULL, NULL, NULL, ?, ?)""",
+                lease_expires_at, next_retry_at, session_id, binding_hash,
+                binding_generation, claim_token, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, NULL, 0, NULL, NULL, NULL, NULL,
+                       ?, ?, ?, NULL, ?, ?)""",
             (
                 job_id,
                 profile,
@@ -148,6 +192,9 @@ def enqueue_lifecycle_job(
                 int(priority),
                 stage,
                 payload_json,
+                session_id,
+                binding_hash,
+                binding_generation,
                 ts,
                 ts,
             ),
@@ -161,6 +208,31 @@ def enqueue_lifecycle_job(
         "stage": stage,
         "status": "queued",
     }
+
+
+@contextmanager
+def _managed_queue_permit(binding_hash: str | None, claim_token: str | None = None) -> Iterator[None]:
+    if binding_hash is None:
+        yield
+        return
+    from app.storage.session_bindings import ManagedQueuePermit, managed_queue_write_permit
+
+    with managed_queue_write_permit(
+        ManagedQueuePermit(
+            table_name="lifecycle_jobs",
+            binding_hash=binding_hash,
+            claim_token=claim_token,
+        )
+    ):
+        yield
+
+
+def _job_binding_hash(conn, *, profile: str, job_id: str) -> str | None:
+    row = conn.execute(
+        "SELECT binding_hash FROM lifecycle_jobs WHERE profile=? AND job_id=?",
+        (profile, job_id),
+    ).fetchone()
+    return str(row[0]) if row is not None and row[0] is not None else None
 
 
 def claim_lifecycle_jobs(
@@ -198,33 +270,59 @@ def claim_lifecycle_jobs(
         ).fetchall()
         for row in rows:
             data = _row_to_dict(row)
-            cur = conn.execute(
-                """UPDATE lifecycle_jobs
-                   SET status='running',
-                       attempts=attempts+1,
-                       lease_owner=?,
-                       lease_expires_at=?,
-                       last_error=NULL,
-                       updated_at=?
-                   WHERE profile=? AND job_id=? AND status IN ('queued','retry','running')
-                     AND (? IS NULL OR source=?)
-                     AND attempts < ?""",
-                (
-                    lease_owner,
-                    lease_expires_at,
-                    ts,
-                    profile,
-                    data["job_id"],
-                    source,
-                    source,
-                    max_attempts,
-                ),
-            )
+            recovery_guard = None
+            if data.get("binding_hash") is not None and data.get("status") == "running":
+                from app.storage.session_bindings import (
+                    ManagedEpisodeEffectFileGuard,
+                    ManagedFileGuardBusyError,
+                )
+
+                try:
+                    recovery_guard = ManagedEpisodeEffectFileGuard(
+                        str(data["binding_hash"]),
+                        profile=profile,
+                    ).acquire()
+                except ManagedFileGuardBusyError:
+                    # Lease expiry makes a job schedulable, but it must not
+                    # transfer effect authority while the prior worker still
+                    # holds the binding-scoped effect guard.
+                    continue
+            claim_token = secrets.token_hex(32)
+            try:
+                with _managed_queue_permit(data.get("binding_hash"), claim_token):
+                    cur = conn.execute(
+                        """UPDATE lifecycle_jobs
+                           SET status='running',
+                               attempts=attempts+1,
+                               lease_owner=?,
+                               lease_expires_at=?,
+                               claim_token=?,
+                               last_error=NULL,
+                               updated_at=?
+                           WHERE profile=? AND job_id=? AND status IN ('queued','retry','running')
+                             AND (? IS NULL OR source=?)
+                             AND attempts < ?""",
+                        (
+                            lease_owner,
+                            lease_expires_at,
+                            claim_token,
+                            ts,
+                            profile,
+                            data["job_id"],
+                            source,
+                            source,
+                            max_attempts,
+                        ),
+                    )
+            finally:
+                if recovery_guard is not None:
+                    recovery_guard.release()
             if cur.rowcount:
                 data["status"] = "running"
                 data["attempts"] = int(data.get("attempts") or 0) + 1
                 data["lease_owner"] = lease_owner
                 data["lease_expires_at"] = lease_expires_at
+                data["claim_token"] = claim_token
                 try:
                     data["payload"] = json.loads(data.get("payload_json") or "{}")
                 except Exception:
@@ -237,9 +335,10 @@ def commit_lifecycle_job(
     *,
     profile: str,
     job_id: str,
+    expected_claim_token: str,
     result: dict[str, Any] | None = None,
     now: str | None = None,
-) -> None:
+) -> bool:
     ts = now or _utc_now_iso()
     result_json = json.dumps(result or {}, sort_keys=True)
     retain_payload = os.environ.get("PITH_LIFECYCLE_JOBS_RETAIN_PAYLOADS", "false").lower() in {
@@ -249,88 +348,111 @@ def commit_lifecycle_job(
     }
     payload_expr = "payload_json" if retain_payload else "'{}'"
     with _db(operation="lifecycle_commit") as conn:
-        conn.execute(
-            f"""UPDATE lifecycle_jobs
-                SET status='committed',
-                    result_json=?,
-                    payload_json={payload_expr},
-                    last_error=NULL,
-                    lease_owner=NULL,
-                    lease_expires_at=NULL,
-                    next_retry_at=NULL,
-                    updated_at=?
-                WHERE profile=? AND job_id=?""",
-            (result_json, ts, profile, job_id),
-        )
+        binding_hash = _job_binding_hash(conn, profile=profile, job_id=job_id)
+        with _managed_queue_permit(binding_hash, expected_claim_token):
+            cur = conn.execute(
+                f"""UPDATE lifecycle_jobs
+                    SET status='committed',
+                        result_json=?,
+                        payload_json={payload_expr},
+                        last_error=NULL,
+                        lease_owner=NULL,
+                        lease_expires_at=NULL,
+                        next_retry_at=NULL,
+                        claim_token=NULL,
+                        deferred_attempts=0,
+                        first_deferred_at=NULL,
+                        updated_at=?
+                    WHERE profile=? AND job_id=? AND status='running' AND claim_token=?""",
+                (result_json, ts, profile, job_id, expected_claim_token),
+            )
+        return cur.rowcount == 1
 
 
 def retry_lifecycle_job(
     *,
     profile: str,
     job_id: str,
+    expected_claim_token: str,
     error: str,
     next_retry_at: str,
     now: str | None = None,
-) -> None:
+) -> bool:
     ts = now or _utc_now_iso()
     with _db(operation="lifecycle_retry") as conn:
-        conn.execute(
-            """UPDATE lifecycle_jobs
-               SET status='retry',
-                   last_error=?,
-                   lease_owner=NULL,
-                   lease_expires_at=NULL,
-                   next_retry_at=?,
-                   updated_at=?
-               WHERE profile=? AND job_id=?""",
-            (error[:1000], next_retry_at, ts, profile, job_id),
-        )
+        binding_hash = _job_binding_hash(conn, profile=profile, job_id=job_id)
+        with _managed_queue_permit(binding_hash, expected_claim_token):
+            cur = conn.execute(
+                """UPDATE lifecycle_jobs
+                   SET status='retry',
+                       last_error=?,
+                       lease_owner=NULL,
+                       lease_expires_at=NULL,
+                       next_retry_at=?,
+                       claim_token=NULL,
+                       updated_at=?
+                   WHERE profile=? AND job_id=? AND status='running' AND claim_token=?""",
+                (error[:1000], next_retry_at, ts, profile, job_id, expected_claim_token),
+            )
+        return cur.rowcount == 1
 
 
 def defer_lifecycle_job(
     *,
     profile: str,
     job_id: str,
+    expected_claim_token: str,
     error: str,
     next_retry_at: str,
     now: str | None = None,
-) -> None:
+) -> bool:
     """Return a claimed job to retry without spending the claim attempt."""
     ts = now or _utc_now_iso()
     with _db(operation="lifecycle_defer") as conn:
-        conn.execute(
-            """UPDATE lifecycle_jobs
-               SET status='retry',
-                   attempts=CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END,
-                   last_error=?,
-                   lease_owner=NULL,
-                   lease_expires_at=NULL,
-                   next_retry_at=?,
-                   updated_at=?
-               WHERE profile=? AND job_id=?""",
-            (error[:1000], next_retry_at, ts, profile, job_id),
-        )
+        binding_hash = _job_binding_hash(conn, profile=profile, job_id=job_id)
+        with _managed_queue_permit(binding_hash, expected_claim_token):
+            cur = conn.execute(
+                """UPDATE lifecycle_jobs
+                   SET status='retry',
+                       attempts=CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END,
+                       deferred_attempts=deferred_attempts + 1,
+                       first_deferred_at=COALESCE(first_deferred_at, ?),
+                       last_error=?,
+                       lease_owner=NULL,
+                       lease_expires_at=NULL,
+                       next_retry_at=?,
+                       claim_token=NULL,
+                       updated_at=?
+                   WHERE profile=? AND job_id=? AND status='running' AND claim_token=?""",
+                (ts, error[:1000], next_retry_at, ts, profile, job_id, expected_claim_token),
+            )
+        return cur.rowcount == 1
 
 
 def fail_lifecycle_job(
     *,
     profile: str,
     job_id: str,
+    expected_claim_token: str,
     error: str,
     now: str | None = None,
-) -> None:
+) -> bool:
     ts = now or _utc_now_iso()
     with _db(operation="lifecycle_fail") as conn:
-        conn.execute(
-            """UPDATE lifecycle_jobs
-               SET status='failed',
-                   last_error=?,
-                   lease_owner=NULL,
-                   lease_expires_at=NULL,
-                   updated_at=?
-               WHERE profile=? AND job_id=?""",
-            (error[:1000], ts, profile, job_id),
-        )
+        binding_hash = _job_binding_hash(conn, profile=profile, job_id=job_id)
+        with _managed_queue_permit(binding_hash, expected_claim_token):
+            cur = conn.execute(
+                """UPDATE lifecycle_jobs
+                   SET status='failed',
+                       last_error=?,
+                       lease_owner=NULL,
+                       lease_expires_at=NULL,
+                       claim_token=NULL,
+                       updated_at=?
+                   WHERE profile=? AND job_id=? AND status='running' AND claim_token=?""",
+                (error[:1000], ts, profile, job_id, expected_claim_token),
+            )
+        return cur.rowcount == 1
 
 
 def terminalize_exhausted_stale_lifecycle_jobs(
@@ -354,10 +476,12 @@ def terminalize_exhausted_stale_lifecycle_jobs(
                    lease_owner=NULL,
                    lease_expires_at=NULL,
                    next_retry_at=NULL,
+                   claim_token=NULL,
                    updated_at=?
                WHERE profile=?
                  AND (? IS NULL OR source=?)
                  AND status='running'
+                 AND binding_hash IS NULL
                  AND attempts >= ?
                  AND (
                     (lease_expires_at IS NOT NULL AND lease_expires_at <= ?)
@@ -372,6 +496,54 @@ def terminalize_exhausted_stale_lifecycle_jobs(
                 max(0, int(max_attempts or 0)),
                 ts,
                 stale_before_iso,
+            ),
+        )
+        return int(cur.rowcount or 0)
+
+
+def terminalize_exhausted_deferred_lifecycle_jobs(
+    *,
+    profile: str,
+    max_deferrals: int,
+    first_deferred_before_iso: str,
+    error: str,
+    now: str | None = None,
+    source: str | None = None,
+) -> int:
+    """Fail queued/retry jobs that exhausted their deferred-admission budget."""
+    if source is not None and source not in VALID_SOURCES:
+        raise ValueError(f"invalid lifecycle job source: {source}")
+    ts = now or _utc_now_iso()
+    effective_max_deferrals = max(1, int(max_deferrals or 0))
+    with _db(operation="lifecycle_terminalize_exhausted_deferred") as conn:
+        cur = conn.execute(
+            """UPDATE lifecycle_jobs
+               SET status='failed',
+                   last_error=?,
+                   lease_owner=NULL,
+                   lease_expires_at=NULL,
+                   next_retry_at=NULL,
+                   claim_token=NULL,
+                   updated_at=?
+               WHERE profile=?
+                 AND (? IS NULL OR source=?)
+                 AND status IN ('queued','retry')
+                 AND binding_hash IS NULL
+                 AND (
+                    deferred_attempts >= ?
+                    OR (
+                        first_deferred_at IS NOT NULL
+                        AND first_deferred_at <= ?
+                    )
+                 )""",
+            (
+                error[:1000],
+                ts,
+                profile,
+                source,
+                source,
+                effective_max_deferrals,
+                first_deferred_before_iso,
             ),
         )
         return int(cur.rowcount or 0)
@@ -397,6 +569,7 @@ def count_failed_lifecycle_jobs_by_error(
                  AND source=?
                  AND stage=?
                  AND status='failed'
+                 AND binding_hash IS NULL
                  AND last_error=?""",
             (profile, source, stage, error[:1000]),
         ).fetchone()
@@ -423,14 +596,18 @@ def requeue_failed_lifecycle_jobs_by_error(
             """UPDATE lifecycle_jobs
                SET status='retry',
                    attempts=0,
+                   deferred_attempts=0,
+                   first_deferred_at=NULL,
                    lease_owner=NULL,
                    lease_expires_at=NULL,
                    next_retry_at=?,
+                   claim_token=NULL,
                    updated_at=?
                WHERE profile=?
                  AND source=?
                  AND stage=?
                  AND status='failed'
+                 AND binding_hash IS NULL
                  AND last_error=?""",
             (next_retry_at, ts, profile, source, stage, error[:1000]),
         )
@@ -447,6 +624,8 @@ def _lifecycle_summary_row_to_dict(row: Any) -> dict[str, Any]:
         "committed_count": int(data.get("committed_count") or 0),
         "skipped_count": int(data.get("skipped_count") or 0),
         "stale_running_count": int(data.get("stale_running_count") or 0),
+        "max_deferred_attempts": int(data.get("max_deferred_attempts") or 0),
+        "oldest_deferred_at": data.get("oldest_deferred_at"),
         "oldest_queued_updated_at": data.get("oldest_queued_updated_at"),
         "oldest_running_updated_at": data.get("oldest_running_updated_at"),
         "last_committed_updated_at": data.get("last_committed_updated_at"),
@@ -475,6 +654,14 @@ def summarize_lifecycle_jobs(*, profile: str, stale_before_iso: str) -> dict[str
                            ELSE 0
                        END
                    ) AS stale_running_count,
+                   MAX(CASE WHEN status IN ('queued', 'retry') THEN deferred_attempts ELSE 0 END)
+                       AS max_deferred_attempts,
+                   MIN(
+                       CASE
+                           WHEN status IN ('queued', 'retry') AND first_deferred_at IS NOT NULL
+                           THEN first_deferred_at
+                       END
+                   ) AS oldest_deferred_at,
                    MIN(CASE WHEN status IN ('queued', 'retry') THEN updated_at END) AS oldest_queued_updated_at,
                    MIN(CASE WHEN status='running' THEN updated_at END) AS oldest_running_updated_at,
                    MAX(CASE WHEN status='committed' THEN updated_at END) AS last_committed_updated_at
@@ -514,6 +701,14 @@ def summarize_lifecycle_jobs_by_source(
                            ELSE 0
                        END
                    ) AS stale_running_count,
+                   MAX(CASE WHEN status IN ('queued', 'retry') THEN deferred_attempts ELSE 0 END)
+                       AS max_deferred_attempts,
+                   MIN(
+                       CASE
+                           WHEN status IN ('queued', 'retry') AND first_deferred_at IS NOT NULL
+                           THEN first_deferred_at
+                       END
+                   ) AS oldest_deferred_at,
                    MIN(CASE WHEN status IN ('queued', 'retry') THEN updated_at END) AS oldest_queued_updated_at,
                    MIN(CASE WHEN status='running' THEN updated_at END) AS oldest_running_updated_at,
                    MAX(CASE WHEN status='committed' THEN updated_at END) AS last_committed_updated_at
@@ -530,7 +725,10 @@ def cleanup_committed_lifecycle_jobs(*, profile: str, retention_days: int, now: 
     with _db(operation="lifecycle_cleanup") as conn:
         cur = conn.execute(
             """DELETE FROM lifecycle_jobs
-               WHERE profile=? AND status='committed' AND updated_at < ?""",
+               WHERE profile=?
+                 AND status='committed'
+                 AND binding_hash IS NULL
+                 AND updated_at < ?""",
             (profile, cutoff),
         )
         return int(cur.rowcount or 0)

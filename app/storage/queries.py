@@ -403,6 +403,68 @@ def set_metadata(key: str, value: str) -> None:
             (key, value, _utc_now_iso()),
         )
 
+
+def load_unlinked_concept_window(
+    limit: int,
+    cursor_created_at: str | None = None,
+    cursor_id: str | None = None,
+) -> dict:
+    """Return a bounded, cursor-ordered window of active/current unlinked concepts."""
+    safe_limit = max(1, min(int(limit), 500))
+    unlinked_predicate = """
+        c.status = 'active'
+        AND c.is_current = 1
+        AND NOT EXISTS (
+            SELECT 1 FROM associations a WHERE a.source = c.id
+        )
+        AND NOT EXISTS (
+            SELECT 1 FROM associations a WHERE a.target = c.id
+        )
+    """
+
+    with read_snapshot_db("load_unlinked_concept_window") as conn:
+        available_row = conn.execute(
+            f"SELECT COUNT(*) AS count FROM concepts c WHERE {unlinked_predicate}"
+        ).fetchone()
+        available = int(available_row["count"]) if available_row else 0
+
+        if cursor_created_at and cursor_id:
+            rows = conn.execute(
+                f"""
+                SELECT c.id, c.created_at
+                FROM concepts c
+                WHERE {unlinked_predicate}
+                ORDER BY CASE
+                    WHEN c.created_at > ? OR (c.created_at = ? AND c.id > ?) THEN 0
+                    ELSE 1
+                END,
+                c.created_at,
+                c.id
+                LIMIT ?
+                """,
+                (cursor_created_at, cursor_created_at, cursor_id, safe_limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                f"""
+                SELECT c.id, c.created_at
+                FROM concepts c
+                WHERE {unlinked_predicate}
+                ORDER BY c.created_at, c.id
+                LIMIT ?
+                """,
+                (safe_limit,),
+            ).fetchall()
+
+    return {
+        "available": available,
+        "rows": [
+            {"concept_id": row["id"], "created_at": row["created_at"]}
+            for row in rows
+        ],
+    }
+
+
 def get_high_authority_concepts_by_ka(knowledge_area: str, limit: int = 3) -> list[dict]:
     """Get highest-authority active concepts for a knowledge area.
 

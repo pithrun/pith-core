@@ -55,19 +55,11 @@ def _get_deadlock_diag_logger() -> logging.Logger:
 
             log_dir = Path(os.environ.get("PITH_LOG_DIR") or (resolve_data_dir() / "logs"))
             log_dir.mkdir(parents=True, exist_ok=True)
-            handler = logging.FileHandler(
-                log_dir / "deadlock-diagnostic.log", mode="a"
-            )
-            handler.setFormatter(
-                logging.Formatter(
-                    "%(asctime)s - %(levelname)s - %(message)s"
-                )
-            )
+            handler = logging.FileHandler(log_dir / "deadlock-diagnostic.log", mode="a")
+            handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
             diag.addHandler(handler)
         except Exception as _init_err:
-            logger.warning(
-                "deadlock diagnostic logger init failed: %s", _init_err
-            )
+            logger.warning("deadlock diagnostic logger init failed: %s", _init_err)
         _deadlock_diag_logger = diag
         return diag
 
@@ -89,15 +81,9 @@ def _capture_all_thread_stacks() -> str:
             daemon = getattr(tobj, "daemon", "?")
             try:
                 lines = traceback.format_stack(frame)
-                parts.append(
-                    f"Thread {tname} (daemon={daemon}, tid={tid}):\n"
-                    + "".join(lines)
-                )
+                parts.append(f"Thread {tname} (daemon={daemon}, tid={tid}):\n" + "".join(lines))
             except Exception as frame_err:
-                parts.append(
-                    f"Thread {tname} (tid={tid}): "
-                    f"<format_stack failed: {frame_err}>"
-                )
+                parts.append(f"Thread {tname} (tid={tid}): <format_stack failed: {frame_err}>")
         return "\n".join(parts)
     except Exception as dump_err:
         return f"<stack dump failed: {dump_err}>"
@@ -152,9 +138,7 @@ def _watchdog_loop() -> None:
                 exc_info=True,
             )
             if crash_count >= 2:
-                logger.error(
-                    "deadlock watchdog loop crashed twice; giving up"
-                )
+                logger.error("deadlock watchdog loop crashed twice; giving up")
                 return
             _time.sleep(_WATCHDOG_CRASH_BACKOFF_SECS)
 
@@ -169,16 +153,11 @@ def _install_faulthandler_hooks() -> None:
     if _faulthandler_installed:
         return
     if os.environ.get("PITH_DEADLOCK_WATCHDOG_DISABLED") == "1":
-        logger.info(
-            "deadlock watchdog disabled via PITH_DEADLOCK_WATCHDOG_DISABLED"
-        )
+        logger.info("deadlock watchdog disabled via PITH_DEADLOCK_WATCHDOG_DISABLED")
         _faulthandler_installed = True
         return
     if not hasattr(faulthandler, "register") or not hasattr(_signal, "SIGUSR1"):
-        logger.debug(
-            "deadlock SIGUSR1 observer unavailable on this platform; "
-            "skipping faulthandler signal hook"
-        )
+        logger.debug("deadlock SIGUSR1 observer unavailable on this platform; skipping faulthandler signal hook")
         _faulthandler_installed = True
         return
     try:
@@ -315,6 +294,8 @@ class SQLiteBackend:
     # Append new migrations here; _run_column_migrations and the audit pick them
     # up automatically.
     _COLUMN_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
+        # ARCH-V068: exact privacy-safe conversation-turn correlation.
+        ("metrics", "request_id_hash", "TEXT DEFAULT NULL"),
         # B5: session learning timestamp
         ("sessions", "last_learning_at", "TEXT"),
         # Self-awareness: session performance counters
@@ -376,6 +357,23 @@ class SQLiteBackend:
         ("write_request_replays", "lease_owner", "TEXT DEFAULT NULL"),
         ("write_request_replays", "lease_expires_at", "TEXT DEFAULT NULL"),
         ("write_request_replays", "next_retry_at", "TEXT DEFAULT NULL"),
+        # ARCH-V033: bounded lifecycle deferred-admission accounting.
+        ("lifecycle_jobs", "deferred_attempts", "INTEGER NOT NULL DEFAULT 0"),
+        ("lifecycle_jobs", "first_deferred_at", "TEXT DEFAULT NULL"),
+        # TOOLING-121: task-owned managed session lifecycle.
+        ("sessions", "binding_hash", "TEXT DEFAULT NULL"),
+        ("sessions", "binding_generation", "INTEGER DEFAULT NULL"),
+        ("sessions", "lifecycle_phase", "TEXT DEFAULT NULL"),
+        ("sessions", "last_activity_at", "TEXT DEFAULT NULL"),
+        ("lifecycle_jobs", "session_id", "TEXT DEFAULT NULL"),
+        ("lifecycle_jobs", "binding_hash", "TEXT DEFAULT NULL"),
+        ("lifecycle_jobs", "binding_generation", "INTEGER DEFAULT NULL"),
+        ("lifecycle_jobs", "claim_token", "TEXT DEFAULT NULL"),
+        ("write_request_replays", "binding_hash", "TEXT DEFAULT NULL"),
+        ("write_request_replays", "session_id", "TEXT DEFAULT NULL"),
+        ("write_request_replays", "external_request_id", "TEXT DEFAULT NULL"),
+        ("write_request_replays", "request_hash", "TEXT DEFAULT NULL"),
+        ("write_request_replays", "claim_token", "TEXT DEFAULT NULL"),
     )
 
     def __init__(self, db_path: Path, schema_ddl: str = ""):
@@ -466,6 +464,7 @@ class SQLiteBackend:
         constant, single source of truth). The same constant is used by
         _check_migration_integrity() to audit post-init column presence.
         """
+
         def _column_exists(table: str, column: str) -> bool:
             return any(row[1] == column for row in conn.execute(f"PRAGMA table_info({table})"))
 
@@ -492,16 +491,11 @@ class SQLiteBackend:
 
     def _run_legacy_compat_backfills(self, conn: sqlite3.Connection) -> None:
         """Backfill renamed legacy columns after early compatibility ALTERs."""
-        def _column_exists(table: str, column: str) -> bool:
-            return any(
-                row[1] == column
-                for row in conn.execute(f"PRAGMA table_info({table})")
-            )
 
-        if (
-            _column_exists("associations", "association_type")
-            and _column_exists("associations", "relation")
-        ):
+        def _column_exists(table: str, column: str) -> bool:
+            return any(row[1] == column for row in conn.execute(f"PRAGMA table_info({table})"))
+
+        if _column_exists("associations", "association_type") and _column_exists("associations", "relation"):
             conn.execute(
                 """
                 UPDATE associations
@@ -592,6 +586,7 @@ class SQLiteBackend:
             # app.ops.metrics directly. See .importlinter Contract 2 and
             # DEBT-244 for rationale.
             from app.core.metrics_facade import metrics
+
             metrics.record(
                 "migration_integrity_check",
                 float(len(missing)),
@@ -603,9 +598,7 @@ class SQLiteBackend:
                 },
             )
         except Exception as metric_err:
-            logger.warning(
-                "MONITOR-CI032A-01: metric record failed: %s", metric_err
-            )
+            logger.warning("MONITOR-CI032A-01: metric record failed: %s", metric_err)
 
         if status == "CRITICAL":
             logger.error(
@@ -677,8 +670,7 @@ class SQLiteBackend:
             self._lock_acquired_at = _t0
         if _elapsed > 5.0 and acquired:
             logger.warning(
-                "db() lock contention: acquired after %.1fs (thread=%s, "
-                "caller=%s, operation=%s, prev_holder=%s)",
+                "db() lock contention: acquired after %.1fs (thread=%s, caller=%s, operation=%s, prev_holder=%s)",
                 _elapsed,
                 threading.current_thread().name,
                 _caller,
@@ -715,9 +707,7 @@ class SQLiteBackend:
                     if getattr(conn, "in_transaction", False):
                         conn.commit()
                     else:
-                        logger.debug(
-                            "db(): outer transaction already closed before context exit; skipping commit"
-                        )
+                        logger.debug("db(): outer transaction already closed before context exit; skipping commit")
             except Exception:
                 if is_outermost:
                     if getattr(conn, "in_transaction", False):
@@ -727,12 +717,15 @@ class SQLiteBackend:
             self._nesting_depth -= 1
             if self._nesting_depth == 0:
                 import time as _time2
+
                 _held = _time2.monotonic() - getattr(self, "_lock_acquired_at", _time2.monotonic())
                 self._prev_lock_holder = f"{getattr(self, '_lock_holder', '?')} held={_held:.1f}s"
                 if _held > 5.0:
                     logger.warning(
                         "db() lock held %.1fs by %s (operation=%s)",
-                        _held, self._lock_holder, _operation,
+                        _held,
+                        self._lock_holder,
+                        _operation,
                     )
             self._lock.release()
 
@@ -826,12 +819,15 @@ class SQLiteBackend:
             self._nesting_depth -= 1
             if self._nesting_depth == 0:
                 import time as _time2
+
                 _held = _time2.monotonic() - getattr(self, "_lock_acquired_at", _time2.monotonic())
                 self._prev_lock_holder = f"{getattr(self, '_lock_holder', '?')} held={_held:.1f}s"
                 if _held > 5.0:
                     logger.warning(
                         "db_immediate() lock held %.1fs by %s (operation=%s)",
-                        _held, self._lock_holder, _operation,
+                        _held,
+                        self._lock_holder,
+                        _operation,
                     )
             self._lock.release()
 
@@ -880,6 +876,12 @@ class SQLiteBackend:
         # behavior plus UTF-8 replacement semantics.
         conn.row_factory = sqlite3.Row
         conn.text_factory = lambda b: b.decode("utf-8", errors="replace") if isinstance(b, bytes) else b
+        # TOOLING-121: persistent writer-barrier triggers fail closed when an
+        # old binary lacks these functions. Register before returning every
+        # writable cached or owned connection.
+        from app.storage.session_bindings import register_managed_write_udfs
+
+        register_managed_write_udfs(conn)
         return conn
 
     @property

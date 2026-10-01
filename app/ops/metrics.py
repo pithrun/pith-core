@@ -25,6 +25,7 @@ from datetime import UTC, datetime, timedelta
 
 from app.core.config import BENCHMARK_READONLY
 from app.core.datetime_utils import _utc_now, _utc_now_iso
+from app.core.request_identity import is_request_id_hash
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +64,14 @@ class MetricsCollector:
         self._buffer: list[dict] = []
         self._flush_threshold = flush_threshold
 
-    def record(self, metric_name: str, value: float, labels: dict | None = None) -> None:
+    def record(
+        self,
+        metric_name: str,
+        value: float,
+        labels: dict | None = None,
+        *,
+        request_id_hash: str | None = None,
+    ) -> None:
         """Record a single metric data point.
 
         Args:
@@ -71,6 +79,8 @@ class MetricsCollector:
             value: Numeric value (ms for timers, count for counters, ratio for gauges).
             labels: Optional key-value pairs for dimensional filtering.
         """
+        if request_id_hash is not None and not is_request_id_hash(request_id_hash):
+            raise ValueError("request_id_hash must be a lowercase SHA-256 hex digest")
         if BENCHMARK_READONLY:
             return
         try:
@@ -85,6 +95,7 @@ class MetricsCollector:
                 "metric": metric_name,
                 "value": value,
                 "labels": json.dumps(labels or {}),
+                "request_id_hash": request_id_hash,
             }
         )
         if len(self._buffer) >= self._flush_threshold:
@@ -99,7 +110,7 @@ class MetricsCollector:
         """
         return _MetricsTimer(self, metric_name, labels)
 
-    def flush(self) -> None:
+    def flush(self, *, strict: bool = False) -> None:
         """Write buffered metrics to SQLite.
 
         Best-effort: failures log a warning but don't crash.
@@ -116,8 +127,19 @@ class MetricsCollector:
 
             with _db() as conn:
                 conn.executemany(
-                    "INSERT INTO metrics (timestamp, metric, value, labels) VALUES (?, ?, ?, ?)",
-                    [(m["timestamp"], m["metric"], m["value"], m["labels"]) for m in batch],
+                    "INSERT INTO metrics "
+                    "(timestamp, metric, value, labels, request_id_hash) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    [
+                        (
+                            m["timestamp"],
+                            m["metric"],
+                            m["value"],
+                            m["labels"],
+                            m.get("request_id_hash"),
+                        )
+                        for m in batch
+                    ],
                 )
             # OBS-002: Log flush for observability
             metric_names = set(m["metric"] for m in batch)
@@ -126,6 +148,8 @@ class MetricsCollector:
             logger.warning("Metrics flush failed: %s", e)
             # Put unflushed metrics back (best-effort recovery)
             self._buffer = batch + self._buffer
+            if strict:
+                raise
 
     def query(
         self,
@@ -280,32 +304,54 @@ class MetricsCollector:
         metric_name: str,
         since: str | None = None,
         labels_filter: dict | None = None,
+        *,
+        strict: bool = False,
     ) -> int:
         """Count total occurrences of a metric, optionally filtered by labels."""
-        self.flush()
+        return self.query_counter_summary(
+            metric_name,
+            since=since,
+            labels_filter=labels_filter,
+            strict=strict,
+        )["count"]
+
+    def query_counter_summary(
+        self,
+        metric_name: str,
+        since: str | None = None,
+        labels_filter: dict | None = None,
+        *,
+        strict: bool = False,
+    ) -> dict:
+        """Return an uncapped counter total and newest matching timestamp."""
+        self.flush(strict=strict)
 
         if since is None:
             since = (_utc_now() - timedelta(hours=1)).isoformat()
+
+        clauses = ["metric = ?", "timestamp >= ?"]
+        params: list[object] = [metric_name, since]
+        for key, value in sorted((labels_filter or {}).items()):
+            clauses.append("json_extract(labels, ?) = ?")
+            params.extend((f"$.{key}", value))
 
         try:
             from app.storage import _db
 
             with _db() as conn:
-                if labels_filter:
-                    # Filter by label values using JSON extraction
-                    rows = conn.execute(
-                        "SELECT SUM(value) FROM metrics WHERE metric = ? AND timestamp >= ?",
-                        (metric_name, since),
-                    ).fetchone()
-                else:
-                    rows = conn.execute(
-                        "SELECT SUM(value) FROM metrics WHERE metric = ? AND timestamp >= ?",
-                        (metric_name, since),
-                    ).fetchone()
-                return int(rows[0] or 0) if rows else 0
+                row = conn.execute(
+                    "SELECT COALESCE(SUM(value), 0), MAX(timestamp) FROM metrics WHERE " + " AND ".join(clauses),
+                    params,
+                ).fetchone()
+            return {
+                "count": int(row[0] or 0) if row else 0,
+                "newest_timestamp": row[1] if row else None,
+            }
         except Exception as e:
-            logger.warning("Metrics count query failed: %s", e)
-            return 0
+            logger.warning("Metrics counter summary query failed: %s", e)
+            if strict:
+                raise
+            return {"count": 0, "newest_timestamp": None}
 
     def query_rate(
         self,

@@ -1,0 +1,129 @@
+{
+  "schema_version": "authority_chain_manifest.v1",
+  "chain_id": "launch_public_copy",
+  "current_artifact_id": "launch_copy_governing_spine_2026_07_07",
+  "artifacts": [
+    {
+      "id": "launch_copy_governing_spine_2026_07_07",
+      "title": "Pith launch copy governing spine",
+      "state": "current",
+      "channel": "all_public_launch_copy",
+      "governs": true,
+      "replaces": [
+        "hn_announcement_post_2026_06_15",
+        "june15_launch_copy_draft_2026_06_15"
+      ],
+      "aliases": [
+        "latest launch copy",
+        "current launch copy",
+        "final launch copy",
+        "approved launch copy",
+        "landed launch copy",
+        "source of truth",
+        "governing spine",
+        "user pains",
+        "pain targeted launch copy"
+      ],
+      "source_path": "docs/strategy/outputs/PITH_LAUNCH_COPY_GOVERNING_SPINE_2026_07_07.md",
+      "source_commit": "pending-local-authority-chain-v1",
+      "source_url": null,
+      "reason": "This artifact governs launch/public-copy decisions because it is the latest approved cross-channel spine and explicitly supersedes older HN/channel drafts.",
+      "concept_ids": [
+        "authority_launch_copy_current"
+      ]
+    },
+    {
+      "id": "hn_announcement_post_2026_06_15",
+      "title": "Hacker News announcement post",
+      "state": "historical",
+      "channel": "hackernews",
+      "governs": false,
+      "superseded_by": "launch_copy_governing_spine_2026_07_07",
+      "replaces": [],
+      "aliases": [
+        "hacker news",
+        "hackernews",
+        "hn",
+        "hn announcement",
+        "announcement post",
+        "hackernews announcement post",
+        "previous announcement post"
+      ],
+      "source_path": "docs/strategy/outputs/HN_ANNOUNCEMENT_POST_2026_06_15.md",
+      "source_commit": "historical-june-15",
+      "source_url": null,
+      "reason": "This is a channel-specific historical artifact. It can answer HN lookup questions but does not govern current launch-copy decisions.",
+      "concept_ids": [
+        "authority_launch_copy_hn_20260615"
+      ]
+    },
+    {
+      "id": "june15_launch_copy_draft_2026_06_15",
+      "title": "June 15 launch copy draft",
+      "state": "superseded",
+      "channel": "launch_copy_draft",
+      "governs": false,
+      "superseded_by": "launch_copy_governing_spine_2026_07_07",
+      "replaces": [],
+      "aliases": [
+        "june 15",
+        "jun 15",
+        "old launch copy",
+        "previous launch copy",
+        "superseded launch copy",
+        "more exciting version"
+      ],
+      "source_path": "docs/strategy/outputs/PITH_LAUNCH_COPY_DRAFT_2026_06_15.md",
+      "source_commit": "historical-june-15",
+      "source_url": null,
+      "reason": "This draft is superseded by the later pain-targeted governing spine.",
+      "concept_ids": [
+        "authority_launch_copy_june15"
+      ]
+    },
+    {
+      "id": "landing_page_channel_copy_2026_07_07",
+      "title": "Landing page channel copy",
+      "state": "channel_draft",
+      "channel": "website",
+      "governs": false,
+      "superseded_by": "launch_copy_governing_spine_2026_07_07",
+      "replaces": [],
+      "aliases": [
+        "landing page",
+        "website copy",
+        "site copy",
+        "public site copy"
+      ],
+      "source_path": "sites/getpith/PITH_LANDING_PAGE_COPY_2026_07_07.md",
+      "source_commit": "pending-local-authority-chain-v1",
+      "source_url": null,
+      "reason": "This is a channel-specific derivative of the governing spine, not the authority source itself.",
+      "concept_ids": [
+        "authority_launch_copy_landing"
+      ]
+    },
+    {
+      "id": "x_launch_thread_channel_copy_2026_07_07",
+      "title": "X launch thread channel copy",
+      "state": "channel_draft",
+      "channel": "x",
+      "governs": false,
+      "superseded_by": "launch_copy_governing_spine_2026_07_07",
+      "replaces": [],
+      "aliases": [
+        "x launch",
+        "twitter launch",
+        "tweet thread",
+        "launch thread"
+      ],
+      "source_path": "docs/strategy/outputs/X_LAUNCH_THREAD_COPY_2026_07_07.md",
+      "source_commit": "pending-local-authority-chain-v1",
+      "source_url": null,
+      "reason": "This is a channel-specific draft and should not supersede the governing launch-copy spine.",
+      "concept_ids": [
+        "authority_launch_copy_x_thread"
+      ]
+    }
+  ]
+}

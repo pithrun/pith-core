@@ -19,8 +19,8 @@ import os
 import platform
 import re
 import shutil
+from datetime import UTC
 from pathlib import Path
-
 
 # --- Constants ---
 HOME = Path.home()
@@ -29,7 +29,10 @@ CLAUDE_COMPAT_SKILLS_DIR = HOME / ".claude" / "skills"
 CANONICAL_SKILLS_DIR = CLAUDE_COMPAT_SKILLS_DIR  # legacy alias for callers/tests
 COWORK_SKILLS_DIR = HOME / "Documents" / "Claude" / "skills"
 LEGACY_DISCOVERY_DIRS = [COWORK_SKILLS_DIR, CLAUDE_COMPAT_SKILLS_DIR]
-AUXILIARY_SKILL_DIRS = [HOME / ".agents" / "skills"]
+# Shared user registries are discovery surfaces owned by the user/client, not
+# generated Pith deployment targets. Pith may inspect them for registry
+# pollution and cross-root collisions, but must never normalize their content.
+USER_SKILL_REGISTRY_DIRS = [HOME / ".agents" / "skills"]
 REGISTRY_BACKUP_QUARANTINE_DIR = HOME / ".agents" / "skills-archive"
 REGISTRY_BACKUP_DIR_RE = re.compile(r"^skills\.[^/]*-bak\.\d+$")
 PREFERRED_CODEX_SKILL_ROOT = HOME / ".codex" / "skills"
@@ -355,7 +358,7 @@ def _deploy_to_claude_compat(skills, log_fn, strategy="symlink"):
 
 def _find_all_cowork_slots(base_path):
     """SKILLS-001: Return ALL Cowork session slots — eliminates session-targeting race condition.
-    
+
     Prior heuristic (most recently created/modified slot) was unreliable: Cowork updates
     manifests independently, so the deploy could target a stale slot. Returning all slots
     guarantees every session gets skills, regardless of timing.
@@ -467,8 +470,6 @@ def _audit_generated_skill_metadata():
         "claude_compat_direct": SURFACES["claude-code"]["path"],
         "codex_user": SURFACES["codex"]["path"],
     }
-    for root in AUXILIARY_SKILL_DIRS:
-        roots[f"auxiliary:{root.name}"] = root
     return {
         label: _audit_skill_metadata_root(label, root)
         for label, root in roots.items()
@@ -496,7 +497,7 @@ def _skill_name_from_file(skill_md_path):
 
 
 def _audit_cross_root_duplicates(canonical_skills):
-    roots = [PREFERRED_CODEX_SKILL_ROOT] + AUXILIARY_SKILL_DIRS
+    roots = [PREFERRED_CODEX_SKILL_ROOT] + USER_SKILL_REGISTRY_DIRS
     by_name = {}
     for root in roots:
         if not root.is_dir():
@@ -543,7 +544,7 @@ def _registry_pollution_roots():
     return _dedupe_paths([
         SURFACES["claude-code"]["path"],
         SURFACES["codex"]["path"],
-        *AUXILIARY_SKILL_DIRS,
+        *USER_SKILL_REGISTRY_DIRS,
     ])
 
 
@@ -808,18 +809,6 @@ def _verify_surface_parity(skills, surface_results, log_fn):
                 parity["drift"].append({"surface": surface, "skill": skill["id"], "reason": "hash_mismatch"})
 
     if _canonical_hub_enabled():
-        auxiliary_audit = _audit_auxiliary_skill_dirs(skills)
-        parity["auxiliaryAudit"] = auxiliary_audit
-        for root in auxiliary_audit:
-            if root.get("status") != "drift":
-                continue
-            for drift in root.get("drift", []):
-                parity["drift"].append({
-                    "surface": "auxiliary",
-                    "path": root.get("path"),
-                    "skill": drift.get("skill"),
-                    "reason": drift.get("reason"),
-                })
         parity["registryPollution"] = _audit_registry_pollution(skills)
 
     if parity["drift"]:
@@ -828,94 +817,6 @@ def _verify_surface_parity(skills, surface_results, log_fn):
     else:
         log_fn("parity", "ok", "No drift detected")
     return parity
-
-
-def _audit_auxiliary_skill_dirs(skills):
-    canonical_by_id = {skill["id"]: skill for skill in skills}
-    audit = []
-    for skills_dir in AUXILIARY_SKILL_DIRS:
-        if not skills_dir.is_dir():
-            audit.append({"path": str(skills_dir), "status": "missing"})
-            continue
-        drift = []
-        for skill in _discover_from_dir(skills_dir):
-            canonical = canonical_by_id.get(skill["id"])
-            if not canonical:
-                drift.append({"skill": skill["id"], "reason": "not_in_canonical"})
-                continue
-            if _hash_skill_tree(skill["path"]) != _hash_skill_tree(canonical["path"]):
-                drift.append({"skill": skill["id"], "reason": "hash_mismatch"})
-        missing = sorted(set(canonical_by_id) - {skill["id"] for skill in _discover_from_dir(skills_dir)})
-        drift.extend({"skill": skill_id, "reason": "missing_from_auxiliary"} for skill_id in missing)
-        audit.append({"path": str(skills_dir), "status": "drift" if drift else "ok", "drift": drift})
-    return audit
-
-
-def _deploy_to_auxiliary_skill_dirs(skills, log_fn):
-    """Repair managed auxiliary skill roots such as ~/.agents/skills."""
-    canonical_ids = {skill["id"] for skill in skills}
-    results = {"status": "ok", "roots": [], "warnings": []}
-    for skills_dir in AUXILIARY_SKILL_DIRS:
-        root_result = {
-            "path": str(skills_dir),
-            "status": "ok",
-            "skills": [],
-            "removedExtraSkills": [],
-            "warnings": [],
-        }
-        if not skills_dir.is_dir():
-            # TOOLING-099: the auxiliary root is a required drift-guard surface; a
-            # managed deploy target should self-heal a missing root rather than
-            # silently skip it (the gap that left ~/.agents/skills drifted). Only
-            # skip if creation genuinely fails (e.g. permissions).
-            try:
-                skills_dir.mkdir(parents=True, exist_ok=True)
-            except OSError as e:
-                root_result["status"] = "skipped"
-                root_result["reason"] = f"auxiliary_root_uncreatable: {e}"
-                results["roots"].append(root_result)
-                continue
-            root_result["createdRoot"] = True
-        for existing in _discover_from_dir(skills_dir):
-            if existing["id"] in canonical_ids:
-                continue
-            existing_path = Path(existing["path"])
-            if (existing_path / MARKER_FILE).exists():
-                shutil.rmtree(existing_path)
-                root_result["removedExtraSkills"].append(existing["id"])
-            else:
-                root_result["warnings"].append(f"{existing['id']}: extra skill is unmanaged")
-        for skill in skills:
-            source_dir = Path(skill["path"])
-            target_dir = skills_dir / skill["id"]
-            try:
-                if target_dir.is_symlink():
-                    if target_dir.resolve() != source_dir.resolve():
-                        root_result["warnings"].append(f"{skill['id']}: symlink managed by another tool")
-                        continue
-                    target_dir.unlink()
-                elif target_dir.exists():
-                    if not (target_dir / MARKER_FILE).exists() and not _target_matches_source(target_dir, source_dir):
-                        root_result["warnings"].append(f"{skill['id']}: exists, not pith-managed")
-                        continue
-                    shutil.rmtree(target_dir)
-                shutil.copytree(source_dir, target_dir)
-                (target_dir / MARKER_FILE).write_text(json.dumps({
-                    "deployed_at": _now_iso(),
-                    "source": str(source_dir),
-                    "strategy": "auxiliary_materialize",
-                }))
-                root_result["skills"].append(skill["id"])
-            except OSError as e:
-                root_result["warnings"].append(f"{skill['id']}: {e}")
-        if root_result["warnings"]:
-            root_result["status"] = "warning"
-            results["warnings"].extend({"path": str(skills_dir), "warning": w} for w in root_result["warnings"])
-        log_fn("auxiliary", root_result["status"], f"{skills_dir}: {len(root_result['skills'])}/{len(skills)} skills")
-        results["roots"].append(root_result)
-    if results["warnings"]:
-        results["status"] = "warning"
-    return results
 
 
 def repair_generated_surfaces(skills, log_fn):
@@ -952,14 +853,43 @@ def repair_generated_surfaces(skills, log_fn):
             "claude-code": _deploy_to_claude_compat(skills, log_fn, strategy="symlink"),
             "codex": _deploy_to_codex(skills, log_fn),
         },
-        "auxiliary": _deploy_to_auxiliary_skill_dirs(skills, log_fn),
     }
     return results
 
 
+def _deploy_success_invariant_issues(results, *, repair):
+    """Return owned-root parity gaps that must block top-level success."""
+    issues = []
+
+    parity = results.get("parity")
+    if parity is None:
+        issues.append({"surface": "parity", "status": "missing", "reason": "parity_result_missing"})
+    elif parity.get("status") != "ok":
+        issues.append({
+            "surface": "parity",
+            "status": parity.get("status", "unknown"),
+            "reason": "parity_not_ok",
+        })
+
+    return issues
+
+
+def _enforce_deploy_success_invariants(results, *, repair, log_fn):
+    """Promote owned-root parity failures into the top-level deploy status."""
+    issues = _deploy_success_invariant_issues(results, repair=repair)
+    if not issues:
+        return
+
+    results["deploymentIssues"] = issues
+    if results.get("status") == "ok":
+        results["status"] = "error"
+        results["error"] = "skill_deployment_invariant_failed"
+    log_fn("all", "error", f"{len(issues)} deployment invariant issue(s)")
+
+
 def _now_iso():
-    from datetime import datetime, timezone
-    return datetime.now(timezone.utc).isoformat()
+    from datetime import datetime
+    return datetime.now(UTC).isoformat()
 
 
 def _deploy_skills_legacy(logs, log_fn):
@@ -1084,17 +1014,6 @@ def deploy_skills(*, status_only=False, migrate=False, dry_run=False, repair=Fal
         log_fn("cowork", "error", f"Unhandled: {e}")
         results["surfaces"]["cowork"] = {"status": "error", "error": str(e)}
 
-    # TOOLING-099: materialize the auxiliary skill root(s) (~/.agents/skills) on
-    # every deploy, not just on repair=True. The drift guard requires this root in
-    # sync; previously it was only refreshed via repair_generated_surfaces, so new
-    # skills drifted out of it on normal deploys. Idempotent; when repair=True the
-    # repair path re-runs this harmlessly (its result is discarded at the merge).
-    try:
-        results["surfaces"]["auxiliary"] = _deploy_to_auxiliary_skill_dirs(skills, log_fn)
-    except Exception as e:
-        log_fn("auxiliary", "error", f"Unhandled: {e}")
-        results["surfaces"]["auxiliary"] = {"status": "error", "error": str(e)}
-
     if repair:
         results["repair"] = repair_generated_surfaces(skills, log_fn)
         results["surfaces"].update(results["repair"].get("surfaces", {}))
@@ -1119,6 +1038,7 @@ def deploy_skills(*, status_only=False, migrate=False, dry_run=False, repair=Fal
         results["error"] = "generated_skill_metadata_post_deploy_failed"
         log_fn("metadata", "error", f"{generated_failures} generated metadata hard failure(s)")
 
+    _enforce_deploy_success_invariants(results, repair=repair, log_fn=log_fn)
     return results
 
 
@@ -1222,16 +1142,16 @@ def _deployer_owned_generated_hard_failures(status):
 
 def auto_deploy_if_needed():
     """Auto-deploy skills to Cowork if needed, with 5-minute debounce.
-    
+
     Called from conversation_turn pipeline. Returns deploy result or None if skipped.
     """
     import time
     global _last_auto_deploy_ts
-    
+
     now = time.time()
     if now - _last_auto_deploy_ts < _AUTO_DEPLOY_COOLDOWN_SECONDS:
         return None
-    
+
     # Check if deploy is needed
     try:
         status = deploy_skills(status_only=True)
@@ -1241,11 +1161,11 @@ def auto_deploy_if_needed():
             return None
     except Exception:
         return None
-    
+
     # Deploy — set cooldown AFTER deploy so failed deploys don't eat retry window (DEBT-225)
     result = deploy_skills(status_only=False, repair=needs_repair)
     _last_auto_deploy_ts = time.time()
-    
+
     # Post-deploy verification
     verify = deploy_skills(status_only=True)
     cowork_verify = verify.get("surfaces", {}).get("cowork", {})
@@ -1256,5 +1176,5 @@ def auto_deploy_if_needed():
         result["warning"] = (
             "Post-deploy verification failed: generated skill metadata still has hard failures"
         )
-    
+
     return result

@@ -4,6 +4,8 @@ Install Pith, verify the local service, then connect your AI client.
 
 ## 1. Install
 
+### macOS
+
 ```bash
 curl -fsSL https://pith.run/install | bash
 ```
@@ -17,6 +19,15 @@ PITH_PORT=8123 curl -fsSL https://pith.run/install | bash
 ```
 
 If port `8000` is occupied, the installer can automatically choose a free port in the configured scan range and persist it.
+
+### Windows PowerShell
+
+```powershell
+Invoke-WebRequest https://github.com/pithrun/pith-core/releases/latest/download/install.ps1 -UseBasicParsing -OutFile install.ps1
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+The Windows installer verifies the server ZIP checksum, provisions a managed Python runtime when needed, keeps its virtual environment on a short external path, configures Task Scheduler, and runs a health check.
 
 ## 2. Verify
 
@@ -38,11 +49,11 @@ Restart Claude Desktop completely. If you skipped the instructions step during i
 pith protocol
 ```
 
-Paste the copied instructions into Claude Desktop settings, save, quit Claude with Cmd+Q, and reopen it.
+Paste the copied instructions into Claude Desktop settings, save, quit Claude completely, and reopen it.
 
 ### Codex
 
-Confirm `~/.codex/AGENTS.md` contains the Pith cognitive loop and that `~/.pith/bin/pith api conversation_turn --stdin-json` is referenced. If Codex was installed after Pith, rerun the installer or the client configuration step.
+Confirm the platform-specific Codex `AGENTS.md` contains the Pith cognitive loop and references `pith api conversation_turn --stdin-json`. If Codex was installed after Pith, rerun the installer or the client configuration step.
 
 ### VS Code, Cursor, and Windsurf
 

@@ -14,6 +14,10 @@ from typing import Callable, Deque
 from app.core.deadline import TurnDeadline
 
 MetricRecorder = Callable[[str, float, dict[str, str]], None]
+FOREGROUND_CONTRACT_DECISION_METRIC = "ct_foreground_contract_decision_total"
+FOREGROUND_CONTRACT_CIRCUIT_OPEN_METRIC = "ct_foreground_contract_circuit_open_total"
+FOREGROUND_CONTRACT_RECOVERY_PROBE_METRIC = "ct_foreground_contract_recovery_probe_total"
+FOREGROUND_CONTRACT_WAIT_METRIC = "ct_foreground_contract_wait_ms"
 _RECOVERY_PROBE_REASONS = frozenset(
     {
         "latency_over_limit",
@@ -21,6 +25,9 @@ _RECOVERY_PROBE_REASONS = frozenset(
         "recovery_probe_over_limit",
     }
 )
+_RECOVERY_PROBE_GATE_ENV = "PITH_FOREGROUND_RECOVERY_PROBES_ENABLED"
+_ENV_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
+_ENV_FALSE_VALUES = frozenset({"0", "false", "no", "off"})
 
 
 class ForegroundContractMode(str, Enum):
@@ -47,7 +54,7 @@ class ForegroundContractConfig:
     circuit_ttl_s: float = 60.0
     max_samples: int = 64
     skip_when_cold: bool = False
-    recovery_probe_enabled: bool = False
+    recovery_probe_enabled: bool | None = None
     reset_samples_on_successful_probe: bool = True
 
 
@@ -160,7 +167,7 @@ class ForegroundContract:
                     reason = "cold_start_no_samples"
                     should_skip = True
                 elif recent_p95 is not None and recent_p95 > config.recent_p95_limit_ms:
-                    if _can_recovery_probe(config, health):
+                    if _can_recovery_probe(config, health, mode):
                         health.mark_recovery_probe()
                         reason = "recovery_probe"
                     else:
@@ -200,9 +207,14 @@ class ForegroundContract:
         if not config.enabled or _normalize_mode(config.mode) is ForegroundContractMode.OFF:
             return
         circuit_open_reason = ""
+        recovery_probe_outcome = ""
         with self._lock:
             health = self._health_for_locked(config)
             was_recovery_probe = health.consume_recovery_probe()
+            if was_recovery_probe:
+                recovery_probe_outcome = (
+                    "success" if elapsed_ms <= config.recent_p95_limit_ms else "over_limit"
+                )
             if (
                 was_recovery_probe
                 and elapsed_ms <= config.recent_p95_limit_ms
@@ -214,13 +226,13 @@ class ForegroundContract:
             if elapsed_ms > config.recent_p95_limit_ms:
                 circuit_open_reason = (
                     "recovery_probe_over_limit"
-                    if was_recovery_probe and config.recovery_probe_enabled
+                    if was_recovery_probe
                     else "latency_over_limit"
                 )
                 health.open_circuit(circuit_open_reason, config.circuit_ttl_s)
         if circuit_open_reason:
             self._record(
-                "ct_foreground_contract_circuit_open_total",
+                FOREGROUND_CONTRACT_CIRCUIT_OPEN_METRIC,
                 1.0,
                 {
                     "unit": config.unit,
@@ -228,8 +240,18 @@ class ForegroundContract:
                     "mode": _normalize_mode(config.mode).value,
                 },
             )
+        if recovery_probe_outcome:
+            self._record(
+                FOREGROUND_CONTRACT_RECOVERY_PROBE_METRIC,
+                1.0,
+                {
+                    "unit": config.unit,
+                    "mode": _normalize_mode(config.mode).value,
+                    "outcome": recovery_probe_outcome,
+                },
+            )
         self._record(
-            "ct_foreground_contract_wait_ms",
+            FOREGROUND_CONTRACT_WAIT_METRIC,
             max(0.0, float(elapsed_ms)),
             {
                 "unit": config.unit,
@@ -240,11 +262,22 @@ class ForegroundContract:
         )
 
     def cancel_recovery_probe(self, config: ForegroundContractConfig) -> None:
-        if not config.enabled or _normalize_mode(config.mode) is ForegroundContractMode.OFF:
+        mode = _normalize_mode(config.mode)
+        if not config.enabled or mode is ForegroundContractMode.OFF:
             return
         with self._lock:
             health = self._health_for_locked(config)
-            health.consume_recovery_probe()
+            was_recovery_probe = health.consume_recovery_probe()
+        if was_recovery_probe:
+            self._record(
+                FOREGROUND_CONTRACT_RECOVERY_PROBE_METRIC,
+                1.0,
+                {
+                    "unit": config.unit,
+                    "mode": mode.value,
+                    "outcome": "cancelled",
+                },
+            )
 
     def health_snapshot(self, unit: str) -> dict[str, float | str | bool | None]:
         with self._lock:
@@ -268,12 +301,15 @@ class ForegroundContract:
         return health
 
     def _record_decision(self, decision: ForegroundContractDecision, *, answer_path: str) -> None:
-        self._record("ct_foreground_contract_decision_total", 1.0, decision.metric_labels(answer_path=answer_path))
+        self._record(FOREGROUND_CONTRACT_DECISION_METRIC, 1.0, decision.metric_labels(answer_path=answer_path))
 
     def _record(self, name: str, value: float, labels: dict[str, str]) -> None:
         if self._recorder is None:
             return
-        self._recorder(name, value, {str(key): _bounded_label(value) for key, value in labels.items()})
+        try:
+            self._recorder(name, value, {str(key): _bounded_label(value) for key, value in labels.items()})
+        except Exception:
+            pass
 
 
 _CONTRACT: ForegroundContract | None = None
@@ -284,9 +320,37 @@ def foreground_contract_mode_from_env() -> ForegroundContractMode:
     return _normalize_mode(os.environ.get("PITH_FOREGROUND_CONTRACT_MODE", "shadow"))
 
 
-def _can_recovery_probe(config: ForegroundContractConfig, health: ForegroundUnitHealth) -> bool:
+def _recovery_probe_gate_from_env() -> bool | None:
+    raw = os.environ.get(_RECOVERY_PROBE_GATE_ENV)
+    if raw is None:
+        return None
+    normalized = str(raw).strip().lower()
+    if normalized in _ENV_TRUE_VALUES:
+        return True
+    if normalized in _ENV_FALSE_VALUES:
+        return False
+    return False
+
+
+def _recovery_probe_allowed(
+    config: ForegroundContractConfig,
+    mode: ForegroundContractMode,
+) -> bool:
+    gate = _recovery_probe_gate_from_env()
+    if gate is False or config.recovery_probe_enabled is False:
+        return False
+    if config.recovery_probe_enabled is True:
+        return True
+    return gate is True and mode is ForegroundContractMode.ENFORCE
+
+
+def _can_recovery_probe(
+    config: ForegroundContractConfig,
+    health: ForegroundUnitHealth,
+    mode: ForegroundContractMode,
+) -> bool:
     return (
-        bool(config.recovery_probe_enabled)
+        _recovery_probe_allowed(config, mode)
         and not health.recovery_probe_in_flight
         and health.circuit_reason in _RECOVERY_PROBE_REASONS
     )

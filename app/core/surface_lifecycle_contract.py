@@ -123,6 +123,8 @@ class SurfaceAdapterManifest:
     learning_probe_kind: str
     learning_failure_policy: str
     learning_quality_mode: str
+    default_context_owner_mode: str = "static"
+    supported_context_owner_modes: tuple[str, ...] = ()
     coherence_probe_kind: str = "not_probeable"
     coherence_verdict: str = VERDICT_UNSUPPORTED
     coherence_required: bool = False
@@ -162,6 +164,7 @@ class SurfaceAdapterManifest:
         if self.canonicality not in VALID_SURFACE_CANONICALITY:
             raise ValueError(f"invalid canonicality: {self.canonicality}")
         for field_name, values in (
+            ("supported_context_owner_modes", self.supported_context_owner_modes),
             ("user_visible_hosts", self.user_visible_hosts),
             ("host_aliases", self.host_aliases),
         ):
@@ -272,6 +275,10 @@ def surface_adapter_from_dict(raw: dict[str, Any]) -> SurfaceAdapterManifest:
         learning_probe_kind=raw.get("learning_probe_kind", default_probe_kind),
         learning_failure_policy=raw.get("learning_failure_policy", default_failure_policy),
         learning_quality_mode=raw.get("learning_quality_mode", default_quality_mode),
+        default_context_owner_mode=raw.get("default_context_owner_mode", "static"),
+        supported_context_owner_modes=_tuple_of_strings(
+            raw.get("supported_context_owner_modes"), "supported_context_owner_modes"
+        ),
         coherence_probe_kind=raw.get("coherence_probe_kind", "not_probeable"),
         coherence_verdict=raw.get("coherence_verdict", VERDICT_UNSUPPORTED),
         coherence_required=bool(raw.get("coherence_required", False)),
@@ -310,20 +317,22 @@ SURFACE_LIFECYCLE_ADAPTERS: dict[str, SurfaceAdapterManifest] = {
         learning_probe_kind="hook_transcript_stop",
         learning_failure_policy="Stop hook must call session_learn or record explicit degraded learning.",
         learning_quality_mode="raw_evidence_capture",
+        default_context_owner_mode="hook_primary",
+        supported_context_owner_modes=("hook_primary",),
         coherence_probe_kind="hook_model_tool_trace",
         coherence_verdict=VERDICT_INSTRUCTION_MEDIATED,
-        coherence_required=True,
+        coherence_required=False,
         coherence_failure_policy=(
-            "PostToolUse model-visible conversation_turn must match hook session and surface for "
-            "model-visible proof; absence is instruction-mediated/not observed, not hook failure."
+            "Explicit PostToolUse conversation_turn proof must match hook session and surface when requested; "
+            "absence on a routine hook-owned turn is not hook failure."
         ),
         config_path_templates=(".claude/settings.json", ".claude.json"),
         config_markers=("UserPromptSubmit", "Stop", "pith", "conversation_turn"),
         conformance_expectation=(
             "A UserPromptSubmit hook runs conversation_turn before response composition; "
             "a Stop hook captures the assistant response after the turn; "
-            "the model-visible binding instructs pith_conversation_turn each substantive turn, "
-            "but compliance is model/tool mediated unless a matching PostToolUse trace is observed."
+            "the hook is the sole routine conversation_turn owner; explicit user-authorized MCP proof "
+            "is optional and model/tool mediated unless a matching PostToolUse trace is observed."
         ),
         supports_fresh_consumer=True,
         supports_cold_start=True,
@@ -335,24 +344,64 @@ SURFACE_LIFECYCLE_ADAPTERS: dict[str, SurfaceAdapterManifest] = {
         surface_id="codex_local_api",
         client_id="codex",
         label="Codex",
-        install_method="AGENTS.md lifecycle instructions plus local API wrapper",
-        context_trigger_type="model_instruction",
+        install_method="configure_clients single-owner Codex lifecycle reconciliation",
+        context_trigger_type="pre_response_hook",
         transport="local_api",
-        context_delivery_mode="local_api_first_call",
+        context_delivery_mode="hook_additional_context",
         timeout_budget_ms=4000,
-        degradation_behavior="Instruction requires explicit degraded response if local API is unavailable.",
-        context_enforcement_verdict=VERDICT_INSTRUCTION_MEDIATED,
+        degradation_behavior=(
+            "Fail visibly with no same-turn retry; instruction-primary only after installer "
+            "proves prompt-hook absence."
+        ),
+        context_enforcement_verdict=VERDICT_ENFORCED,
         learning_trigger_type="model_instruction",
         learning_transport="unavailable",
         learning_capture_verdict=VERDICT_INSTRUCTION_MEDIATED,
         learning_probe_kind="instruction_observed",
         learning_failure_policy="Model/operator compliance is required; no post-response trigger is enforced.",
         learning_quality_mode="verified_concepts_required",
+        default_context_owner_mode="hook_primary",
+        supported_context_owner_modes=("hook_primary", "instruction_primary", "transition_hold"),
         config_path_templates=(".codex/AGENTS.md", ".codex/config.toml"),
-        config_markers=("conversation_turn", "pith api", "origin_id"),
-        conformance_expectation="AGENTS.md instructs Codex to call the local API before substantive responses.",
+        config_markers=("PITH_CODEX_LIFECYCLE_OWNER", "UserPromptSubmit", "conversation_turn"),
+        conformance_expectation=(
+            "A reconciled hook-primary installation invokes conversation_turn once before response "
+            "composition and instructs the model to suppress a duplicate call."
+        ),
         display_group="OpenAI",
         user_visible_hosts=("Codex",),
+        canonicality="canonical_surface",
+    ),
+    "chatgpt_tunnel": SurfaceAdapterManifest(
+        surface_id="chatgpt_tunnel",
+        client_id="chatgpt",
+        label="ChatGPT Secure MCP Tunnel",
+        install_method="ChatGPT developer app connected through OpenAI Secure MCP Tunnel",
+        context_trigger_type="mcp_tool",
+        transport="secure_mcp_tunnel",
+        context_delivery_mode="mcp_tool_call",
+        timeout_budget_ms=8000,
+        degradation_behavior="Report the current MCP call failure; do not infer connectivity from tunnel or process health.",
+        context_enforcement_verdict=VERDICT_INSTRUCTION_MEDIATED,
+        learning_trigger_type="model_instruction",
+        learning_transport="mcp_stdio",
+        learning_capture_verdict=VERDICT_INSTRUCTION_MEDIATED,
+        learning_probe_kind="instruction_observed",
+        learning_failure_policy="Model/tool compliance is required; failed tunnel calls must remain explicit.",
+        learning_quality_mode="verified_concepts_required",
+        config_path_templates=(
+            ".pith/tunnel/profiles/pith-windows.yaml",
+            ".pith/tunnel/profiles/pith-macos.yaml",
+        ),
+        config_markers=("tunnel_id", "mcp:"),
+        conformance_expectation=(
+            "A connected ChatGPT developer app invokes the allowlisted Pith MCP tools through Secure MCP Tunnel; "
+            "a same-turn conversation result is required for a connected verdict."
+        ),
+        supports_fresh_consumer=True,
+        supports_cold_start=True,
+        display_group="OpenAI",
+        user_visible_hosts=("ChatGPT Chat",),
         canonicality="canonical_surface",
     ),
     "claude_desktop_mcp": SurfaceAdapterManifest(

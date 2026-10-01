@@ -16,21 +16,19 @@ import os
 import time
 import uuid
 from collections import defaultdict
-from datetime import datetime
 
 from app.cognitive.auto_reflection import (
     L1_TYPES,
-    L3_TYPES,
     _classify_cluster_type,
     _extract_theme,
 )
-from app.core.datetime_utils import _utc_now, _utc_now_iso
+from app.core.config import MAINTENANCE_LLM_MODEL
+from app.core.datetime_utils import _utc_now_iso
 from app.core.metrics_facade import metrics
-from app.core.models import Concept, Evidence, SearchQuery
+from app.core.models import Concept, Evidence
 from app.storage import (
     _db,
     _db_immediate,
-    list_concepts,
     load_concept,
     save_concept,
 )
@@ -41,7 +39,7 @@ logger = logging.getLogger(__name__)
 # Configuration
 # ============================================================
 
-MODEL = os.environ.get("PITH_SYNTHESIS_MODEL", "google/gemini-2.0-flash-001")  # COST-001
+MODEL = os.environ.get("PITH_SYNTHESIS_MODEL", MAINTENANCE_LLM_MODEL)
 TIMEOUT_SECONDS = int(os.environ.get("PITH_SYNTHESIS_TIMEOUT_S", "15"))
 MAX_TOKENS = 500
 SUMMARY_TRUNCATE = 500  # Max chars per concept summary in prompts
@@ -55,8 +53,8 @@ MAX_CANDIDATES = 200  # Safety cap on L1 concepts to evaluate
 # Confidence bracket tiers — empirically set from cluster size distribution
 # (n=70 observed clusters: min=13, median=22, max=47)
 # Override via env vars to tune without code changes.
-CONF_TIER_A_MIN = int(os.environ.get("PITH_SYNTH_TIER_A_MIN", "30"))   # strong  → 0.70–0.85
-CONF_TIER_B_MIN = int(os.environ.get("PITH_SYNTH_TIER_B_MIN", "18"))   # moderate → 0.58–0.72
+CONF_TIER_A_MIN = int(os.environ.get("PITH_SYNTH_TIER_A_MIN", "30"))  # strong  → 0.70–0.85
+CONF_TIER_B_MIN = int(os.environ.get("PITH_SYNTH_TIER_B_MIN", "18"))  # moderate → 0.58–0.72
 # Below TIER_B_MIN → Tier C: 0.40–0.58
 
 
@@ -68,6 +66,7 @@ def _confidence_bracket(concept_count: int) -> tuple[float, float, str]:
         return 0.58, 0.72, "moderate evidence"
     else:
         return 0.40, 0.58, "thin evidence"
+
 
 # Circuit breaker: trips on first AuthenticationError, resets on restart
 _SYNTHESIS_LLM_AUTH_FAILED: bool = False
@@ -213,13 +212,15 @@ def _select_synthesis_candidates() -> list[dict]:
 
     candidates = []
     for row in rows:
-        candidates.append({
-            "id": row[0],
-            "summary": (row[1] or "")[:SUMMARY_TRUNCATE],
-            "confidence": row[2] or 0.3,
-            "concept_type": row[3] or "observation",
-            "knowledge_area": row[4] or "general",
-        })
+        candidates.append(
+            {
+                "id": row[0],
+                "summary": (row[1] or "")[:SUMMARY_TRUNCATE],
+                "confidence": row[2] or 0.3,
+                "concept_type": row[3] or "observation",
+                "knowledge_area": row[4] or "general",
+            }
+        )
     return candidates
 
 
@@ -247,15 +248,17 @@ def _cluster_candidates(candidates: list[dict]) -> list[dict]:
         target_type, question_template = _classify_cluster_type(summaries)
         theme = _extract_theme(summaries, area)
 
-        clusters.append({
-            "knowledge_area": area,
-            "concepts": concepts,
-            "avg_confidence": avg_conf,
-            "target_type": target_type,
-            "synthesis_hint": question_template.format(theme=theme),
-            "theme": theme,
-            "score": len(concepts) * avg_conf,  # Rank metric
-        })
+        clusters.append(
+            {
+                "knowledge_area": area,
+                "concepts": concepts,
+                "avg_confidence": avg_conf,
+                "target_type": target_type,
+                "synthesis_hint": question_template.format(theme=theme),
+                "theme": theme,
+                "score": len(concepts) * avg_conf,  # Rank metric
+            }
+        )
 
     # Rank by score, take top N
     clusters.sort(key=lambda c: c["score"], reverse=True)
@@ -305,6 +308,7 @@ def _check_dedup(synthesis_text: str, knowledge_area: str) -> tuple[bool, float]
     """
     try:
         from app.retrieval import retrieval_engine
+
         # Use embedding cosine similarity — blended relevance_score caps at ~0.55
         # for near-duplicates, making the old 0.85 threshold unreachable.
         results = retrieval_engine.search_for_dedup_embedding(synthesis_text, top_k=5)
@@ -344,15 +348,17 @@ def _create_synthesized_concept(
                     evidence_list.append(ev)
 
         # Add synthesis provenance evidence
-        evidence_list.append(Evidence(
-            source_type="synthesis",
-            content=f"Auto-synthesized from {len(source_concept_ids)} L1 concepts by Phase 7 (cycle {cycle_id}). Reason: {synthesis['reason']}",
-            reliability_weight=0.5,
-            directness=0.4,
-            consistency=0.7,
-            extraction_source="synthesis_engine",
-            timestamp=_utc_now_iso(),
-        ))
+        evidence_list.append(
+            Evidence(
+                source_type="synthesis",
+                content=f"Auto-synthesized from {len(source_concept_ids)} L1 concepts by Phase 7 (cycle {cycle_id}). Reason: {synthesis['reason']}",
+                reliability_weight=0.5,
+                directness=0.4,
+                consistency=0.7,
+                extraction_source="synthesis_engine",
+                timestamp=_utc_now_iso(),
+            )
+        )
 
         concept = Concept(
             id=concept_id,
@@ -375,7 +381,9 @@ def _create_synthesized_concept(
         save_concept(concept)
         logger.info(
             "REFLECT-030: Created synthesized concept %s (%s) in %s: %s",
-            concept_id, synthesis["concept_type"], cluster_knowledge_area,
+            concept_id,
+            synthesis["concept_type"],
+            cluster_knowledge_area,
             synthesis["synthesis"][:100],
         )
         return concept_id
@@ -424,10 +432,16 @@ def _link_to_sources(synth_concept_id: str, source_ids: list[str]) -> int:
             now = _utc_now_iso()
             rows = []
             for src_id in source_ids:
-                rows.append((
-                    synth_concept_id, src_id, "synthesized_from",
-                    0.8, now, "synthesis_engine",
-                ))
+                rows.append(
+                    (
+                        synth_concept_id,
+                        src_id,
+                        "synthesized_from",
+                        0.8,
+                        now,
+                        "synthesis_engine",
+                    )
+                )
             if rows:
                 conn.executemany(
                     """INSERT OR IGNORE INTO associations
@@ -468,9 +482,16 @@ def _record_synthesis_cycle(
                     total_ms, details)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    cycle_id, _utc_now_iso(), clusters_evaluated, clusters_meaningful,
-                    concepts_created, concepts_deduplicated, llm_calls, llm_failures,
-                    round(total_ms, 1), json.dumps(details) if details else None,
+                    cycle_id,
+                    _utc_now_iso(),
+                    clusters_evaluated,
+                    clusters_meaningful,
+                    concepts_created,
+                    concepts_deduplicated,
+                    llm_calls,
+                    llm_failures,
+                    round(total_ms, 1),
+                    json.dumps(details) if details else None,
                 ),
             )
     except Exception as e:
@@ -514,7 +535,9 @@ async def run_synthesis() -> dict:
         # Mark all candidates as evaluated even if no clusters formed
         all_ids = [c["id"] for c in candidates]
         _mark_evaluated(all_ids)
-        logger.info("REFLECT-030: No clusters met minimum size (%d) — marking %d evaluated", MIN_CLUSTER_SIZE, len(all_ids))
+        logger.info(
+            "REFLECT-030: No clusters met minimum size (%d) — marking %d evaluated", MIN_CLUSTER_SIZE, len(all_ids)
+        )
         return {"status": "completed", "reason": "no_qualifying_clusters", "candidates": len(candidates)}
 
     # 7.3-7.5 Process each cluster
@@ -525,14 +548,17 @@ async def run_synthesis() -> dict:
         "concepts_deduplicated": 0,
         "llm_calls": 0,
         "llm_failures": 0,
+        "creation_failures": 0,
         "cluster_details": [],
     }
 
     for cluster in clusters:
+        source_ids = [c["id"] for c in cluster["concepts"]]
         cluster_detail = {
             "knowledge_area": cluster["knowledge_area"],
             "concept_count": len(cluster["concepts"]),
             "theme": cluster["theme"],
+            "source_ids": source_ids,
         }
         stats["clusters_evaluated"] += 1
 
@@ -545,9 +571,9 @@ async def run_synthesis() -> dict:
         except Exception as e:
             stats["llm_failures"] += 1
             cluster_detail["status"] = f"llm_error: {e}"
+            cluster_detail["retry_eligible"] = True
             stats["cluster_details"].append(cluster_detail)
-            # Still mark these L1s as evaluated to prevent retry
-            _mark_evaluated([c["id"] for c in cluster["concepts"]])
+            # Failed attempts must not advance the terminal evaluation watermark.
             continue
 
         # Parse response
@@ -563,15 +589,15 @@ async def run_synthesis() -> dict:
         except (json.JSONDecodeError, ValueError) as e:
             stats["llm_failures"] += 1
             cluster_detail["status"] = f"parse_error: {e}"
+            cluster_detail["retry_eligible"] = True
             stats["cluster_details"].append(cluster_detail)
-            _mark_evaluated([c["id"] for c in cluster["concepts"]])
             continue
 
         # Check meaningfulness
         if not synthesis["meaningful"]:
             cluster_detail["status"] = f"not_meaningful: {synthesis['reason']}"
             stats["cluster_details"].append(cluster_detail)
-            _mark_evaluated([c["id"] for c in cluster["concepts"]])
+            _mark_evaluated(source_ids)
             continue
 
         stats["clusters_meaningful"] += 1
@@ -582,13 +608,15 @@ async def run_synthesis() -> dict:
             stats["concepts_deduplicated"] += 1
             cluster_detail["status"] = f"deduplicated (sim={sim_score:.3f})"
             stats["cluster_details"].append(cluster_detail)
-            _mark_evaluated([c["id"] for c in cluster["concepts"]])
+            _mark_evaluated(source_ids)
             continue
 
         # Create concept
-        source_ids = [c["id"] for c in cluster["concepts"]]
         concept_id = _create_synthesized_concept(
-            synthesis, source_ids, cluster["knowledge_area"], cycle_id,
+            synthesis,
+            source_ids,
+            cluster["knowledge_area"],
+            cycle_id,
         )
 
         if concept_id:
@@ -596,13 +624,13 @@ async def run_synthesis() -> dict:
             _link_to_sources(concept_id, source_ids)
             cluster_detail["status"] = f"created: {concept_id}"
             cluster_detail["synthesis"] = synthesis["synthesis"][:100]
+            _mark_evaluated(source_ids)
         else:
+            stats["creation_failures"] += 1
             cluster_detail["status"] = "creation_failed"
+            cluster_detail["retry_eligible"] = True
 
         stats["cluster_details"].append(cluster_detail)
-
-        # 7.45 Mark source L1s as evaluated
-        _mark_evaluated(source_ids)
 
     # 7.6 Record tracking
     total_ms = (time.monotonic() - t0) * 1000
@@ -626,8 +654,7 @@ async def run_synthesis() -> dict:
         total_ms,
         labels={"model": MODEL, "call_site": "synthesis"},
     )
-    metrics.record("synthesis_meaningful_rate",
-                    stats["clusters_meaningful"] / max(1, stats["clusters_evaluated"]))
+    metrics.record("synthesis_meaningful_rate", stats["clusters_meaningful"] / max(1, stats["clusters_evaluated"]))
 
     logger.info(
         "REFLECT-030: Phase 7 complete in %.1fs — %d clusters, %d meaningful, "
@@ -641,7 +668,7 @@ async def run_synthesis() -> dict:
     )
 
     return {
-        "status": "completed",
+        "status": "error" if stats["creation_failures"] else "completed",
         "cycle_id": cycle_id,
         "clusters_evaluated": stats["clusters_evaluated"],
         "clusters_meaningful": stats["clusters_meaningful"],
@@ -649,5 +676,6 @@ async def run_synthesis() -> dict:
         "concepts_deduplicated": stats["concepts_deduplicated"],
         "llm_calls": stats["llm_calls"],
         "llm_failures": stats["llm_failures"],
+        "creation_failures": stats["creation_failures"],
         "total_ms": round(total_ms, 1),
     }

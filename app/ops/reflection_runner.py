@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -37,6 +38,54 @@ _DEFAULT_RETRY_AFTER_SECONDS = 30
 _DEFAULT_MIN_FREE_BYTES = 1024 * 1024 * 1024
 _REFLECTION_FULL_SOURCE = "reflection_full"
 _REFLECTION_FULL_STAGE = "reflect"
+
+
+class _SpawnedWorker:
+    """Minimal child handle for native spawn, without a Python fork callback."""
+
+    def __init__(self, command: list[str], env: dict[str, str]) -> None:
+        # Change cwd only in the fresh interpreter; never mutate the server cwd.
+        bootstrap = (
+            "import os,runpy,sys; os.chdir(sys.argv.pop(1)); "
+            "sys.path.insert(0,os.getcwd()); "
+            "runpy.run_module('app.ops.reflection_worker',run_name='__main__')"
+        )
+        self.args = [command[0], "-c", bootstrap, str(_REPO_ROOT), *command[3:]]
+        self.returncode: int | None = None
+        actions = [
+            (os.POSIX_SPAWN_OPEN, fd, os.devnull, os.O_RDONLY if fd == 0 else os.O_WRONLY, 0) for fd in (0, 1, 2)
+        ]
+        self.pid = os.posix_spawn(command[0], self.args, env, file_actions=actions, setsid=True)
+
+    def wait(self, timeout: float | None = None) -> int:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while self.returncode is None:
+            pid, status = os.waitpid(self.pid, os.WNOHANG)
+            if pid:
+                self.returncode = os.waitstatus_to_exitcode(status)
+                break
+            if deadline is not None and time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired(self.args, timeout)
+            time.sleep(0.05)
+        return self.returncode
+
+    def kill(self) -> None:
+        if self.returncode is None:
+            os.kill(self.pid, signal.SIGKILL)
+
+
+def _start_worker(command: list[str], env: dict[str, str]):
+    if should_suppress_optional_subprocess("reflection_worker"):
+        # Failure of safe spawn must never fall back to a guarded fork path.
+        return _SpawnedWorker(command, env)
+    return subprocess.Popen(
+        command,
+        cwd=str(_REPO_ROOT),
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
 
 
 def _env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
@@ -192,7 +241,9 @@ class ReflectionRunner:
                         active_snapshot=active_snapshot,
                     )
                 except Exception as exc:
-                    logger.exception("Reflection run failed: run_id=%s mode=%s source=%s", run_id, request.mode, request.source)
+                    logger.exception(
+                        "Reflection run failed: run_id=%s mode=%s source=%s", run_id, request.mode, request.source
+                    )
                     self._record_metric("reflection_run_failed", request, status="failed")
                     return self._finish_failed(run_id, request, started_at, started_monotonic, exc, active_snapshot)
                 finally:
@@ -253,14 +304,7 @@ class ReflectionRunner:
         env = os.environ.copy()
         env["PITH_REFLECTION_WORKER_RUN_ID"] = run_id
         try:
-            process = subprocess.Popen(
-                command,
-                cwd=str(_REPO_ROOT),
-                env=env,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
+            process = _start_worker(command, env)
         except Exception as exc:
             self._clear_active_run(run_id)
             self._thread_lock.release()
@@ -351,16 +395,11 @@ class ReflectionRunner:
         ]
         env = os.environ.copy()
         env["PITH_REFLECTION_WORKER_RUN_ID"] = selected_run_id
-        process: subprocess.Popen | None = None
+        process = None
         try:
-            process = subprocess.Popen(
-                command,
-                cwd=str(_REPO_ROOT),
-                env=env,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
+            # A retry must prove its own completion, not reuse an old artifact.
+            output_path.unlink(missing_ok=True)
+            process = _start_worker(command, env)
             active_snapshot = self._update_active_run(
                 selected_run_id,
                 {
@@ -382,13 +421,13 @@ class ReflectionRunner:
                     process.wait(timeout=10)
                 raise TimeoutError(f"reflection_worker_timeout_after_{timeout_seconds}s") from exc
 
-            payload: dict[str, Any] = {}
+            payload: dict[str, Any] = {"status": "failed", "error": "worker_output_missing"}
             if output_path.exists():
                 try:
                     payload = json.loads(output_path.read_text(encoding="utf-8"))
                 except Exception as exc:
                     payload = {"status": "failed", "error": f"worker_output_invalid: {exc}"}
-            status = str(payload.get("status") or ("completed" if exit_code == 0 else "failed"))
+            status = str(payload.get("status") or "failed")
             if exit_code != 0 and status == "completed":
                 status = "failed"
             self._update_active_run(
@@ -510,7 +549,7 @@ class ReflectionRunner:
         )
 
     def _check_worker_fork_safety(self) -> ReflectionAdmission:
-        if not should_suppress_optional_subprocess("reflection_worker"):
+        if not should_suppress_optional_subprocess("reflection_worker") or callable(getattr(os, "posix_spawn", None)):
             return ReflectionAdmission(accepted=True)
         return ReflectionAdmission(
             accepted=False,

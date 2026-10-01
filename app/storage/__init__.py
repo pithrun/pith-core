@@ -63,14 +63,17 @@ from app.storage.concepts import (  # noqa: F401
     add_association,
     add_associations_bulk,
     add_typed_association,
+    apply_current_governance_currency_conn,
     apply_lifecycle_transition_conn,
     archive_concept,
     count_associations,
     count_orphan_concepts,
     get_adjacency_graph,
     get_all_association_triples,
+    get_associated_concept_ids,
     get_association_triples_for_pairs,
     get_knowledge_area_map,
+    get_knowledge_area_map_for_ids,
     get_next_version,
     get_next_version_conn,
     get_related_concepts,
@@ -105,6 +108,7 @@ from app.storage.sessions import (  # noqa: F401
     load_active_sessions_by_origin,
     load_session,
     load_session_velocity,
+    mark_session_reflection_completed,
     recover_interrupted_sessions,
     save_session,
     update_session,
@@ -152,6 +156,7 @@ from app.storage.queries import (  # noqa: F401
     load_firmware,
     load_recent_concepts,
     load_recent_concepts_by_types,
+    load_unlinked_concept_window,
     save_firmware,
     set_always_activate,
     set_metadata,
@@ -318,7 +323,8 @@ def load_write_request_replay(endpoint: str, profile: str, request_id: str) -> d
     with _db() as conn:
         row = conn.execute(
             "SELECT status, response_json, request_json, attempt_count, last_error, "
-            "lease_owner, lease_expires_at, next_retry_at, updated_at FROM write_request_replays "
+            "lease_owner, lease_expires_at, next_retry_at, binding_hash, session_id, "
+            "external_request_id, request_hash, claim_token, updated_at FROM write_request_replays "
             "WHERE endpoint=? AND profile=? AND request_id=?",
             (endpoint, profile, request_id),
         ).fetchone()
@@ -335,8 +341,33 @@ def load_write_request_replay(endpoint: str, profile: str, request_id: str) -> d
         "lease_owner": data.get("lease_owner"),
         "lease_expires_at": data.get("lease_expires_at"),
         "next_retry_at": data.get("next_retry_at"),
+        "binding_hash": data.get("binding_hash"),
+        "session_id": data.get("session_id"),
+        "external_request_id": data.get("external_request_id"),
+        "request_hash": data.get("request_hash"),
+        "claim_token": data.get("claim_token"),
         "updated_at": data["updated_at"],
     }
+
+
+def load_managed_write_request_replays_for_episode(
+    endpoint: str,
+    profile: str,
+    binding_hash: str,
+    session_id: str,
+    *,
+    status: str = "processing",
+) -> list[dict]:
+    """Load replay authorities for one exact managed episode."""
+
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT request_id, external_request_id, request_hash, claim_token, status, updated_at "
+            "FROM write_request_replays WHERE endpoint=? AND profile=? AND binding_hash=? "
+            "AND session_id=? AND status=? ORDER BY created_at, request_id",
+            (endpoint, profile, binding_hash, session_id, status),
+        ).fetchall()
+    return [_write_replay_row_to_dict(row) for row in rows]
 
 
 def insert_write_request_processing(
@@ -345,15 +376,59 @@ def insert_write_request_processing(
     request_id: str,
     now: str,
     request_payload: dict | None = None,
-) -> None:
+    *,
+    binding_hash: str | None = None,
+    session_id: str | None = None,
+    external_request_id: str | None = None,
+    request_hash: str | None = None,
+    claim_token: str | None = None,
+) -> int:
+    from contextlib import nullcontext
+
+    from app.storage.session_bindings import ManagedQueuePermit, managed_queue_write_permit
+
+    managed_values = (binding_hash, session_id, external_request_id, request_hash, claim_token)
+    if any(value is not None for value in managed_values) and not all(value is not None for value in managed_values):
+        raise ValueError("managed write replay metadata must be complete")
     request_json = _json.dumps(request_payload) if request_payload is not None else None
-    with _db() as conn:
-        conn.execute(
-            "INSERT INTO write_request_replays(endpoint, profile, request_id, status, response_json, request_json, "
-            "attempt_count, last_error, lease_owner, lease_expires_at, next_retry_at, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (endpoint, profile, request_id, "processing", None, request_json, 0, None, None, None, None, now, now),
+    permit = (
+        managed_queue_write_permit(
+            ManagedQueuePermit(
+                table_name="write_request_replays",
+                binding_hash=binding_hash,
+            )
         )
+        if binding_hash is not None
+        else nullcontext()
+    )
+    with permit, _db() as conn:
+        cursor = conn.execute(
+            "INSERT INTO write_request_replays(endpoint, profile, request_id, status, response_json, request_json, "
+            "attempt_count, last_error, lease_owner, lease_expires_at, next_retry_at, binding_hash, session_id, "
+            "external_request_id, request_hash, claim_token, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                endpoint,
+                profile,
+                request_id,
+                "processing",
+                None,
+                request_json,
+                0,
+                None,
+                None,
+                None,
+                None,
+                binding_hash,
+                session_id,
+                external_request_id,
+                request_hash,
+                claim_token,
+                now,
+                now,
+            ),
+        )
+        return int(cursor.rowcount or 0)
 
 
 def mark_write_request_processing(
@@ -362,22 +437,56 @@ def mark_write_request_processing(
     request_id: str,
     now: str,
     request_payload: dict | None = None,
-) -> None:
+    *,
+    binding_hash: str | None = None,
+    expected_claim_token: str | None = None,
+    new_claim_token: str | None = None,
+) -> int:
+    from contextlib import nullcontext
+
+    from app.storage.session_bindings import ManagedQueuePermit, managed_queue_write_permit
+
+    if binding_hash is not None and (expected_claim_token is None or new_claim_token is None):
+        raise ValueError("managed replay reclaim requires expected and new claim tokens")
     request_json = _json.dumps(request_payload) if request_payload is not None else None
-    with _db() as conn:
+    permit = (
+        managed_queue_write_permit(
+            ManagedQueuePermit(
+                table_name="write_request_replays",
+                binding_hash=binding_hash,
+                claim_token=expected_claim_token,
+            )
+        )
+        if binding_hash is not None
+        else nullcontext()
+    )
+    with permit, _db() as conn:
+        managed_where = " AND binding_hash=? AND claim_token=?" if binding_hash is not None else ""
+        managed_params = (binding_hash, expected_claim_token) if binding_hash is not None else ()
         if request_json is None:
-            conn.execute(
-                "UPDATE write_request_replays SET status=?, response_json=NULL, lease_owner=NULL, lease_expires_at=NULL, updated_at=? "
-                "WHERE endpoint=? AND profile=? AND request_id=?",
-                ("processing", now, endpoint, profile, request_id),
+            cursor = conn.execute(
+                "UPDATE write_request_replays SET status=?, response_json=NULL, lease_owner=NULL, lease_expires_at=NULL, "
+                "claim_token=COALESCE(?, claim_token), updated_at=? "
+                "WHERE endpoint=? AND profile=? AND request_id=?" + managed_where,
+                ("processing", new_claim_token, now, endpoint, profile, request_id, *managed_params),
             )
         else:
-            conn.execute(
+            cursor = conn.execute(
                 "UPDATE write_request_replays SET status=?, response_json=NULL, request_json=COALESCE(request_json, ?), "
-                "lease_owner=NULL, lease_expires_at=NULL, updated_at=? "
-                "WHERE endpoint=? AND profile=? AND request_id=?",
-                ("processing", request_json, now, endpoint, profile, request_id),
+                "lease_owner=NULL, lease_expires_at=NULL, claim_token=COALESCE(?, claim_token), updated_at=? "
+                "WHERE endpoint=? AND profile=? AND request_id=?" + managed_where,
+                (
+                    "processing",
+                    request_json,
+                    new_claim_token,
+                    now,
+                    endpoint,
+                    profile,
+                    request_id,
+                    *managed_params,
+                ),
             )
+        return int(cursor.rowcount or 0)
 
 
 def commit_write_request_replay(
@@ -386,14 +495,37 @@ def commit_write_request_replay(
     request_id: str,
     response: dict,
     now: str,
-) -> None:
-    with _db() as conn:
-        conn.execute(
-            "UPDATE write_request_replays SET status=?, response_json=?, request_json=NULL, "
-            "last_error=NULL, lease_owner=NULL, lease_expires_at=NULL, next_retry_at=NULL, updated_at=? "
-            "WHERE endpoint=? AND profile=? AND request_id=?",
-            ("committed", _json.dumps(response), now, endpoint, profile, request_id),
+    *,
+    binding_hash: str | None = None,
+    expected_claim_token: str | None = None,
+) -> int:
+    from contextlib import nullcontext
+
+    from app.storage.session_bindings import ManagedQueuePermit, managed_queue_write_permit
+
+    if binding_hash is not None and expected_claim_token is None:
+        raise ValueError("managed replay commit requires expected claim token")
+    permit = (
+        managed_queue_write_permit(
+            ManagedQueuePermit(
+                table_name="write_request_replays",
+                binding_hash=binding_hash,
+                claim_token=expected_claim_token,
+            )
         )
+        if binding_hash is not None
+        else nullcontext()
+    )
+    managed_where = " AND binding_hash=? AND claim_token=?" if binding_hash is not None else ""
+    managed_params = (binding_hash, expected_claim_token) if binding_hash is not None else ()
+    with permit, _db() as conn:
+        cursor = conn.execute(
+            "UPDATE write_request_replays SET status=?, response_json=?, request_json=NULL, "
+            "last_error=NULL, lease_owner=NULL, lease_expires_at=NULL, next_retry_at=NULL, claim_token=NULL, updated_at=? "
+            "WHERE endpoint=? AND profile=? AND request_id=?" + managed_where,
+            ("committed", _json.dumps(response), now, endpoint, profile, request_id, *managed_params),
+        )
+        return int(cursor.rowcount or 0)
 
 
 def fail_write_request_replay(
@@ -403,18 +535,49 @@ def fail_write_request_replay(
     response: dict,
     now: str,
     error_class: str,
+    *,
+    binding_hash: str | None = None,
+    expected_claim_token: str | None = None,
 ) -> int:
+    from contextlib import nullcontext
+
+    from app.storage.session_bindings import ManagedQueuePermit, managed_queue_write_permit
+
+    if binding_hash is not None and expected_claim_token is None:
+        raise ValueError("managed replay failure requires expected claim token")
     payload = dict(response)
     payload.setdefault("status", "failed")
     payload.setdefault("persistence_state", "failed")
     payload.setdefault("request_id", request_id)
     payload.setdefault("error_class", error_class)
-    with _db() as conn:
+    permit = (
+        managed_queue_write_permit(
+            ManagedQueuePermit(
+                table_name="write_request_replays",
+                binding_hash=binding_hash,
+                claim_token=expected_claim_token,
+            )
+        )
+        if binding_hash is not None
+        else nullcontext()
+    )
+    managed_where = " AND binding_hash=? AND claim_token=?" if binding_hash is not None else ""
+    managed_params = (binding_hash, expected_claim_token) if binding_hash is not None else ()
+    with permit, _db() as conn:
         cur = conn.execute(
             "UPDATE write_request_replays SET status=?, response_json=?, request_json=NULL, "
-            "last_error=?, lease_owner=NULL, lease_expires_at=NULL, next_retry_at=NULL, updated_at=? "
-            "WHERE endpoint=? AND profile=? AND request_id=?",
-            ("failed", _json.dumps(payload), error_class[:1000], now, endpoint, profile, request_id),
+            "last_error=?, lease_owner=NULL, lease_expires_at=NULL, next_retry_at=NULL, claim_token=NULL, updated_at=? "
+            "WHERE endpoint=? AND profile=? AND request_id=?" + managed_where,
+            (
+                "failed",
+                _json.dumps(payload),
+                error_class[:1000],
+                now,
+                endpoint,
+                profile,
+                request_id,
+                *managed_params,
+            ),
         )
         return int(cur.rowcount or 0)
 
@@ -422,7 +585,8 @@ def fail_write_request_replay(
 def delete_processing_write_request(endpoint: str, profile: str, request_id: str) -> None:
     with _db() as conn:
         conn.execute(
-            "DELETE FROM write_request_replays WHERE endpoint=? AND profile=? AND request_id=? AND status=?",
+            "DELETE FROM write_request_replays WHERE endpoint=? AND profile=? AND request_id=? AND status=? "
+            "AND binding_hash IS NULL",
             (endpoint, profile, request_id, "processing"),
         )
 
@@ -443,6 +607,7 @@ def fail_unrecoverable_stale_write_requests(
             """SELECT request_id
                FROM write_request_replays
                WHERE endpoint=? AND profile=? AND status='processing'
+                 AND binding_hash IS NULL
                  AND updated_at < ?
                  AND request_json IS NULL
                ORDER BY updated_at
@@ -462,7 +627,7 @@ def fail_unrecoverable_stale_write_requests(
                 "UPDATE write_request_replays SET status=?, response_json=?, request_json=NULL, "
                 "last_error=?, lease_owner=NULL, lease_expires_at=NULL, next_retry_at=NULL, updated_at=? "
                 "WHERE endpoint=? AND profile=? AND request_id=? AND status='processing' "
-                "AND updated_at < ? AND request_json IS NULL",
+                "AND binding_hash IS NULL AND updated_at < ? AND request_json IS NULL",
                 (
                     "failed",
                     _json.dumps(response),
@@ -491,12 +656,15 @@ def record_checkpoint_save_event(session_id: str | None, task_id: str) -> None:
         )
 
 
-def summarize_write_request_processing(endpoint: str, profile: str, stale_before_iso: str, max_attempts: int = 3) -> dict:
+def summarize_write_request_processing(
+    endpoint: str, profile: str, stale_before_iso: str, max_attempts: int = 3
+) -> dict:
     with _db() as conn:
         rows = conn.execute(
             """SELECT request_id, updated_at, request_json, attempt_count
                FROM write_request_replays
                WHERE endpoint=? AND profile=? AND status=?
+                 AND binding_hash IS NULL
                ORDER BY updated_at""",
             (endpoint, profile, "processing"),
         ).fetchall()
@@ -549,6 +717,7 @@ def claim_stale_write_requests(
             """SELECT endpoint, profile, request_id, request_json, attempt_count, updated_at
                FROM write_request_replays
                WHERE endpoint=? AND profile=? AND status='processing'
+                 AND binding_hash IS NULL
                  AND updated_at < ?
                  AND request_json IS NOT NULL
                  AND (next_retry_at IS NULL OR next_retry_at <= ?)
@@ -569,6 +738,7 @@ def claim_stale_write_requests(
                        updated_at=?
                    WHERE endpoint=? AND profile=? AND request_id=?
                      AND status='processing'
+                     AND binding_hash IS NULL
                      AND updated_at < ?
                      AND request_json IS NOT NULL
                      AND (next_retry_at IS NULL OR next_retry_at <= ?)
@@ -608,6 +778,7 @@ def mark_write_request_reclaim_failed(
         conn.execute(
             """UPDATE write_request_replays
                SET last_error=?, next_retry_at=?, lease_owner=NULL, lease_expires_at=NULL, updated_at=?
-               WHERE endpoint=? AND profile=? AND request_id=? AND status='processing'""",
+               WHERE endpoint=? AND profile=? AND request_id=? AND status='processing'
+                 AND binding_hash IS NULL""",
             (last_error[:1000], next_retry_at, now, endpoint, profile, request_id),
         )

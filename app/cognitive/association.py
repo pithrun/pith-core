@@ -8,10 +8,14 @@ similarity. Two-tier strategy:
 Created in Phase 1.3. All edges use "related_to" relation type.
 """
 
+import json
 import logging
+import threading
 import time
+import uuid
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+from contextlib import nullcontext
+from datetime import UTC, datetime, timedelta, timezone
 
 from app.core.metrics_facade import metrics
 from app.core.models import (
@@ -25,58 +29,300 @@ from app.retrieval import retrieval_engine
 from app.storage import (
     add_association,
     count_orphan_concepts,
-    get_all_association_triples,
+    get_associated_concept_ids,
     get_association_triples_for_pairs,
-    get_knowledge_area_map,
-    list_concepts,
+    get_knowledge_area_map_for_ids,
+    get_metadata,
     load_concept,
+    load_concepts_batch,
+    load_unlinked_concept_window,
+    set_metadata,
 )
 
 logger = logging.getLogger("pith.association")
 
+_AUTO_ASSOCIATE_INVOCATION_SOURCES = frozenset({"api", "async_task", "maintenance", "direct"})
+_UNLINKED_CURSOR_KEY = "association_discovery_unlinked_cursor_v1"
+_UNLINKED_ASSOCIATION_LOCK = threading.Lock()
 
-def auto_associate_batch(request: AutoAssociateBatchRequest) -> AutoAssociateBatchResponse:
-    """Run two-tier auto-association pipeline on all active concepts.
 
-    Steps:
-      A. Sync TF-IDF index (ensure all concepts indexed)
-      B. Compute pairwise cosine similarity at tier2 threshold (captures all candidates)
-      C. Tier 1 pass — text similarity edges (cosine >= tier1_threshold)
-      D. Tier 2 pass — domain-boosted edges for remaining orphans
-      E. Bulk insert edges (or skip if dry_run)
-      F. Return stats
-    """
-    start_time = time.time()
+def _parse_unlinked_cursor(value: str | None) -> tuple[str, str] | None:
+    if not value:
+        return None
+    try:
+        payload = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        logger.warning("Ignoring malformed unlinked association cursor")
+        return None
+    if not isinstance(payload, dict):
+        logger.warning("Ignoring non-object unlinked association cursor")
+        return None
+    created_at = payload.get("created_at")
+    concept_id = payload.get("concept_id")
+    if (
+        not isinstance(created_at, str)
+        or not created_at
+        or len(created_at) > 64
+        or not isinstance(concept_id, str)
+        or not concept_id
+        or len(concept_id) > 256
+    ):
+        logger.warning("Ignoring invalid unlinked association cursor fields")
+        return None
+    return created_at, concept_id
 
-    # --- Step A: Index sync ---
-    index_synced = retrieval_engine.sync_index()
 
-    # --- Baseline metrics ---
-    orphans_before = count_orphan_concepts()
-    existing_edges = get_all_association_triples()
+def _serialize_unlinked_cursor(created_at: str, concept_id: str) -> str:
+    return json.dumps(
+        {"concept_id": concept_id, "created_at": created_at},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
-    # --- Step B: Compute pairwise similarity ---
-    # Use the lower threshold to capture all candidate pairs for both tiers
+
+def _unlinked_age_buckets(rows: list[dict]) -> dict[str, int]:
+    buckets = {"under_1d": 0, "1d_to_7d": 0, "7d_to_30d": 0, "over_30d": 0}
+    now = datetime.now(UTC)
+    for row in rows:
+        try:
+            created = datetime.fromisoformat(str(row["created_at"]).replace("Z", "+00:00"))
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=UTC)
+            age = now - created
+        except (KeyError, TypeError, ValueError):
+            continue
+        if age < timedelta(days=1):
+            buckets["under_1d"] += 1
+        elif age < timedelta(days=7):
+            buckets["1d_to_7d"] += 1
+        elif age < timedelta(days=30):
+            buckets["7d_to_30d"] += 1
+        else:
+            buckets["over_30d"] += 1
+    return buckets
+
+
+def _generate_unlinked_pairs(
+    request: AutoAssociateBatchRequest,
+    selected_rows: list[dict],
+) -> tuple[list[tuple[str, str, float]], set[str], set[str], int]:
+    """Generate bounded TF-IDF candidate pairs for selected unlinked concepts."""
+    selected_ids = [row["concept_id"] for row in selected_rows]
+    concept_map = load_concepts_batch(selected_ids)
+    if selected_ids and not concept_map:
+        raise RuntimeError("all selected unlinked association concepts were unavailable")
+    unavailable_ids = {concept_id for concept_id in selected_ids if concept_id not in concept_map}
     lower_threshold = request.tier2_threshold if request.tier2_enabled else request.tier1_threshold
-    all_pairs = retrieval_engine.pairwise_similarity(threshold=lower_threshold)
-    pairs_evaluated = len(all_pairs)
+    pair_scores: dict[tuple[str, str], float] = {}
+    pairs_evaluated = 0
+    searches_succeeded = 0
+    search_failures = 0
 
-    # --- Build knowledge_area map for Tier 2 ---
-    ka_map = {}
+    for concept_id in selected_ids:
+        concept = concept_map.get(concept_id)
+        if concept is None:
+            continue
+        try:
+            query_text = retrieval_engine._concept_to_document(concept)
+            raw_results = retrieval_engine.index.search(
+                query_text,
+                top_k=request.max_candidates_per_concept + 1,
+            )
+        except Exception as exc:
+            unavailable_ids.add(concept_id)
+            search_failures += 1
+            logger.warning("Unlinked association search failed for one concept: %s", type(exc).__name__)
+            continue
+
+        searches_succeeded += 1
+        candidates_seen = 0
+        for result_id, score_value in raw_results:
+            if result_id == concept_id:
+                continue
+            if candidates_seen >= request.max_candidates_per_concept:
+                break
+            candidates_seen += 1
+            pairs_evaluated += 1
+            score = float(score_value)
+            if score < lower_threshold:
+                continue
+            source, target = sorted((concept_id, result_id))
+            pair_scores[(source, target)] = max(score, pair_scores.get((source, target), 0.0))
+
+    if search_failures and searches_succeeded == 0:
+        raise RuntimeError("all hydrated unlinked association searches failed")
+
+    all_pairs = [
+        (source, target, round(score, 4))
+        for (source, target), score in pair_scores.items()
+    ]
+    all_pairs.sort(key=lambda pair: pair[2], reverse=True)
+    return all_pairs, set(selected_ids), unavailable_ids, pairs_evaluated
+
+
+def _auto_associate_metric_labels(
+    invocation_source: str,
+    batch_run_id: str,
+    parent_run_id: str | int | None,
+    **extra: str | int | float,
+) -> dict[str, str | int | float]:
+    source = invocation_source if invocation_source in _AUTO_ASSOCIATE_INVOCATION_SOURCES else "direct"
+    labels: dict[str, str | int | float] = {
+        "invocation_source": source,
+        "batch_run_id": batch_run_id,
+    }
+    if parent_run_id is not None:
+        labels["parent_run_id"] = str(parent_run_id)[:64]
+    labels.update(extra)
+    return labels
+
+
+def _record_auto_associate_phase(
+    phase: str,
+    started_at: float,
+    labels: dict[str, str | int | float],
+) -> None:
+    metrics.record(
+        "auto_associate_batch_phase_latency_ms",
+        round((time.perf_counter() - started_at) * 1000, 2),
+        {**labels, "phase": phase},
+    )
+
+
+def auto_associate_batch(
+    request: AutoAssociateBatchRequest,
+    *,
+    invocation_source: str = "direct",
+    parent_run_id: str | int | None = None,
+) -> AutoAssociateBatchResponse:
+    """Run two-tier auto-association with candidate-bounded decision state."""
+    lock = _UNLINKED_ASSOCIATION_LOCK if request.selection_mode == "unlinked" else nullcontext()
+    with lock:
+        return _auto_associate_batch_impl(
+            request,
+            invocation_source=invocation_source,
+            parent_run_id=parent_run_id,
+        )
+
+
+def _auto_associate_batch_impl(
+    request: AutoAssociateBatchRequest,
+    *,
+    invocation_source: str,
+    parent_run_id: str | int | None,
+) -> AutoAssociateBatchResponse:
+    start_time = time.perf_counter()
+    batch_run_id = uuid.uuid4().hex
+    labels = _auto_associate_metric_labels(
+        invocation_source,
+        batch_run_id,
+        parent_run_id,
+        dry_run="true" if request.dry_run else "false",
+        selection_mode=request.selection_mode,
+    )
+
+    phase_start = time.perf_counter()
+    index_synced = retrieval_engine.sync_index()
+    _record_auto_associate_phase("index_sync", phase_start, labels)
+
+    phase_start = time.perf_counter()
+    orphans_before = count_orphan_concepts()
+    _record_auto_associate_phase("orphan_count_before", phase_start, labels)
+
+    selected_rows: list[dict] = []
+    selected_ids: set[str] = set()
+    unavailable_ids: set[str] = set()
+    concepts_available = 0
+    concept_budget_exhausted = False
+    cursor_start = None
+    cursor_end = None
+    age_buckets = {"under_1d": 0, "1d_to_7d": 0, "7d_to_30d": 0, "over_30d": 0}
+
+    phase_start = time.perf_counter()
+    if request.selection_mode == "unlinked":
+        parsed_cursor = _parse_unlinked_cursor(get_metadata(_UNLINKED_CURSOR_KEY))
+        if parsed_cursor:
+            cursor_start = _serialize_unlinked_cursor(*parsed_cursor)
+        window = load_unlinked_concept_window(
+            request.max_concepts_evaluated,
+            parsed_cursor[0] if parsed_cursor else None,
+            parsed_cursor[1] if parsed_cursor else None,
+        )
+        selected_rows = list(window["rows"])
+        concepts_available = int(window["available"])
+        concept_budget_exhausted = concepts_available > len(selected_rows)
+        age_buckets = _unlinked_age_buckets(selected_rows)
+        candidate_search_started = time.perf_counter()
+        all_pairs, selected_ids, unavailable_ids, pairs_evaluated = _generate_unlinked_pairs(
+            request,
+            selected_rows,
+        )
+        candidate_search_ms = round((time.perf_counter() - candidate_search_started) * 1000, 2)
+        pairs_available = pairs_evaluated
+        pair_budget_exhausted = False
+        if selected_rows:
+            last_row = selected_rows[-1]
+            cursor_end = _serialize_unlinked_cursor(last_row["created_at"], last_row["concept_id"])
+    else:
+        lower_threshold = request.tier2_threshold if request.tier2_enabled else request.tier1_threshold
+        candidate_search_started = time.perf_counter()
+        all_pairs = retrieval_engine.pairwise_similarity(
+            threshold=lower_threshold,
+            max_pairs_evaluated=request.max_pairs_evaluated,
+        )
+        candidate_search_ms = round((time.perf_counter() - candidate_search_started) * 1000, 2)
+        pairwise_stats = getattr(retrieval_engine, "_last_pairwise_similarity_stats", {}) or {}
+        pairs_evaluated = int(pairwise_stats.get("pairs_evaluated", len(all_pairs)))
+        pairs_available = int(pairwise_stats.get("pairs_available", pairs_evaluated))
+        pair_budget_exhausted = bool(pairwise_stats.get("pair_budget_exhausted", False))
+    _record_auto_associate_phase("pair_generation", phase_start, labels)
+
+    candidate_ids = {concept_id for source, target, _ in all_pairs for concept_id in (source, target)}
+
+    ka_map: dict[str, str | None] = {}
+    if request.selection_mode == "unlinked" and candidate_ids:
+        phase_start = time.perf_counter()
+        ka_map = get_knowledge_area_map_for_ids(candidate_ids)
+        all_pairs = [
+            (source, target, score)
+            for source, target, score in all_pairs
+            if source in ka_map and target in ka_map
+        ]
+        candidate_ids = {
+            concept_id
+            for source, target, _ in all_pairs
+            for concept_id in (source, target)
+        }
+        _record_auto_associate_phase("active_current_candidate_filter", phase_start, labels)
+
+    phase_start = time.perf_counter()
+    existing_edges = get_association_triples_for_pairs(
+        (source, target, "related_to") for source, target, _ in all_pairs
+    )
+    _record_auto_associate_phase("duplicate_lookup", phase_start, labels)
+
+    existing_participants: set[str] = set()
     if request.tier2_enabled:
-        ka_map = get_knowledge_area_map()
+        phase_start = time.perf_counter()
+        existing_participants = get_associated_concept_ids(candidate_ids)
+        _record_auto_associate_phase("participant_lookup", phase_start, labels)
 
-    # --- Track edges per concept for cap enforcement ---
+        if not ka_map:
+            phase_start = time.perf_counter()
+            ka_map = get_knowledge_area_map_for_ids(candidate_ids)
+            _record_auto_associate_phase("knowledge_area_lookup", phase_start, labels)
+
     edges_added_per_concept = defaultdict(int)
-
-    # Stats accumulators
     tier1_edges_created = 0
     tier2_edges_created = 0
     edges_skipped_existing = 0
     edges_skipped_cap = 0
-    edges_to_insert = []  # List of (source, target, strength) for deferred insert
+    edges_to_insert: list[tuple[str, str, float]] = []
+    matched_selected_ids: set[str] = set()
+    deferred_selected_ids: set[str] = set()
+    evaluated_selected_ids = selected_ids - unavailable_ids
 
-    # --- Step C: Tier 1 pass ---
+    phase_start = time.perf_counter()
     tier1_pairs = [(s, t, score) for s, t, score in all_pairs if score >= request.tier1_threshold]
 
     for source, target, score in tier1_pairs:
@@ -90,38 +336,25 @@ def auto_associate_batch(request: AutoAssociateBatchRequest) -> AutoAssociateBat
             or edges_added_per_concept[target] >= request.max_edges_per_concept
         ):
             edges_skipped_cap += 1
+            deferred_selected_ids.update({source, target} & evaluated_selected_ids)
             continue
 
         strength = round(min(score, 0.80), 3)
         edges_to_insert.append((source, target, strength))
-        existing_edges.add(triple)  # Prevent Tier 2 from re-adding
+        existing_edges.add(triple)
         edges_added_per_concept[source] += 1
         edges_added_per_concept[target] += 1
         tier1_edges_created += 1
+        matched_selected_ids.update({source, target} & evaluated_selected_ids)
 
-    # --- Step D: Tier 2 pass (orphan rescue) ---
     if request.tier2_enabled:
-        # Identify concepts still orphaned after Tier 1
-        # A concept is "rescued" if it gained any edge in Tier 1
-        concepts_with_new_edges = set()
-        for source, target, _ in edges_to_insert:
-            concepts_with_new_edges.add(source)
-            concepts_with_new_edges.add(target)
+        new_edge_participants = {
+            concept_id
+            for source, target, _ in edges_to_insert
+            for concept_id in (source, target)
+        }
+        still_orphan_ids = candidate_ids - existing_participants - new_edge_participants
 
-        # Get concepts that are STILL orphans: no existing edges AND no new edges
-        # We need to check against the original existing_edges set + new edges
-        still_orphan_ids = set()
-        all_edge_participants = set()
-        for s, t, r in existing_edges:
-            all_edge_participants.add(s)
-            all_edge_participants.add(t)
-
-        for cid in list_concepts():
-            if cid not in all_edge_participants:
-                still_orphan_ids.add(cid)
-
-        # Tier 2 pairs: below tier1 but above tier2, AND same knowledge_area,
-        # AND at least one side is still orphaned
         tier2_pairs = [
             (s, t, score)
             for s, t, score in all_pairs
@@ -143,37 +376,92 @@ def auto_associate_batch(request: AutoAssociateBatchRequest) -> AutoAssociateBat
                 or edges_added_per_concept[target] >= request.max_edges_per_concept
             ):
                 edges_skipped_cap += 1
+                deferred_selected_ids.update({source, target} & evaluated_selected_ids)
                 continue
 
-            # Tier 2 strength is discounted (weaker text signal)
             strength = round(min(score * 0.8, 0.80), 3)
             edges_to_insert.append((source, target, strength))
             existing_edges.add(triple)
             edges_added_per_concept[source] += 1
             edges_added_per_concept[target] += 1
             tier2_edges_created += 1
+            matched_selected_ids.update({source, target} & evaluated_selected_ids)
+    _record_auto_associate_phase("edge_decisions", phase_start, labels)
 
-    # --- Step E: Bulk insert ---
+    phase_start = time.perf_counter()
     if not request.dry_run:
         for source, target, strength in edges_to_insert:
             add_association(source, target, "related_to", strength)
+        if request.selection_mode == "unlinked" and cursor_end is not None:
+            set_metadata(_UNLINKED_CURSOR_KEY, cursor_end)
+    _record_auto_associate_phase("persistence", phase_start, labels)
 
-    # --- Step F: Final metrics ---
+    phase_start = time.perf_counter()
     orphans_after = count_orphan_concepts() if not request.dry_run else orphans_before
-    processing_time_ms = round((time.time() - start_time) * 1000, 1)
+    _record_auto_associate_phase("orphan_count_after", phase_start, labels)
+    processing_time_ms = round((time.perf_counter() - start_time) * 1000, 1)
 
-    # OBS-03: emit association batch latency to metrics DB
-    metrics.record("auto_associate_batch_latency_ms", processing_time_ms)
+    deferred_selected_ids -= matched_selected_ids
+    concepts_evaluated = len(evaluated_selected_ids)
+    concepts_matched = len(matched_selected_ids)
+    concepts_deferred = len(deferred_selected_ids)
+    concepts_no_match = concepts_evaluated - concepts_matched - concepts_deferred
+    concepts_unavailable = len(unavailable_ids)
+
+    metrics.record("auto_associate_batch_latency_ms", processing_time_ms, labels)
+    metrics.record("auto_associate_batch_pairs_evaluated", pairs_evaluated, labels)
+    metrics.record("auto_associate_batch_pairs_available", pairs_available, labels)
+    metrics.record("auto_associate_batch_candidate_count", len(all_pairs), labels)
+    metrics.record("auto_associate_batch_candidate_endpoint_count", len(candidate_ids), labels)
+    metrics.record("auto_associate_batch_candidate_search_latency_ms", candidate_search_ms, labels)
+    metrics.record("auto_associate_batch_concepts_available", concepts_available, labels)
+    metrics.record("auto_associate_batch_concepts_evaluated", concepts_evaluated, labels)
+    metrics.record("auto_associate_batch_concepts_matched", concepts_matched, labels)
+    metrics.record("auto_associate_batch_concepts_no_match", concepts_no_match, labels)
+    metrics.record("auto_associate_batch_concepts_deferred", concepts_deferred, labels)
+    metrics.record("auto_associate_batch_concepts_unavailable", concepts_unavailable, labels)
+    metrics.record("auto_associate_batch_concept_budget_exhausted", int(concept_budget_exhausted), labels)
+    for bucket, count in age_buckets.items():
+        metrics.record(
+            "auto_associate_batch_selected_age_count",
+            count,
+            {**labels, "age_bucket": bucket},
+        )
+    if pair_budget_exhausted:
+        metrics.record("auto_associate_batch_pair_budget_exhausted", 1, labels)
 
     logger.info(
-        f"auto_associate_batch: T1={tier1_edges_created}, T2={tier2_edges_created}, "
-        f"skipped_existing={edges_skipped_existing}, skipped_cap={edges_skipped_cap}, "
-        f"orphans {orphans_before}→{orphans_after}, {processing_time_ms}ms"
+        "auto_associate_batch[%s]: source=%s mode=%s dry_run=%s T1=%d, T2=%d, "
+        "skipped_existing=%d, skipped_cap=%d, pairs=%d/%d, pair_budget_exhausted=%s, "
+        "concepts=%d/%d matched=%d no_match=%d deferred=%d unavailable=%d, "
+        "orphans %d->%d, %.1fms",
+        batch_run_id,
+        labels["invocation_source"],
+        request.selection_mode,
+        labels["dry_run"],
+        tier1_edges_created,
+        tier2_edges_created,
+        edges_skipped_existing,
+        edges_skipped_cap,
+        pairs_evaluated,
+        pairs_available,
+        pair_budget_exhausted,
+        concepts_evaluated,
+        concepts_available,
+        concepts_matched,
+        concepts_no_match,
+        concepts_deferred,
+        concepts_unavailable,
+        orphans_before,
+        orphans_after,
+        processing_time_ms,
     )
 
     return AutoAssociateBatchResponse(
         index_synced=index_synced,
         pairs_evaluated=pairs_evaluated,
+        pairs_available=pairs_available,
+        pair_budget_exhausted=pair_budget_exhausted,
         tier1_edges_created=tier1_edges_created,
         tier2_edges_created=tier2_edges_created,
         edges_skipped_existing=edges_skipped_existing,
@@ -182,6 +470,16 @@ def auto_associate_batch(request: AutoAssociateBatchRequest) -> AutoAssociateBat
         orphans_after=orphans_after,
         processing_time_ms=processing_time_ms,
         dry_run=request.dry_run,
+        selection_mode=request.selection_mode,
+        concepts_available=concepts_available,
+        concepts_evaluated=concepts_evaluated,
+        concepts_matched=concepts_matched,
+        concepts_no_match=concepts_no_match,
+        concepts_deferred=concepts_deferred,
+        concepts_unavailable=concepts_unavailable,
+        concept_budget_exhausted=concept_budget_exhausted,
+        cursor_start=cursor_start,
+        cursor_end=cursor_end,
     )
 
 
@@ -426,8 +724,8 @@ def auto_associate_decision_concept(concept_id: str, concept) -> int:
             return 0
 
     try:
-        from app.storage import _get_connection, _invalidate_associations_cache
         from app.core.datetime_utils import _utc_now_iso
+        from app.storage import _get_connection, _invalidate_associations_cache
 
         conn = _get_connection()
         cutoff = (

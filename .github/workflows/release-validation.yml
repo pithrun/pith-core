@@ -36,8 +36,16 @@ jobs:
             SECURITY.md
             CONTRIBUTING.md
             requirements.txt
+            install.ps1
             scripts/install.sh
+            scripts/install.ps1
+            scripts/windows_embedding_runtime.ps1
+            scripts/windows_tunnel_reconciliation.ps1
             pith_mcp.py
+            pith-server-latest.tar.gz
+            pith-server-latest.sha256
+            pith-server-latest.zip
+            pith-server-latest.zip.sha256
           )
           for path in "${required_files[@]}"; do
             test -f "$path" || { echo "Missing required file: $path" >&2; exit 1; }
@@ -60,6 +68,53 @@ jobs:
           bash -n scripts/backup/sync_backups.sh
           bash -n scripts/beta-report.sh
           bash -n scripts/setup-mcp.sh
+
+      - name: PowerShell syntax check
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $paths = @(
+            "install.ps1",
+            "scripts/install.ps1",
+            "scripts/windows_embedding_runtime.ps1",
+            "scripts/windows_tunnel_reconciliation.ps1"
+          )
+          foreach ($path in $paths) {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $path),
+              [ref]$tokens,
+              [ref]$errors
+            ) | Out-Null
+            if ($errors.Count -gt 0) {
+              $errors | ForEach-Object { Write-Error "${path}: $($_.Message)" }
+              exit 1
+            }
+          }
+
+      - name: Verify release asset checksums
+        run: |
+          set -euo pipefail
+          sha256sum -c pith-server-latest.sha256
+          sha256sum -c pith-server-latest.zip.sha256
+          mapfile -t mcpb_files < <(find integrations/claude-desktop-extension -maxdepth 1 -type f -name 'pith-claude-*.mcpb' -print)
+          test "${#mcpb_files[@]}" -eq 1 || { echo "Expected exactly one Claude MCPB" >&2; exit 1; }
+          mcpb="${mcpb_files[0]}"
+          test -f "${mcpb}.sha256" || { echo "Missing MCPB checksum: ${mcpb}.sha256" >&2; exit 1; }
+          (cd "$(dirname "$mcpb")" && sha256sum -c "$(basename "$mcpb").sha256")
+
+      - name: Reject generated caches in release archives
+        run: |
+          set -euo pipefail
+          if tar -tzf pith-server-latest.tar.gz | grep -E '(^|/)(__pycache__/|[^/]+\.pyc$)'; then
+            echo "Generated Python cache found in tarball" >&2
+            exit 1
+          fi
+          if unzip -l pith-server-latest.zip | grep -E '(^|/)(__pycache__/|[^/]+\.pyc$)'; then
+            echo "Generated Python cache found in Windows ZIP" >&2
+            exit 1
+          fi
 
       - name: Local Markdown link check
         run: |

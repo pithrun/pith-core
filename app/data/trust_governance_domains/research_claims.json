@@ -1,0 +1,63 @@
+{
+  "schema_version": "trust_governance_domain.v1",
+  "domain_id": "research_claims",
+  "title": "Research and fact-tracking claims",
+  "current_item_id": "research_claims_require_source_evidence_2026_07_10",
+  "scope_terms": [
+    "research claim",
+    "fact tracking",
+    "evidence policy",
+    "claim verification",
+    "source-backed claim",
+    "research source of truth"
+  ],
+  "items": [
+    {
+      "id": "research_claims_require_source_evidence_2026_07_10",
+      "title": "Source-backed research claim policy",
+      "state": "current",
+      "scope": "research_fact_tracking",
+      "governs": true,
+      "replaces": [
+        "research_claims_memory_recall_sufficient_2026_06_15"
+      ],
+      "aliases": [
+        "current research claim policy",
+        "research source of truth",
+        "source-backed claim policy",
+        "fact tracking policy",
+        "claim verification policy",
+        "evidence requirement"
+      ],
+      "source_path": "specs/GENERALIZED_TRUST_GOVERNANCE_V1_SPEC_2026_07_10.md",
+      "source_commit": "pending-generalized-trust-governance-v1",
+      "source_url": null,
+      "reason": "This policy governs research and fact-tracking answers because current claims must carry source evidence rather than relying on memory recall alone.",
+      "concept_ids": [
+        "trust_governance_research_claims_current"
+      ]
+    },
+    {
+      "id": "research_claims_memory_recall_sufficient_2026_06_15",
+      "title": "Memory-recall-only research claim draft",
+      "state": "superseded",
+      "scope": "research_fact_tracking",
+      "governs": false,
+      "superseded_by": "research_claims_require_source_evidence_2026_07_10",
+      "replaces": [],
+      "aliases": [
+        "memory recall sufficient",
+        "old research claim draft",
+        "previous research policy",
+        "superseded research claim"
+      ],
+      "source_path": "docs/research/MEMORY_RECALL_ONLY_CLAIM_DRAFT_2026_06_15.md",
+      "source_commit": "historical-research-fixture",
+      "source_url": null,
+      "reason": "This draft is superseded and must not govern current research or fact-tracking answers.",
+      "concept_ids": [
+        "trust_governance_research_claims_superseded_memory_only"
+      ]
+    }
+  ]
+}

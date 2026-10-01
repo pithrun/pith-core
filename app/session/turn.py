@@ -8,6 +8,7 @@ import hashlib
 import inspect
 import json
 import logging
+import math
 import os
 import sqlite3
 import threading
@@ -39,6 +40,7 @@ from app.core.constants import (
 from app.core.datetime_utils import _ensure_aware, _utc_now, _utc_now_iso
 from app.core.config import BENCHMARK, BENCHMARK_READONLY
 from app.core.deadline import TurnDeadline
+from app.core.request_identity import hash_request_id
 from app.core.models import (
     ActivatedConcept,
     ActiveDirectionality,
@@ -1693,6 +1695,18 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _deadline_budget_metric_label(value: Any) -> str:
+    if isinstance(value, bool):
+        return "invalid"
+    try:
+        budget_ms = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return "invalid"
+    if not math.isfinite(budget_ms) or budget_ms <= 0:
+        return "invalid"
+    return format(budget_ms, ".15g")
+
+
 def _clamped_env_float(name: str, default: float, minimum: float, maximum: float) -> float:
     return max(minimum, min(maximum, _env_float(name, default)))
 
@@ -2321,6 +2335,44 @@ def _abstention_fallback_deadline_remaining_ms(turn_deadline: Any) -> float | No
     if remaining is None:
         return None
     return round(remaining, 2)
+
+
+def _persist_contradiction_currency_conn(
+    conn: Any,
+    *,
+    suppressed_ids: list[str],
+    contested_ids: list[str],
+    now: str,
+) -> dict[str, int]:
+    """Persist TB-2 currency decisions without crossing lifecycle boundaries."""
+    from app.storage import apply_current_governance_currency_conn
+
+    suppressed_changed = sum(
+        apply_current_governance_currency_conn(
+            conn,
+            concept_id,
+            "CONTRADICTED",
+            excluded_current_statuses=("CONTRADICTED",),
+            now=now,
+        )
+        for concept_id in suppressed_ids
+    )
+    contested_changed = sum(
+        apply_current_governance_currency_conn(
+            conn,
+            concept_id,
+            "CONTESTED",
+            excluded_current_statuses=("CONTRADICTED", "CONTESTED"),
+            now=now,
+        )
+        for concept_id in contested_ids
+    )
+    return {
+        "suppressed_changed": suppressed_changed,
+        "suppressed_requested": len(suppressed_ids),
+        "contested_changed": contested_changed,
+        "contested_requested": len(contested_ids),
+    }
 
 
 def _abstention_fallback_error_trace(turn_deadline: Any) -> dict[str, Any]:
@@ -5609,10 +5661,10 @@ class ConversationTurnMixin:
             self._persist_session_origin_if_missing(session, request.origin_id)
             return session, "bound", "explicit_request", session.session_id if session else None
 
-        if transport_mode == "exec_http_fallback":
+        requested_origin_id = (request.origin_id or "").strip() or None
+        if transport_mode == "exec_http_fallback" and not requested_origin_id:
             return None, "unbound", "exec_fallback_omitted", None
 
-        requested_origin_id = (request.origin_id or "").strip() or None
         if requested_origin_id:
             rows = load_active_sessions_by_origin(requested_origin_id)
             if len(rows) == 1:
@@ -5748,9 +5800,24 @@ class ConversationTurnMixin:
           S5: Context assembly — trim evidence, compute graph_density
         """
         t0 = time.perf_counter()
+        _request_id = getattr(request, "request_id", None)
+        _request_id_hash = hash_request_id(_request_id)
+        _hook_additional_context = (
+            getattr(request, "context_delivery_mode", "") == "hook_additional_context"
+        )
+        _turn_deadline_budget_ms = (
+            _env_float("PITH_HOOK_TURN_DEADLINE_MS", 2500.0)
+            if _hook_additional_context
+            else _env_float("PITH_TURN_DEADLINE_MS", 3500.0)
+        )
+        _turn_deadline_enabled = (
+            _env_bool("PITH_HOOK_TURN_DEADLINE_ENABLED", True)
+            if _hook_additional_context
+            else _env_bool("PITH_TURN_DEADLINE_ENABLED", False)
+        )
         _turn_deadline = TurnDeadline.from_budget_ms(
-            _env_float("PITH_TURN_DEADLINE_MS", 3500.0),
-            enabled=os.environ.get("PITH_TURN_DEADLINE_ENABLED", "").lower() in ("true", "1"),
+            _turn_deadline_budget_ms,
+            enabled=_turn_deadline_enabled,
             request_id=getattr(request, "origin_id", None) or getattr(request, "session_id", None),
         )
         _turn_pressure_state = None
@@ -5792,7 +5859,9 @@ class ConversationTurnMixin:
         _stage3b_standard_entity_budget_ms = int(
             max(1, _env_float("PITH_ENTITY_CHAIN_STANDARD_BUDGET_MS", 100.0))
         )
-        _stage2_latency_admission_enabled = _env_bool("PITH_STAGE2_LATENCY_ADMISSION_ENABLED", False)
+        _stage2_latency_admission_enabled = (
+            _env_bool("PITH_STAGE2_LATENCY_ADMISSION_ENABLED", False) or _hook_additional_context
+        )
         _stage2_retrieval_min_remaining_ms = _clamped_env_float(
             "PITH_STAGE2_RETRIEVAL_MIN_REMAINING_MS", 1200.0, 100.0, 3500.0
         )
@@ -5824,9 +5893,6 @@ class ConversationTurnMixin:
             _answer_path_policy_snapshot = None
             _answer_path_observe_only = True
             _answer_path_enforcement_enabled = False
-        _hook_additional_context = (
-            getattr(request, "context_delivery_mode", "") == "hook_additional_context"
-        )
         if _hook_additional_context:
             _answer_path_observe_only = False
             _answer_path_enforcement_enabled = True
@@ -5999,7 +6065,10 @@ class ConversationTurnMixin:
                 "first_call": "unknown",
                 "resumption": "unknown",
                 "deadline_enabled": str(bool(_turn_deadline.enabled)).lower(),
+                "deadline_budget_ms": _deadline_budget_metric_label(_turn_deadline_budget_ms),
                 "answer_path_mode": "none",
+                "context_delivery_mode": str(getattr(request, "context_delivery_mode", "") or "unknown"),
+                "surface_id": str(getattr(request, "surface_id", "unknown") or "unknown"),
             }
             try:
                 labels["first_call"] = str(bool(is_first_call)).lower()  # noqa: F821
@@ -6101,7 +6170,7 @@ class ConversationTurnMixin:
             min_remaining_ms: float,
             recent_p95_limit_ms: float,
             circuit_ttl_s: float = 60.0,
-            recovery_probe_enabled: bool = False,
+            recovery_probe_enabled: bool | None = None,
             reset_samples_on_successful_probe: bool = True,
         ):
             from app.core.foreground_contract import (
@@ -6281,7 +6350,7 @@ class ConversationTurnMixin:
         # of:
         # - explicit authoritative session binding
         # - safe legacy auto-create/in-memory session
-        # - unbound degraded mode for exec fallback without session_id
+        # - unbound degraded mode for exec fallback without session_id or origin_id
         #
         # Request-path latest-active-session recovery is intentionally removed.
 
@@ -6458,7 +6527,7 @@ class ConversationTurnMixin:
                     if self.current_session
                     else request.session_id or "unbound"
                 )
-                raw_turn_id = request.request_id or f"{raw_session_id}:{self._episode_turn_counter + 1}"
+                raw_turn_id = _request_id or f"{raw_session_id}:{self._episode_turn_counter + 1}"
                 _pending_raw_capture = {
                     "session_id": raw_session_id,
                     "turn_id": raw_turn_id,
@@ -6506,6 +6575,7 @@ class ConversationTurnMixin:
             # Measures whether previously activated concepts were actually used
             # in the LLM's response. Heuristic-only, target <10ms.
             _t_prelearn_feedback_start = time.perf_counter()
+            _prelearn_feedback_fg_config = None
             try:
                 from app.core.config import get_feature_flag as _gff_fb
                 if _gff_fb("FEEDBACK_L1_ENABLED", True) and self._last_activated_concept_ids:
@@ -6579,12 +6649,17 @@ class ConversationTurnMixin:
                                         )
                                 except Exception as _util_err:
                                     logger.warning(f"RETRIEVAL-080: Utility update failed (non-fatal): {_util_err}")
-                    _foreground_contract_record_latency(
+                        _foreground_contract_record_latency(
+                            _prelearn_feedback_fg_config,
+                            (time.perf_counter() - _t_prelearn_feedback_start) * 1000.0,
+                            phase="prelearn.feedback",
+                        )
+            except Exception as _fb_err:
+                if _prelearn_feedback_fg_config is not None:
+                    _foreground_contract_cancel_recovery_probe(
                         _prelearn_feedback_fg_config,
-                        (time.perf_counter() - _t_prelearn_feedback_start) * 1000.0,
                         phase="prelearn.feedback",
                     )
-            except Exception as _fb_err:
                 logger.warning(f"FEEDBACK-001: L1 scoring failed (non-fatal): {_fb_err}")
             finally:
                 _ct_phase_prelearn_feedback_s += time.perf_counter() - _t_prelearn_feedback_start
@@ -6643,6 +6718,7 @@ class ConversationTurnMixin:
                     learn_request = SessionLearnRequest(
                         user_message=prev_msg,
                         assistant_response=prev_response,
+                        request_id=_request_id,
                         knowledge_area="conversation",
                         extracted_concepts=extracted,  # None = Tier 1 only; list = Tier 1 + Tier 2
                         session_id=self.current_session.session_id if self.current_session else None,
@@ -8889,8 +8965,16 @@ class ConversationTurnMixin:
         )
         _log_perf080_flags_once()
 
+        def _record_graph_index_load_state(state: str) -> None:
+            _record_budget_metric(
+                "ct_phase_graph_index_load_state",
+                1.0,
+                {"state": state},
+            )
+
         if _skip_graph_walk:
             top_results = top_results  # Keep results, skip graph enrichment
+            _record_graph_index_load_state("graph_walk_skipped")
         elif top_results and (
             (_stage2_latency_admission_enabled and not _turn_deadline.can_start(
                 "S4_graph_walk.load",
@@ -8916,6 +9000,7 @@ class ConversationTurnMixin:
                 priority="required_degraded",
                 min_remaining_ms=_min_remaining_ms,
             )
+            _record_graph_index_load_state("deadline_before_start")
             graph_indexes = None
             edges = []
         elif top_results:
@@ -8938,11 +9023,7 @@ class ConversationTurnMixin:
                     )
                     graph_indexes = _graph_load_result.indexes
                     edges = graph_indexes.edges if graph_indexes is not None else []
-                    _record_budget_metric(
-                        "ct_phase_graph_index_load_state",
-                        1.0,
-                        {"state": _graph_load_result.state},
-                    )
+                    _record_graph_index_load_state(_graph_load_result.state)
                     if _graph_load_result.refresh_scheduled:
                         _record_budget_metric("ct_phase_graph_index_refresh_scheduled_total", 1.0)
                     if graph_indexes is None:
@@ -8956,10 +9037,12 @@ class ConversationTurnMixin:
                 else:
                     graph_indexes = load_association_indexes()
                     edges = graph_indexes.edges
+                    _record_graph_index_load_state("direct_load")
             else:
                 graph_data = load_associations()
                 edges = graph_data.get("associations", [])
                 graph_indexes = None
+                _record_graph_index_load_state("cache_disabled_direct_load")
             _t_graph_index_load_ms = (time.perf_counter() - _t_graph_index_load_start) * 1000.0
             _stage3_set_count("ct_subphase_graph_edge_count", len(edges or []))
 
@@ -13293,29 +13376,19 @@ class ConversationTurnMixin:
 
                         with db_immediate() as _contra_conn:
                             now = _utc_now_iso()
-                            for loser_id in contradiction_result.suppressed_ids:
-                                _contra_conn.execute(
-                                    """UPDATE concepts
-                                       SET currency_status = 'CONTRADICTED',
-                                           data = json_set(data, '$.currency_status', 'CONTRADICTED'),
-                                           updated_at = ?
-                                       WHERE id = ? AND currency_status != 'CONTRADICTED'""",
-                                    (now, loser_id),
-                                )
-                            for contested_id in contradiction_result.contested_ids:
-                                _contra_conn.execute(
-                                    """UPDATE concepts
-                                       SET currency_status = 'CONTESTED',
-                                           data = json_set(data, '$.currency_status', 'CONTESTED'),
-                                           updated_at = ?
-                                       WHERE id = ? AND currency_status NOT IN ('CONTRADICTED', 'CONTESTED')""",
-                                    (now, contested_id),
-                                )
+                            _persisted = _persist_contradiction_currency_conn(
+                                _contra_conn,
+                                suppressed_ids=contradiction_result.suppressed_ids,
+                                contested_ids=contradiction_result.contested_ids,
+                                now=now,
+                            )
                             # commit handled by _db() context manager
                             logger.info(
-                                "TB-2: Persisted %d suppressed, %d contested",
-                                len(contradiction_result.suppressed_ids),
-                                len(contradiction_result.contested_ids),
+                                "TB-2: Persisted %d/%d suppressed, %d/%d contested",
+                                _persisted["suppressed_changed"],
+                                _persisted["suppressed_requested"],
+                                _persisted["contested_changed"],
+                                _persisted["contested_requested"],
                             )
                     except Exception as e:
                         logger.warning("TB-2: Contradiction persistence failed: %s", e)
@@ -14258,7 +14331,12 @@ class ConversationTurnMixin:
         try:
             from app.ops.metrics import metrics
 
-            metrics.record("conversation_turn_latency_ms", elapsed_ms, _conversation_turn_latency_labels())
+            metrics.record(
+                "conversation_turn_latency_ms",
+                elapsed_ms,
+                _conversation_turn_latency_labels(),
+                request_id_hash=_request_id_hash,
+            )
             if _answer_path_admission is not None:
                 metrics.record(
                     "answer_path_mode_total",
@@ -14609,7 +14687,10 @@ class ConversationTurnMixin:
                         "TURN_LATENCY_TRACE",
                         None,
                         build_turn_latency_trace(
-                            request_id=getattr(_turn_deadline, "request_id", None),
+                            request_id=_request_id,
+                            request_id_hash=_request_id_hash,
+                            surface_id=getattr(request, "surface_id", "unknown"),
+                            context_delivery_mode=getattr(request, "context_delivery_mode", "unknown"),
                             elapsed_ms=elapsed_ms,
                             deadline=_turn_deadline,
                             phases_ms=_turn_latency_phase_ms,
@@ -14959,6 +15040,28 @@ class ConversationTurnMixin:
             logger.warning(f"C1-CHAIN: Failed (non-fatal): {_c1_e}")
             _chain_answer = None
             _chain_answer_diagnostics = None
+        try:
+            from app.core.config import get_feature_flag
+
+            if get_feature_flag("AUTHORITY_CHAIN_ANSWER_ENABLED", True):
+                from app.session.trust_governance_answer_surface import (
+                    build_trust_governance_answer_surface,
+                )
+
+                _trust_answer, _trust_diagnostics = build_trust_governance_answer_surface(
+                    request.message or search_query,
+                    engine_chain_answer=_chain_answer,
+                    engine_chain_answer_diagnostics=_chain_answer_diagnostics,
+                )
+                if _trust_answer:
+                    _chain_answer = _trust_answer
+                if _trust_diagnostics:
+                    _chain_answer_diagnostics = _trust_diagnostics
+        except Exception as _authority_chain_e:
+            logger.warning(
+                "AUTHORITY-CHAIN-ANSWER: Failed (non-fatal): %s",
+                _authority_chain_e,
+            )
         _record_source_set_answer_dry_run_event(
             question=request.message or search_query,
             activated_concepts=activated,

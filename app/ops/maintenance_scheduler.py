@@ -14,8 +14,7 @@ import asyncio
 import json
 import logging
 import os
-import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -85,7 +84,7 @@ def _write_heartbeat(status: str, details: dict | None = None) -> None:
             "source": "built_in",
             "scheduler": "builtin",
             "status": status,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
             "interval_seconds": MAINTENANCE_INTERVAL_SECONDS,
             "circuit_open": _circuit_open,
             "consecutive_failures": _consecutive_failures,
@@ -94,6 +93,12 @@ def _write_heartbeat(status: str, details: dict | None = None) -> None:
             heartbeat["last_run"] = existing["last_run"]
         if existing.get("reflection_status") and "reflection_status" not in heartbeat:
             heartbeat["reflection_status"] = existing["reflection_status"]
+        if existing.get("outcome_health") and "outcome_health" not in heartbeat:
+            from app.ops.maintenance import validate_maintenance_outcome_health
+
+            validated_outcomes = validate_maintenance_outcome_health(existing["outcome_health"])
+            if validated_outcomes is not None:
+                heartbeat["outcome_health"] = validated_outcomes
         if details:
             heartbeat.update(details)
         heartbeat_path.write_text(json.dumps(heartbeat, indent=2))
@@ -151,7 +156,7 @@ async def _maintenance_loop() -> None:
                 logger.info("Maintenance scheduler: starting scheduled run")
                 _write_heartbeat("running")
 
-                from app.ops.maintenance import run_maintenance
+                from app.ops.maintenance import build_maintenance_outcome_health, run_maintenance
                 report = await run_maintenance(phases=DEFAULT_PHASES)
 
                 _consecutive_failures = 0  # Reset on success
@@ -160,7 +165,8 @@ async def _maintenance_loop() -> None:
                     f"phases={report.phases_completed if hasattr(report, 'phases_completed') else 'unknown'}"
                 )
                 _write_heartbeat("completed", {
-                    "last_run": datetime.now(timezone.utc).isoformat(),
+                    "last_run": datetime.now(UTC).isoformat(),
+                    "outcome_health": build_maintenance_outcome_health(report),
                 })
 
         except asyncio.CancelledError:

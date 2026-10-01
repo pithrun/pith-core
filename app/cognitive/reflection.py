@@ -18,8 +18,11 @@ import statistics
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 
+from app.core.confidence_policy import bound_positive_confidence, effective_confidence_cap
+from app.core.config import get_feature_flag
 from app.core.datetime_utils import _ensure_aware, _utc_now, _utc_now_iso
 # DEBT-239: cognitive must not import governance directly (Contract 3).
 def _get_auto_graduate_quarantined():
@@ -115,6 +118,16 @@ SOURCE_RELIABILITY = {
 }
 
 logger = logging.getLogger(__name__)
+
+
+def _concept_confidence_cap(concept: Concept, feedback_loop_on: bool) -> float:
+    return effective_confidence_cap(
+        concept_type=concept.concept_type,
+        utility_score=concept.utility_score,
+        utility_samples=concept.utility_samples,
+        evidence=concept.evidence,
+        feedback_loop_on=feedback_loop_on,
+    )
 
 
 class ReflectionAborted(RuntimeError):
@@ -391,7 +404,7 @@ def _flush_recalibration_events(events: list[tuple]) -> None:
     now = _utc_now_iso()
 
     # MONITOR-086: Compute summary statistics
-    direction_counts = {"downward": 0, "upward": 0, "psis_cap": 0}
+    direction_counts = {"downward": 0, "upward": 0, "psis_cap": 0, "policy_cap": 0}
     corrections = []
     for _cid, _old, _new, _es, direction, correction in events:
         direction_counts[direction] = direction_counts.get(direction, 0) + 1
@@ -406,6 +419,7 @@ def _flush_recalibration_events(events: list[tuple]) -> None:
         "downward": direction_counts.get("downward", 0),
         "upward": direction_counts.get("upward", 0),
         "psis_cap": direction_counts.get("psis_cap", 0),
+        "policy_cap": direction_counts.get("policy_cap", 0),
         "avg_correction": round(sum(corrections) / len(corrections), 4) if corrections else 0,
         "max_correction": round(max(corrections), 4) if corrections else 0,
         "significant_count": len(significant_events),
@@ -699,6 +713,66 @@ class ReflectionEngine:
                 if "database is locked" not in str(exc).lower() or attempt == attempts - 1:
                     raise
                 time.sleep(0.25 * (attempt + 1))
+
+    @staticmethod
+    def _is_retryable_sqlite_contention(exc: sqlite3.OperationalError) -> bool:
+        message = str(exc).strip().lower()
+        return message in {"database is locked", "database is busy"} or message.startswith(
+            "database table is locked"
+        )
+
+    @staticmethod
+    def _record_archive_retry_metric(operation: str, outcome: str) -> None:
+        try:
+            metrics.record(
+                "reflection_db_lock_retry",
+                1,
+                {"operation": operation, "outcome": outcome},
+            )
+        except Exception as exc:
+            logger.debug("MAINT-104: retry metric recording failed: %s", exc)
+
+    def _archive_concept_with_lock_retry(
+        self,
+        concept_id: str,
+        *,
+        on_archived: Callable[[str], None],
+        operation: str,
+        attempts: int = 5,
+    ) -> bool:
+        if attempts < 1:
+            raise ValueError("attempts must be at least 1")
+
+        had_contention = False
+        for attempt in range(1, attempts + 1):
+            try:
+                archived = archive_concept(concept_id, on_archived=on_archived)
+                if had_contention:
+                    self._record_archive_retry_metric(operation, "recovered")
+                return archived
+            except sqlite3.OperationalError as exc:
+                retryable = self._is_retryable_sqlite_contention(exc)
+                if not retryable or attempt == attempts:
+                    if retryable:
+                        self._record_archive_retry_metric(operation, "exhausted")
+                    raise
+
+                delay_seconds = 0.25 * attempt
+                had_contention = True
+                self._record_archive_retry_metric(operation, "retrying")
+                logger.warning(
+                    "MAINT-104: transient SQLite contention archiving concept %s "
+                    "during %s; retrying attempt %d/%d in %.2fs: %s",
+                    concept_id,
+                    operation,
+                    attempt + 1,
+                    attempts,
+                    delay_seconds,
+                    exc,
+                )
+                time.sleep(delay_seconds)
+
+        raise AssertionError("archive retry loop exited unexpectedly")
 
     def _abort_requested(self) -> bool:
         if self._cancel_event is not None and self._cancel_event.is_set():
@@ -1499,27 +1573,32 @@ class ReflectionEngine:
         REFLECT-022: Batch SQL pattern — compute in memory, write once.
         Returns (strengthened_count, list_of_strengthened_concept_ids, guarded_count)
         """
-        from app.core.config import PSIS_QUARANTINE_CONFIDENCE_CAP, PSIS_QUARANTINE_EVIDENCE_MARKER
         strengthened = 0
         guarded = 0
         strengthened_ids: list[str] = []
         batch_updates = []
+        feedback_loop_on = get_feature_flag("FEEDBACK_LOOP_ENABLED", True)
 
         all_concepts = _preloaded if _preloaded is not None else list_concepts_full()
         for idx, concept in enumerate(all_concepts, start=1):
             self._check_abort_every(idx, 100, "strengthen")
             if concept.access_count > 2:
                 boost = min(0.05, concept.access_count * 0.003)
-                new_confidence = min(1.0, concept.confidence + boost)
-                if new_confidence != concept.confidence:
-                    if PSIS_QUARANTINE_EVIDENCE_MARKER in (concept.evidence or []):
-                        new_confidence = min(new_confidence, PSIS_QUARANTINE_CONFIDENCE_CAP)
-                    new_stability = concept.stability
-                    if concept.stability < self.TIME_MATURATION_MAX_STABILITY:
-                        new_stability = min(self.TIME_MATURATION_MAX_STABILITY,
-                                            concept.stability + 0.05)
-                    else:
-                        guarded += 1
+                candidate_confidence = min(1.0, concept.confidence + boost)
+                new_confidence = bound_positive_confidence(
+                    concept.confidence,
+                    candidate_confidence,
+                    _concept_confidence_cap(concept, feedback_loop_on),
+                )
+                new_stability = concept.stability
+                if concept.stability < self.TIME_MATURATION_MAX_STABILITY:
+                    new_stability = min(
+                        self.TIME_MATURATION_MAX_STABILITY,
+                        concept.stability + 0.05,
+                    )
+                else:
+                    guarded += 1
+                if new_confidence != concept.confidence or new_stability != concept.stability:
                     batch_updates.append((new_confidence, new_stability, concept.id))
                     concept.confidence = new_confidence  # SCALE-004: ordering consistency
                     if new_stability is not None:
@@ -1569,10 +1648,10 @@ class ReflectionEngine:
         Cap: stability maxes at 0.8 (time alone can't make fully stable).
         Returns (count, list_of_matured_concept_ids) for HEALTH-009 association.
         """
-        from app.core.config import PSIS_QUARANTINE_CONFIDENCE_CAP, PSIS_QUARANTINE_EVIDENCE_MARKER
         matured = 0
         matured_ids: list[str] = []
         batch_updates = []
+        feedback_loop_on = get_feature_flag("FEEDBACK_LOOP_ENABLED", True)
         cutoff = (_utc_now() - timedelta(days=self.TIME_MATURATION_AGE_DAYS)).isoformat()
 
         all_concepts = _preloaded if _preloaded is not None else list_concepts_full()
@@ -1603,11 +1682,14 @@ class ReflectionEngine:
             confidence_boost = self.TIME_MATURATION_CONFIDENCE_BOOST * multiplier
             new_stability = min(self.TIME_MATURATION_MAX_STABILITY,
                                 concept.stability + stability_boost)
-            new_confidence = min(1.0, concept.confidence + confidence_boost)
+            candidate_confidence = min(1.0, concept.confidence + confidence_boost)
+            new_confidence = bound_positive_confidence(
+                concept.confidence,
+                candidate_confidence,
+                _concept_confidence_cap(concept, feedback_loop_on),
+            )
 
             if new_stability != concept.stability or new_confidence != concept.confidence:
-                if PSIS_QUARANTINE_EVIDENCE_MARKER in (concept.evidence or []):
-                    new_confidence = min(new_confidence, PSIS_QUARANTINE_CONFIDENCE_CAP)
                 batch_updates.append((new_confidence, new_stability, concept.id))
                 concept.confidence = new_confidence  # SCALE-004: ordering consistency
                 concept.stability = new_stability  # SCALE-004: ordering consistency
@@ -1642,9 +1724,9 @@ class ReflectionEngine:
         For each concept, count neighbors with confidence >= 0.5.
         Apply per-neighbor boost (0.02), capped at 0.08 total per concept.
         """
-        from app.core.config import PSIS_QUARANTINE_CONFIDENCE_CAP, PSIS_QUARANTINE_EVIDENCE_MARKER
         propagated = 0
         batch_updates = []
+        feedback_loop_on = get_feature_flag("FEEDBACK_LOOP_ENABLED", True)
 
         all_concepts = _preloaded if _preloaded is not None else list_concepts_full()
         confidence_map = {c.id: c.confidence for c in all_concepts}
@@ -1665,10 +1747,13 @@ class ReflectionEngine:
 
             boost = min(self.ASSOC_PROPAGATION_MAX_BOOST,
                         eligible_neighbors * self.ASSOC_PROPAGATION_BOOST)
-            new_confidence = min(1.0, concept.confidence + boost)
+            candidate_confidence = min(1.0, concept.confidence + boost)
+            new_confidence = bound_positive_confidence(
+                concept.confidence,
+                candidate_confidence,
+                _concept_confidence_cap(concept, feedback_loop_on),
+            )
             if new_confidence != concept.confidence:
-                if PSIS_QUARANTINE_EVIDENCE_MARKER in (concept.evidence or []):
-                    new_confidence = min(new_confidence, PSIS_QUARANTINE_CONFIDENCE_CAP)
                 batch_updates.append((new_confidence, None, concept.id))
                 concept.confidence = new_confidence  # SCALE-004: ordering consistency
                 propagated += 1
@@ -1967,20 +2052,16 @@ class ReflectionEngine:
           - If confidence > target: decay toward target with RECALIBRATION_DAMPING
           - If confidence < target: boost toward target with same damping
           - If concept has no evidence: skip
-          - Type-differentiated caps: L3+utility>0.6 → 0.85, L3 → 0.7, L1 → 0.6
+          - Type-differentiated caps: proven L3 → 0.85, L3 → 0.7, L1 → 0.6
           - EUNOMIA-038: warmup guard removed; base damping is now 0.10 and
             maintenance runs 1x/day, so convergence is already slower than the
             original 0.15 damping at 4x/day.
         Returns: (recalibrated_count, factor_cvs_dict)
         """
         from app.core.config import (
-            L3_CONCEPT_TYPES,
             MIN_UTILITY_SAMPLES,
-            PSIS_QUARANTINE_CONFIDENCE_CAP,
-            PSIS_QUARANTINE_EVIDENCE_MARKER,
             RECALIBRATION_EVIDENCE_WEIGHT,
             RECALIBRATION_UTILITY_WEIGHT,
-            get_feature_flag,
         )
         recalibrated = 0
         recal_events: list[tuple] = []
@@ -2029,6 +2110,7 @@ class ReflectionEngine:
             new_confidence = concept.confidence
             direction = None
             correction = 0.0
+            confidence_cap = _concept_confidence_cap(concept, _feedback_loop_on)
 
             if gap > RECALIBRATION_GAP_THRESHOLD:
                 correction = _effective_damping * gap
@@ -2038,45 +2120,31 @@ class ReflectionEngine:
                 correction = _effective_damping * abs(gap)
                 new_confidence = min(1.0, concept.confidence + correction)
                 direction = "upward"
-            else:
-                # STABILITY-027: Catch-all PSIS cap for within-threshold concepts
-                if PSIS_QUARANTINE_EVIDENCE_MARKER in (concept.evidence or []):
-                    if concept.confidence > PSIS_QUARANTINE_CONFIDENCE_CAP:
-                        old_confidence = concept.confidence
-                        new_confidence = PSIS_QUARANTINE_CONFIDENCE_CAP
-                        batch_updates.append((new_confidence, None, concept.id))
-                        concept.confidence = new_confidence  # SCALE-004: ordering consistency
-                        recalibrated += 1
-                        recal_events.append(
-                            (concept.id, old_confidence, new_confidence, e_c, "psis_cap",
-                             new_confidence - old_confidence)
-                        )
+
+            capped_confidence = min(new_confidence, confidence_cap)
+            if capped_confidence < new_confidence:
+                new_confidence = capped_confidence
+                if direction is None:
+                    direction = "policy_cap"
+
+            old_confidence = concept.confidence
+            if new_confidence == old_confidence:
                 continue
-
-            if direction:
-                if PSIS_QUARANTINE_EVIDENCE_MARKER in (concept.evidence or []):
-                    new_confidence = min(new_confidence, PSIS_QUARANTINE_CONFIDENCE_CAP)
-
-                # RETRIEVAL-080: Apply type-differentiated confidence caps
-                if _feedback_loop_on:
-                    _util_score = concept.utility_score
-                    _ctype = concept.concept_type or "observation"
-                    if _ctype in L3_CONCEPT_TYPES and _util_score is not None and _util_score > 0.6:
-                        _type_cap = 0.85  # Proven L3: higher ceiling
-                    elif _ctype in L3_CONCEPT_TYPES:
-                        _type_cap = 0.7   # Standard L3 ceiling
-                    else:
-                        _type_cap = 0.6   # L1 ceiling (observations less stable)
-                    new_confidence = min(new_confidence, _type_cap)
-
-                old_confidence = concept.confidence
-                batch_updates.append((new_confidence, None, concept.id))
-                concept.confidence = new_confidence  # SCALE-004: ordering consistency
-                recalibrated += 1
-                if abs(correction) > RECALIBRATION_LOG_MIN_CORRECTION:
-                    recal_events.append(
-                        (concept.id, old_confidence, new_confidence, e_c, direction, correction)
+            applied_correction = abs(new_confidence - old_confidence)
+            batch_updates.append((new_confidence, None, concept.id))
+            concept.confidence = new_confidence  # SCALE-004: ordering consistency
+            recalibrated += 1
+            if abs(applied_correction) > RECALIBRATION_LOG_MIN_CORRECTION:
+                recal_events.append(
+                    (
+                        concept.id,
+                        old_confidence,
+                        new_confidence,
+                        e_c,
+                        direction or "policy_cap",
+                        applied_correction,
                     )
+                )
 
         if _utility_blended_count > 0:
             logger.info(f"RETRIEVAL-080: Recalibration blended utility for {_utility_blended_count} concepts")
@@ -2236,7 +2304,11 @@ class ReflectionEngine:
             except (ValueError, TypeError, AttributeError):
                 continue  # Can't parse date, skip to be safe
 
-            if archive_concept(concept_id, on_archived=lambda cid: retrieval_engine.remove_concept(cid)):
+            if self._archive_concept_with_lock_retry(
+                concept_id,
+                on_archived=lambda cid: retrieval_engine.remove_concept(cid),
+                operation="garbage_collection",
+            ):
                 cleaned += 1
                 logger.info(
                     f"GC archived concept {concept_id}: "
@@ -2861,7 +2933,11 @@ class ReflectionEngine:
             days_since = (_utc_now() - _ensure_aware(last_access)).days
             if days_since < FORGETTING_STALENESS_DAYS:
                 continue
-            if archive_concept(concept_id, on_archived=lambda cid: retrieval_engine.remove_concept(cid)):
+            if self._archive_concept_with_lock_retry(
+                concept_id,
+                on_archived=lambda cid: retrieval_engine.remove_concept(cid),
+                operation="forgetting",
+            ):
                 archived_count += 1
                 logger.info(
                     f"Forgot concept {concept_id}: "

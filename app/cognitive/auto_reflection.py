@@ -620,26 +620,12 @@ def mark_session_reflected(session_id: str) -> None:
     Prevents T1 from re-reflecting on the same orphaned session.
     """
     try:
-        from app.storage import _db
+        from app.storage import mark_session_reflection_completed
 
-        with _db() as conn:
-            # Update session data JSON to include reflection_completed flag
-            row = conn.execute("SELECT data FROM sessions WHERE id = ?", (session_id,)).fetchone()
-
-            data = {}
-            if row and row[0]:
-                try:
-                    data = json.loads(row[0]) if isinstance(row[0], str) else row[0]
-                except (json.JSONDecodeError, TypeError):
-                    data = {}
-
-            data["reflection_completed"] = True
-            data["reflection_completed_at"] = _utc_now_iso()
-
-            conn.execute(
-                "UPDATE sessions SET data = ? WHERE id = ?",
-                (json.dumps(data), session_id),
-            )
+        mark_session_reflection_completed(
+            session_id,
+            reflected_at=_utc_now_iso(),
+        )
         logger.debug(f"Session {session_id} marked as reflection-completed")
     except Exception as e:
         logger.warning(f"Failed to mark session reflected (non-fatal): {e}")

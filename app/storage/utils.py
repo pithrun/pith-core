@@ -3,6 +3,7 @@
 Constants, validation helpers, schema DDL, and DB filename migration.
 Extracted from storage/__init__.py during Item 2b decomposition.
 """
+
 import json
 import logging
 import os
@@ -12,8 +13,14 @@ from contextlib import suppress
 
 logger = logging.getLogger(__name__)
 
+FTS_VERBATIM_SENTINEL_CONCEPT_IDS = (
+    "first_turn_orphan",
+    "orphan_verbatim",
+)
+
 # AGENT-001: agent_id validation
 _AGENT_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_\-]{1,64}$")
+
 
 def validate_agent_id(agent_id: str) -> str:
     """Validate and normalize agent_id. Returns validated value or 'default'."""
@@ -35,6 +42,7 @@ def _clamp_score(value, low: float = 0.0, high: float = 1.0):
     except (TypeError, ValueError):
         return None
 
+
 def _safe_json_loads(data, context: str = "unknown") -> dict | None:
     """Bug 7 fix: Safely decode JSON data column with UTF-8 error handling.
 
@@ -51,6 +59,7 @@ def _safe_json_loads(data, context: str = "unknown") -> dict | None:
     except (json.JSONDecodeError, UnicodeDecodeError) as e:
         logger.error(f"Bug 7: Corrupted data in {context}: {type(e).__name__}: {e}")
         return None
+
 
 # --- Schema DDL ---
 SCHEMA_DDL = """
@@ -188,7 +197,58 @@ CREATE TABLE IF NOT EXISTS sessions (
     pressure_score REAL DEFAULT NULL,
     last_learning_at TEXT DEFAULT NULL,
     last_heartbeat TEXT DEFAULT NULL,
-    working_context_json TEXT DEFAULT NULL
+    working_context_json TEXT DEFAULT NULL,
+    binding_hash TEXT DEFAULT NULL,
+    binding_generation INTEGER DEFAULT NULL,
+    lifecycle_phase TEXT DEFAULT NULL,
+    last_activity_at TEXT DEFAULT NULL
+);
+
+-- TOOLING-121: durable task ownership is separate from episode lifetime.
+CREATE TABLE IF NOT EXISTS session_bindings (
+    binding_hash TEXT NOT NULL,
+    profile TEXT NOT NULL,
+    owner_surface_id TEXT NOT NULL,
+    owner_workspace_id TEXT NOT NULL,
+    owner_native_conversation_hash TEXT NOT NULL,
+    current_session_id TEXT,
+    generation INTEGER NOT NULL DEFAULT 0 CHECK(generation >= 0),
+    protocol_version INTEGER NOT NULL CHECK(protocol_version >= 1),
+    state TEXT NOT NULL DEFAULT 'active' CHECK(state IN ('active','tombstoned')),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(profile, binding_hash)
+);
+
+CREATE TABLE IF NOT EXISTS session_binding_policy (
+    profile TEXT PRIMARY KEY,
+    mode TEXT NOT NULL CHECK(mode IN
+        ('legacy_disabled','managed_shadow','managed_enabled')),
+    protocol_version INTEGER NOT NULL CHECK(protocol_version >= 1),
+    idle_seconds INTEGER NOT NULL CHECK(idle_seconds BETWEEN 300 AND 604800),
+    minimum_writer_protocol INTEGER NOT NULL CHECK(minimum_writer_protocol >= 1),
+    writer_barrier_armed INTEGER NOT NULL DEFAULT 0
+        CHECK(writer_barrier_armed IN (0,1)),
+    writer_barrier_armed_at TEXT,
+    updated_at TEXT NOT NULL,
+    updated_by TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS session_close_step_receipts (
+    session_id TEXT NOT NULL,
+    step_name TEXT NOT NULL,
+    step_version INTEGER NOT NULL CHECK(step_version >= 1),
+    binding_hash TEXT NOT NULL,
+    binding_generation INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK(state IN
+        ('started','committed','skipped','needs_attention')),
+    claim_token TEXT,
+    payload_hash TEXT NOT NULL,
+    result_hash TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    last_error TEXT,
+    PRIMARY KEY(session_id, step_name, step_version)
 );
 
 -- Execution checkpoints (ephemeral resumption state, NOT concepts)
@@ -243,6 +303,11 @@ CREATE TABLE IF NOT EXISTS write_request_replays (
     lease_owner TEXT DEFAULT NULL,
     lease_expires_at TEXT DEFAULT NULL,
     next_retry_at TEXT DEFAULT NULL,
+    binding_hash TEXT DEFAULT NULL,
+    session_id TEXT DEFAULT NULL,
+    external_request_id TEXT DEFAULT NULL,
+    request_hash TEXT DEFAULT NULL,
+    claim_token TEXT DEFAULT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     PRIMARY KEY (endpoint, profile, request_id)
@@ -268,6 +333,12 @@ CREATE TABLE IF NOT EXISTS lifecycle_jobs (
     lease_owner TEXT,
     lease_expires_at TEXT,
     next_retry_at TEXT,
+    deferred_attempts INTEGER NOT NULL DEFAULT 0,
+    first_deferred_at TEXT DEFAULT NULL,
+    session_id TEXT DEFAULT NULL,
+    binding_hash TEXT DEFAULT NULL,
+    binding_generation INTEGER DEFAULT NULL,
+    claim_token TEXT DEFAULT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE(profile, source, idempotency_key)
@@ -278,6 +349,75 @@ ON lifecycle_jobs(profile, status, priority, updated_at);
 
 CREATE INDEX IF NOT EXISTS idx_lifecycle_jobs_stage_status
 ON lifecycle_jobs(profile, stage, status, updated_at);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_binding_generation
+ON sessions(binding_hash, binding_generation)
+WHERE binding_hash IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_sessions_managed_due
+ON sessions(lifecycle_phase, last_activity_at, binding_hash)
+WHERE binding_hash IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_lifecycle_jobs_episode_status
+ON lifecycle_jobs(binding_hash, session_id, status, updated_at)
+WHERE binding_hash IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_write_replays_episode_status
+ON write_request_replays(binding_hash, session_id, status, updated_at)
+WHERE binding_hash IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_close_receipts_episode_state
+ON session_close_step_receipts(binding_hash, session_id, state);
+
+-- MAINT-097: transactional handoff from concept membership changes to the
+-- server-owned retrieval index. Triggers keep raw SQL writers covered and the
+-- event insert participates in the originating concept transaction.
+CREATE TABLE IF NOT EXISTS lifecycle_index_outbox (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    concept_id TEXT NOT NULL,
+    event_type TEXT NOT NULL CHECK (event_type IN ('membership_change', 'delete')),
+    status TEXT NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'running', 'done', 'skipped', 'failed')),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    last_error TEXT,
+    source TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_lifecycle_index_outbox_ready
+ON lifecycle_index_outbox(status, next_attempt_at, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_lifecycle_index_outbox_concept
+ON lifecycle_index_outbox(concept_id, created_at);
+
+CREATE TRIGGER IF NOT EXISTS trg_concepts_lifecycle_index_membership
+AFTER UPDATE OF status, is_current ON concepts
+WHEN
+    (COALESCE(OLD.status, '') = 'active' AND COALESCE(OLD.is_current, 0) = 1)
+    <>
+    (COALESCE(NEW.status, '') = 'active' AND COALESCE(NEW.is_current, 0) = 1)
+BEGIN
+    INSERT INTO lifecycle_index_outbox
+        (concept_id, event_type, status, attempts, created_at, updated_at, source)
+    VALUES
+        (NEW.id, 'membership_change', 'queued', 0,
+         strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+         strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+         'concepts_membership_update');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_concepts_lifecycle_index_delete
+AFTER DELETE ON concepts
+BEGIN
+    INSERT INTO lifecycle_index_outbox
+        (concept_id, event_type, status, attempts, created_at, updated_at, source)
+    VALUES
+        (OLD.id, 'delete', 'queued', 0,
+         strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+         strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+         'concepts_delete');
+END;
 
 -- Key-value metadata
 CREATE TABLE IF NOT EXISTS metadata (
@@ -630,7 +770,8 @@ CREATE TABLE IF NOT EXISTS metrics (
     timestamp TEXT NOT NULL,
     metric TEXT NOT NULL,
     value REAL NOT NULL,
-    labels TEXT DEFAULT '{}'
+    labels TEXT DEFAULT '{}',
+    request_id_hash TEXT DEFAULT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_metrics_ts ON metrics(timestamp);
 CREATE INDEX IF NOT EXISTS idx_metrics_name ON metrics(metric, timestamp);
@@ -832,6 +973,7 @@ CONCEPTS_DIR = DATA_DIR / "concepts"
 # Ensure directories exist (INDEX_DIR used by TF-IDF, still filesystem)
 INDEX_DIR.mkdir(parents=True, exist_ok=True)
 
+
 def _migrate_db_filename() -> None:
     """Auto-migrate brain.db → pith.db on first startup after update.
 
@@ -927,6 +1069,7 @@ def _migrate_db_filename() -> None:
         return
 
     logger.info("Database migration complete: brain.db → pith.db")
+
 
 # Run migration at module load (before any DB access)
 _migrate_db_filename()
