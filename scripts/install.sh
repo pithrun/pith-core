@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# Pith Installer v1.0.7
+# Pith Installer v1.0.8
 # macOS developer preview installer; Linux remains an unverified source/developer path.
 
 # Configuration
@@ -15,7 +15,7 @@ PITH_REPAIR_RUNTIME="${PITH_REPAIR_RUNTIME:-0}"
 PITH_FORCE_MANAGED_PYTHON="${PITH_FORCE_MANAGED_PYTHON:-0}"
 # Keep PITH_VERSION on line 18.
 # scripts/version-bump.sh and TEST-090 depend on this exact location.
-PITH_VERSION="1.0.7"
+PITH_VERSION="1.0.8"
 PITH_INSTALL_TELEMETRY_URL="${PITH_INSTALL_TELEMETRY_URL-https://pith.run/telemetry/install}"
 PITH_INSTALL_TELEMETRY_EVENT_VERSION="${PITH_INSTALL_TELEMETRY_EVENT_VERSION:-1}"
 PITH_RELEASE_CHANNEL="${PITH_RELEASE_CHANNEL:-unknown}"
@@ -597,7 +597,6 @@ surface_label() {
         cursor) echo "Cursor" ;;
         windsurf) echo "Windsurf" ;;
         cline) echo "Cline" ;;
-        project) echo "Project MCP templates" ;;
         *) echo "$1" ;;
     esac
 }
@@ -612,7 +611,6 @@ surface_detail() {
         cursor) echo "MCP config template; add Cursor User Rule or AGENTS.md for default Pith invocation" ;;
         windsurf) echo "Experimental MCP config template; not launch-verified" ;;
         cline) echo "Experimental MCP settings template; not launch-verified" ;;
-        project) echo ".mcp.json and .vscode/mcp.json templates inside the installed server folder" ;;
         *) echo "MCP config" ;;
     esac
 }
@@ -642,9 +640,6 @@ surface_detected() {
             ;;
         cline)
             [[ -d "$HOME/Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev" || -d "$HOME/.config/Code/User/globalStorage/saoudrizwan.claude-dev" ]]
-            ;;
-        project)
-            return 0
             ;;
         *)
             return 1
@@ -682,14 +677,14 @@ select_install_surfaces() {
     fi
 
     PITH_SELECTED_SURFACES="$(normalize_surface_list "${PITH_CLIENTS:-all}")"
-    local surfaces=(claude_desktop chatgpt codex vscode claude_code cursor windsurf cline project)
+    local surfaces=(claude_desktop chatgpt codex vscode claude_code cursor windsurf cline)
 
     if [[ -n "${PITH_CLIENTS:-}" ]]; then
         return
     fi
 
     if [[ "${PITH_PRIVATE_BETA:-0}" != "1" || "${PITH_SKIP_PAUSES:-0}" == "1" || ! -t 0 ]]; then
-        PITH_SELECTED_SURFACES="claude_desktop,claude_code,chatgpt,codex,vscode,cursor,project"
+        PITH_SELECTED_SURFACES="claude_desktop,claude_code,chatgpt,codex,vscode,cursor"
         return
     fi
 
@@ -1482,6 +1477,7 @@ elif [[ -f "$CONFIGURE_SCRIPT" ]] && python3 "$CONFIGURE_SCRIPT" \
     --api-url "http://localhost:$PITH_PORT" \
     --pith-version "$PITH_VERSION" \
     --clients "${PITH_SELECTED_SURFACES:-all}" \
+    --skip-project \
     --json > "$CLIENT_CONFIG_RESULT_JSON" 2> "$CLIENT_CONFIG_RESULT_ERR"; then
     summarize_client_config_result "$CLIENT_CONFIG_RESULT_JSON"
     mark_success "Client configuration diagnostics saved to $CLIENT_CONFIG_RESULT_JSON"

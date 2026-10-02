@@ -1,11 +1,11 @@
-# Pith Installer v1.0.7 (Windows PowerShell)
+# Pith Installer v1.0.8 (Windows PowerShell)
 # Windows equivalent installer
 
 #Requires -Version 5.0
 
 param(
     [switch]$Force = $false,
-    [string]$PithVersion = "1.0.7"
+    [string]$PithVersion = "1.0.8"
 )
 
 # Strict error handling
@@ -629,7 +629,7 @@ function Normalize-SurfaceList {
         "claude_code" = "claude_code"
         "3" = "codex"
         "codex" = "codex"
-        "9" = "chatgpt"
+        "8" = "chatgpt"
         "chat" = "chatgpt"
         "chatgpt" = "chatgpt"
         "chatgpt-desktop" = "chatgpt"
@@ -644,8 +644,6 @@ function Normalize-SurfaceList {
         "windsurf" = "windsurf"
         "7" = "cline"
         "cline" = "cline"
-        "8" = "project"
-        "project" = "project"
     }
 
     $Selected = New-Object System.Collections.Generic.List[string]
@@ -682,7 +680,6 @@ function Get-SurfaceLabel {
         "cursor" = "Cursor"
         "windsurf" = "Windsurf"
         "cline" = "Cline"
-        "project" = "Project .mcp.json"
     }
     if ($Labels.ContainsKey($Surface)) {
         return $Labels[$Surface]
@@ -728,7 +725,7 @@ function Show-SelectedSurfaces {
 }
 
 function Select-InstallSurfaces {
-    $PublicDefault = "claude_desktop,claude_code,chatgpt,codex,vscode,cursor,project"
+    $PublicDefault = "claude_desktop,claude_code,chatgpt,codex,vscode,cursor"
     $EnvSelectedExists = $null -ne [Environment]::GetEnvironmentVariable("PITH_SELECTED_SURFACES", "Process")
     if ($EnvSelectedExists) {
         $Selected = Normalize-SurfaceList $env:PITH_SELECTED_SURFACES
@@ -761,8 +758,7 @@ function Select-InstallSurfaces {
     Write-Host "  5. Cursor"
     Write-Host "  6. Windsurf"
     Write-Host "  7. Cline"
-    Write-Host "  8. Project .mcp.json"
-    Write-Host "  9. ChatGPT"
+    Write-Host "  8. ChatGPT"
     $Answer = Read-Host "Install Pith into which surfaces? [all detected]"
     if (-not $Answer) {
         Write-Host "  AI app surfaces selected: $SelectedFromClients"
@@ -2091,6 +2087,7 @@ elseif (Test-Path $ConfigureScript) {
         "--project-dir", "$PithHome\pith-server",
         "--platform", "windows",
         "--clients", "$PithSelectedSurfaces",
+        "--skip-project",
         "--json"
     )
     if ($PithHomeOverridden) {
