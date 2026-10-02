@@ -66,7 +66,7 @@ BINARY_EXTENSIONS = {
 
 ALLOWED_CHANGED_BINARY_PATHS = {
     "demo/demo.gif",
-    "integrations/claude-desktop-extension/pith-claude-1.0.7.mcpb",
+    "integrations/claude-desktop-extension/pith-claude-1.0.8.mcpb",
     "pith-server-latest.tar.gz",
     "pith-server-latest.zip",
 }
