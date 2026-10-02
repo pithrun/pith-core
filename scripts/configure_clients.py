@@ -479,7 +479,7 @@ CHATGPT_CONFIG = {
     },
 }
 CODEX_PLUGIN_NAME = "pith"
-CODEX_PLUGIN_BASE_VERSION = "1.0.7"
+CODEX_PLUGIN_BASE_VERSION = "1.0.8"
 CODEX_PLUGIN_CATEGORY = "Productivity"
 CODEX_PLUGIN_SOURCE_PATH = "./plugins/pith"
 
@@ -5907,7 +5907,8 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Configuration templates: Claude Desktop, Claude Code, Cursor, Windsurf, "
-            "Cline, Codex, VS Code. Runtime support must be verified in each client."
+            "Cline, Codex, VS Code. Runtime support must be verified in each client. "
+            "Project-level configs require explicit --clients project selection."
         ),
     )
     parser.add_argument("--server-path", required=True, help="Absolute path to pith_mcp.py (MCP bridge)")
@@ -5957,7 +5958,8 @@ def main():
         "--clients",
         default="all",
         help=(
-            "Comma-separated client IDs to configure. Use all, none, or any of: "
+            "Comma-separated client IDs to configure. Use all for detected applications only, "
+            "none, or any of: "
             "claude_desktop, claude_code, chatgpt, codex, vscode, cursor, windsurf, cline, project."
         ),
     )
@@ -6121,7 +6123,7 @@ def main():
         results["configured"].append(chatgpt_remote_connector_requirement(args.dry_run))
 
     # --- Phase 3: Project-level configs ---
-    project_selected = wants("project")
+    project_selected = not configure_all and wants("project")
     if not args.skip_project and project_selected:
         try:
             r = generate_project_mcp_json(

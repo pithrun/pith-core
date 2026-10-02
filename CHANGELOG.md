@@ -4,6 +4,12 @@ All notable changes to Pith are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.8] - 2026-10-01
+
+### Fixed
+- Removes project-level MCP files from the broad installer surface list on macOS, Linux, and Windows.
+- Prevents default and `all` client configuration from writing `.mcp.json` or `.vscode/mcp.json`; explicit project configuration remains available.
+
 ## [1.0.7] - 2026-10-01
 
 ### Added
