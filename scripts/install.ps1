@@ -1,11 +1,11 @@
-# Pith Installer v1.0.8 (Windows PowerShell)
+# Pith Installer v1.0.9 (Windows PowerShell)
 # Windows equivalent installer
 
 #Requires -Version 5.0
 
 param(
     [switch]$Force = $false,
-    [string]$PithVersion = "1.0.8"
+    [string]$PithVersion = "1.0.9"
 )
 
 # Strict error handling
@@ -218,6 +218,79 @@ function Stop-PithInstallProcessesForCleanup {
 
     $SurvivorIds = @($Survivors | ForEach-Object { $_.ProcessId }) -join ", "
     Write-Error-Custom "Pith runtime processes did not stop before install. Surviving PIDs: $SurvivorIds"
+}
+
+function Get-PithServerTreeInventory {
+    param([Parameter(Mandatory=$true)][string]$PithHome, [Parameter(Mandatory=$true)][string]$ServerPath)
+    if (-not [IO.Path]::IsPathRooted($PithHome) -or -not [IO.Path]::IsPathRooted($ServerPath)) { throw 'Pith install paths must be absolute' }
+    $HomeFull = [IO.Path]::GetFullPath($PithHome).TrimEnd('\')
+    $ServerFull = [IO.Path]::GetFullPath($ServerPath).TrimEnd('\')
+    if ($PithHome -match '^[A-Za-z]:(?![\\/])' -or [IO.Path]::GetPathRoot($PithHome).Length -le 1 -or $HomeFull -eq [IO.Path]::GetPathRoot($HomeFull).TrimEnd('\')) { throw 'Pith home must not be relative to a drive or be a volume root' }
+    $Expected = [IO.Path]::GetFullPath((Join-Path $HomeFull 'pith-server')).TrimEnd('\')
+    if ($ServerFull -ine $Expected) { throw 'Pith server path is not the managed child' }
+    $Ancestor = $ServerFull
+    while ($Ancestor) {
+        if (Test-Path -LiteralPath $Ancestor) {
+            $Item = Get-Item -LiteralPath $Ancestor -Force -ErrorAction Stop
+            if (-not $Item.PSIsContainer -or ($Item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Unsafe Pith server ancestor' }
+        }
+        $Ancestor = [IO.Path]::GetDirectoryName($Ancestor)
+    }
+    $Inventory = New-Object System.Collections.Generic.List[object]
+    if (-not (Test-Path -LiteralPath $ServerFull)) { return $Inventory.ToArray() }
+    $Pending = New-Object System.Collections.Generic.Stack[string]
+    $Pending.Push($ServerFull)
+    $MaxItems = 100000
+    while ($Pending.Count -gt 0) {
+        $Directory = $Pending.Pop()
+        Get-ChildItem -LiteralPath $Directory -Force -ErrorAction Stop | ForEach-Object {
+            $Item = $_
+            if ($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Reparse point in Pith server tree' }
+            $Inventory.Add($Item)
+            if ($Inventory.Count -gt $MaxItems) { throw 'Pith server tree exceeds safety inventory limit' }
+            if ($Item.PSIsContainer) { $Pending.Push($Item.FullName) }
+        }
+    }
+    return $Inventory.ToArray()
+}
+
+function Test-PithOwnedApplicationBytecode {
+    param([Parameter(Mandatory=$true)][string]$RelativePath)
+    $Parts = $RelativePath.Split('\')
+    foreach ($Part in $Parts) {
+        if (-not $Part -or $Part.IndexOfAny([IO.Path]::GetInvalidFileNameChars()) -ge 0) { return $false }
+    }
+    if ([IO.Path]::IsPathRooted($RelativePath) -or $Parts -contains '..' -or $Parts -contains '.' -or $RelativePath.Contains('/')) { return $false }
+    if ([IO.Path]::GetExtension($RelativePath) -ine '.pyc') { return $false }
+    if ($Parts.Count -gt 1 -and $Parts[0] -in @('app', 'pith_client', 'scripts', 'migrations', 'integrations')) { return $true }
+    if ($Parts.Count -eq 1 -and $Parts[0] -in @('pith_mcp.pyc', 'skill_deployer.pyc')) { return $true }
+    return ($Parts.Count -eq 2 -and $Parts[0] -ieq '__pycache__' -and $Parts[1] -match '^(pith_mcp|skill_deployer)\.[^.]+(?:\.opt-[0-9]+)?\.pyc$')
+}
+
+function Clear-PithApplicationBytecode {
+    param([Parameter(Mandatory=$true)][string]$PithHome, [Parameter(Mandatory=$true)][string]$ServerPath)
+    $Inventory = @(Get-PithServerTreeInventory -PithHome $PithHome -ServerPath $ServerPath)
+    $ServerFull = [IO.Path]::GetFullPath($ServerPath).TrimEnd('\')
+    $Removed = 0
+    foreach ($Item in $Inventory) {
+        if ($Item.PSIsContainer -or $Item.Extension -ine '.pyc') { continue }
+        $Relative = $Item.FullName.Substring($ServerFull.Length + 1)
+        if (-not (Test-PithOwnedApplicationBytecode -RelativePath $Relative)) { continue }
+        # Recheck all ancestors immediately before file-only deletion.
+        $Ancestor = $Item.FullName
+        while ($Ancestor -and $Ancestor.Length -ge $ServerFull.Length) {
+            $Current = Get-Item -LiteralPath $Ancestor -Force -ErrorAction Stop
+            if ($Current.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Reparse point before Pith bytecode deletion' }
+            $Ancestor = [IO.Path]::GetDirectoryName($Ancestor)
+        }
+        Remove-Item -LiteralPath $Item.FullName -Force -ErrorAction Stop
+        if (Test-Path -LiteralPath $Item.FullName) { throw 'Pith application bytecode remains after deletion' }
+        $Removed++
+    }
+    foreach ($Item in @(Get-PithServerTreeInventory -PithHome $PithHome -ServerPath $ServerPath)) {
+        if (-not $Item.PSIsContainer -and (Test-PithOwnedApplicationBytecode -RelativePath $Item.FullName.Substring($ServerFull.Length + 1))) { throw 'Residual Pith application bytecode after cleanup' }
+    }
+    return $Removed
 }
 
 function Wait-PithPendingUninstallCleanup {
@@ -1475,38 +1548,39 @@ Stop-PithInstallProcessesForCleanup
 Write-Step 3 "Install Pith server files"
 
 $PithServerPath = "$PithHome\pith-server"
+Get-PithServerTreeInventory -PithHome $PithHome -ServerPath $PithServerPath | Out-Null
 $DownloadSuccess = $false
 
 # Strategy 1: Detect running from distribution directory (most common for beta)
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ParentDir = Split-Path -Parent $ScriptDir
 $AdjacentPackage = Join-Path $ScriptDir "pith-server-latest.zip"
-$DistDir = if (Test-Path $AdjacentPackage) { $ScriptDir } else { $ParentDir }
+$DistDir = if (Test-Path -LiteralPath $AdjacentPackage) { $ScriptDir } else { $ParentDir }
 
 if (
-    -not (Test-Path $AdjacentPackage) -and
-    (Test-Path "$DistDir\app\api\server.py") -and
-    (Test-Path "$DistDir\pith_client\cli.py") -and
-    (Test-Path "$DistDir\pith_mcp.py")
+    -not (Test-Path -LiteralPath $AdjacentPackage) -and
+    (Test-Path -LiteralPath "$DistDir\app\api\server.py") -and
+    (Test-Path -LiteralPath "$DistDir\pith_client\cli.py") -and
+    (Test-Path -LiteralPath "$DistDir\pith_mcp.py")
 ) {
     Write-Host "  Detected distribution directory: $DistDir"
-    if (-not (Test-Path $PithServerPath)) {
+    if (-not (Test-Path -LiteralPath $PithServerPath)) {
         New-Item -ItemType Directory -Path $PithServerPath -Force | Out-Null
     }
-    # Copy app files from distribution to install location
-    Copy-Item -Path "$DistDir\app" -Destination "$PithServerPath\app" -Recurse -Force
-    Copy-Item -Path "$DistDir\pith_client" -Destination "$PithServerPath\pith_client" -Recurse -Force
-    Copy-Item -Path "$DistDir\pith_mcp.py" -Destination "$PithServerPath\pith_mcp.py" -Force
-    Copy-Item -Path "$DistDir\skill_deployer.py" -Destination "$PithServerPath\skill_deployer.py" -Force
-    Copy-Item -Path "$DistDir\requirements.txt" -Destination "$PithServerPath\requirements.txt" -Force
-    if (Test-Path "$DistDir\scripts") {
-        Copy-Item -Path "$DistDir\scripts" -Destination "$PithServerPath\scripts" -Recurse -Force
+    # Copy directories to the server parent so upgrades merge without nesting.
+    Copy-Item -LiteralPath "$DistDir\app" -Destination $PithServerPath -Recurse -Force -ErrorAction Stop
+    Copy-Item -LiteralPath "$DistDir\pith_client" -Destination $PithServerPath -Recurse -Force -ErrorAction Stop
+    Copy-Item -LiteralPath "$DistDir\pith_mcp.py" -Destination "$PithServerPath\pith_mcp.py" -Force -ErrorAction Stop
+    Copy-Item -LiteralPath "$DistDir\skill_deployer.py" -Destination "$PithServerPath\skill_deployer.py" -Force -ErrorAction Stop
+    Copy-Item -LiteralPath "$DistDir\requirements.txt" -Destination "$PithServerPath\requirements.txt" -Force -ErrorAction Stop
+    if (Test-Path -LiteralPath "$DistDir\scripts") {
+        Copy-Item -LiteralPath "$DistDir\scripts" -Destination $PithServerPath -Recurse -Force -ErrorAction Stop
     }
-    if (Test-Path "$DistDir\migrations") {
-        Copy-Item -Path "$DistDir\migrations" -Destination "$PithServerPath\migrations" -Recurse -Force
+    if (Test-Path -LiteralPath "$DistDir\migrations") {
+        Copy-Item -LiteralPath "$DistDir\migrations" -Destination $PithServerPath -Recurse -Force -ErrorAction Stop
     }
-    if (Test-Path "$DistDir\integrations") {
-        Copy-Item -Path "$DistDir\integrations" -Destination "$PithServerPath\integrations" -Recurse -Force
+    if (Test-Path -LiteralPath "$DistDir\integrations") {
+        Copy-Item -LiteralPath "$DistDir\integrations" -Destination $PithServerPath -Recurse -Force -ErrorAction Stop
     }
     Write-Success "Copied server files from distribution"
     Write-Host "PITH_PACKAGE_SOURCE=distribution_directory"
@@ -1516,7 +1590,7 @@ if (
 # Strategy 2: Local tarball/zip (created by build-release.sh)
 if (-not $DownloadSuccess) {
     $LocalPackage = Join-Path $DistDir "pith-server-latest.zip"
-    if (Test-Path $LocalPackage) {
+    if (Test-Path -LiteralPath $LocalPackage) {
         Write-Host "  Found local package: $LocalPackage"
         $LocalChecksum = "$LocalPackage.sha256"
         if (-not (Test-Path -LiteralPath $LocalChecksum -PathType Leaf)) {
@@ -1531,10 +1605,10 @@ if (-not $DownloadSuccess) {
         if ($ActualLocalHash -ne $ExpectedLocalHash) {
             throw "Local release package checksum verification failed"
         }
-        if (-not (Test-Path $PithServerPath)) {
+        if (-not (Test-Path -LiteralPath $PithServerPath)) {
             New-Item -ItemType Directory -Path $PithServerPath -Force | Out-Null
         }
-        Expand-Archive -Path $LocalPackage -DestinationPath $PithServerPath -Force
+        Expand-Archive -LiteralPath $LocalPackage -DestinationPath $PithServerPath -Force
         Write-Success "Extracted local server package"
         Write-Host "PITH_PACKAGE_SOURCE=adjacent_verified_zip"
         $DownloadSuccess = $true
@@ -1563,7 +1637,7 @@ if (-not $DownloadSuccess) {
         Invoke-WebRequest -Uri $ChecksumUrl -OutFile $ChecksumPath -TimeoutSec 30 -ErrorAction SilentlyContinue
 
         # Verify checksum
-        if ((Test-Path $ServerPath) -and (Test-Path $ChecksumPath)) {
+        if ((Test-Path -LiteralPath $ServerPath) -and (Test-Path -LiteralPath $ChecksumPath)) {
             $FileHash = Get-PithSha256 -Path $ServerPath
             $ChecksumContent = (Get-Content $ChecksumPath | Select-Object -First 1) -split ' '
             $ExpectedHash = $ChecksumContent[0]
@@ -1572,10 +1646,10 @@ if (-not $DownloadSuccess) {
                 Write-Success "Download successful and checksum verified"
 
                 # Extract server
-                if (-not (Test-Path $PithServerPath)) {
+                if (-not (Test-Path -LiteralPath $PithServerPath)) {
                     New-Item -ItemType Directory -Path $PithServerPath -Force | Out-Null
                 }
-                Expand-Archive -Path $ServerPath -DestinationPath $PithServerPath -Force
+                Expand-Archive -LiteralPath $ServerPath -DestinationPath $PithServerPath -Force
                 Write-Host "PITH_PACKAGE_SOURCE=hosted_verified_zip"
                 $DownloadSuccess = $true
             }
@@ -1598,10 +1672,12 @@ if (-not $DownloadSuccess) {
 if (-not $DownloadSuccess) {
     Write-Error-Custom "Could not locate Pith server files. Run this script from the distribution directory or provide DOWNLOAD_URL."
 }
-if (-not (Test-Path "$PithServerPath\pith_client\cli.py" -PathType Leaf)) {
+if (-not (Test-Path -LiteralPath "$PithServerPath\pith_client\cli.py" -PathType Leaf)) {
     throw "Installed Pith server tree is incomplete: missing pith_client\cli.py"
 }
 
+$BytecodeRemoved = Clear-PithApplicationBytecode -PithHome $PithHome -ServerPath $PithServerPath
+Write-Host "PITH_APPLICATION_BYTECODE_REMOVED=$BytecodeRemoved"
 Write-Host ""
 
 # ============================================================================
