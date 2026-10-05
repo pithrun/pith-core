@@ -4,6 +4,13 @@ All notable changes to Pith are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.9] - 2026-10-04
+
+### Fixed
+- Windows upgrades merge application directories into their active locations instead of creating nested copies.
+- Windows upgrades clear application-owned Python bytecode after acquiring the package, so subsequent imports use the installed source. User data and configuration are preserved.
+- The Windows installer stops if it cannot complete or verify application-bytecode cleanup.
+
 ## [1.0.8] - 2026-10-01
 
 ### Fixed
