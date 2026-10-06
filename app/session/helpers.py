@@ -6,11 +6,9 @@ Phase 1B P1.1: Session persistence to SQLite, startup recovery, stub retirement.
 Key design: session_start loads concepts ONCE and passes to both introspect
 and orient — single disk scan, no redundant reads.
 
-Stub surface area (2 stubs remaining for Phase 1B+ retirement):
-  - contradictions_detected — wired to DB via ARCH-O01 (session.py:1165)
-  - corrections_made (needs error tracking wiring — correction.py runs but output not connected)
-
 Retired stubs:
+  - contradictions_detected → wired to DB via ARCH-O01 (app/session/orient.py:_compute_where_been)
+  - corrections_made → wired to DB via ARCH-O01 (app/session/orient.py:_compute_where_been)
   - open_threads → self._compute_open_threads() calls app.threads [Phase 1B+]
   - next_recommended_actions → populated via actions logic [Phase 1B+]
   - strategic_priorities → populated via priority extraction [Phase 1B+]

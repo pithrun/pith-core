@@ -6,6 +6,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from pith_client.learning_receipts import classify_learning_result
+
 CONFORMANCE_SCHEMA_VERSION = "surface_lifecycle_conformance.v3"
 SURFACE_LIFECYCLE_VERSION = "3.0"
 
@@ -808,12 +810,14 @@ def evaluate_learning_phase(
             capture_state = str(probe.get("learning_capture_state") or "")
             immediate_status = str(probe.get("immediate_status") or "")
             linkage_state = str(probe.get("session_linkage_state") or "")
-            has_learning_evidence = (
-                accepted_events > 0
-                or learning_events > 0
-                or capture_state == "accepted"
-                or immediate_status == "committed"
-            )
+            interpretation = dict(probe)
+            interpretation["status"] = immediate_status
+            classification = classify_learning_result(interpretation)
+            has_learning_evidence = classification == "committed"
+            if not any(key in probe for key in ("accepted_learning_events", "learning_events", "learning_capture_state")):
+                has_learning_evidence = (
+                    classification not in {"failed", "partial", "processing", "unknown_pending"}
+                    and immediate_status == "committed")
             if not has_learning_evidence:
                 status = "failed"
                 proof_status = "failed"

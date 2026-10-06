@@ -15,6 +15,8 @@ from typing import Any
 
 import requests
 
+from pith_client.learning_receipts import classify_learning_result, learning_result_body
+
 from ._base import DEFAULT_BASE_URL
 
 DEFAULT_TIMEOUT = 30.0
@@ -1093,6 +1095,8 @@ def _parse_transport_ts(value: Any) -> float | None:
 
 
 _TRANSPORT_LIFECYCLE_SAFE_KEYS = {
+    "learning_capture_state",
+    "errors",
     "ts",
     "event",
     "operation",
@@ -1317,6 +1321,12 @@ class _TransportLifecycleReporter(_LifecycleReporter):
             "previous_response_present": state.get("previous_response_present"),
             "extracted_concepts_present": state.get("extracted_concepts_present"),
         }
+        if state.get("learning_capture_state") or state.get("errors") is not None:
+            classification = classify_learning_result({k: v for k, v in state.items() if v is not None})
+            if classification in {"failed", "partial", "processing", "unknown_pending"}:
+                return _lifecycle_phase(
+                    "degraded" if classification in {"processing", "unknown_pending"} else "failed",
+                    verdict="not_enforced", reason=classification, **evidence)
         if state.get("operation") == "session_end" and state.get("error") is not True:
             return _lifecycle_phase("passed", verdict="observed", reason=self.learning_reason, **evidence)
         if state.get("operation") == "conversation_turn" and (
@@ -1596,7 +1606,20 @@ def _claude_code_learning_phase(state: dict[str, Any]) -> dict[str, Any]:
         "session_linkage_state": state.get("last_stop_learn_session_linkage_state"),
         "request_id": state.get("last_stop_learn_request_id"),
     }
-    if learn_status == "committed" and accepted_count > 0:
+    evidence["errors"] = state.get("last_stop_learn_" + "errors")
+    result_evidence = {
+        key: state["last_stop_learn_" + key]
+        for key in ("accepted_learning_events", "learning_events", "learning_capture_state", "errors")
+        if "last_stop_learn_" + key in state
+    }
+    result_evidence["status"] = learn_status
+    classification = classify_learning_result(result_evidence)
+    if classification in {"failed", "partial", "processing", "unknown_pending"}:
+        return _lifecycle_phase(
+            "degraded" if classification in {"processing", "unknown_pending"} else "failed",
+            verdict="pending" if classification in {"processing", "unknown_pending"} else "not_enforced",
+            reason=classification, **evidence)
+    if learn_status == "committed" and accepted_count > 0 and classification == "committed":
         return _lifecycle_phase("passed", verdict="enforced", **evidence)
     if learn_status == "committed":
         return _lifecycle_phase(
@@ -1735,6 +1758,19 @@ def _codex_learning_phase(state: dict[str, Any]) -> dict[str, Any]:
         "stop_observed": state.get("last_stop_observed") if proof_prefix else state.get("stop_observed"),
         "proof_source": proof_source,
     }
+    evidence["errors"] = state.get(proof_prefix + "errors")
+    result_evidence = {
+        key: state[proof_prefix + key]
+        for key in ("accepted_learning_events", "learning_events", "learning_capture_state", "errors")
+        if proof_prefix + key in state
+    }
+    result_evidence["status"] = learn_status
+    classification = classify_learning_result(result_evidence)
+    if classification in {"failed", "partial", "processing", "unknown_pending"}:
+        return _lifecycle_phase(
+            "degraded" if classification in {"processing", "unknown_pending"} else "failed",
+            verdict="pending" if classification in {"processing", "unknown_pending"} else "not_enforced",
+            reason=classification, **evidence)
     if (
         proof_source == "current_stop"
         and learn_status == "skipped"
@@ -1754,7 +1790,7 @@ def _codex_learning_phase(state: dict[str, Any]) -> dict[str, Any]:
         learn_status = "committed"
         evidence["proof_source"] = "last_stop"
         evidence["last_stop_status_gap_detected"] = True
-    if learn_status == "committed" and accepted_count > 0:
+    if learn_status == "committed" and accepted_count > 0 and classification == "committed":
         return _lifecycle_phase("passed", verdict="enforced", **evidence)
     if learn_status == "committed":
         return _lifecycle_phase(
@@ -3797,6 +3833,7 @@ def _emit_lifecycle_api_call_event(
         surface_id = "local_api_cli"
     auto_learned = body.get("auto_learned")
     auto_learned_events = auto_learned.get("events") if isinstance(auto_learned, dict) else None
+    learning_body = learning_result_body(operation, body)
     _transport_event(
         "lifecycle_api_call",
         operation=operation,
@@ -3815,7 +3852,9 @@ def _emit_lifecycle_api_call_event(
         extracted_concepts_present=bool(args.get("extracted_concepts_json")),
         auto_learned=bool(auto_learned),
         learning_events=body.get("learning_events") if body.get("learning_events") is not None else auto_learned_events,
-        accepted_learning_events=body.get("accepted_learning_events"),
+        accepted_learning_events=learning_body.get("accepted_learning_events"),
+        learning_capture_state=learning_body.get("learning_capture_state"),
+        errors=learning_body.get("errors"),
         checkpoint_task_id=args.get("task_id") or body.get("task_id"),
         api_url=api_url,
     )

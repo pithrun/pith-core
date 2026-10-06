@@ -26,6 +26,8 @@ import logging
 import os
 import threading
 import time
+from collections.abc import Callable
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -125,7 +127,30 @@ class RefreshQueue:
 refresh_queue = RefreshQueue()
 
 
-def drain_due(engine, *, now: float | None = None) -> dict | None:
+def _pressure_kwargs(pressure_provider: Callable[[], Any] | None) -> dict:
+    if pressure_provider is None:
+        return {}
+    try:
+        snapshot = pressure_provider()
+        return {
+            "host_memory_pressure_state": str(
+                getattr(snapshot, "memory_state", None) or "unknown"
+            ),
+            "host_pressure_reasons": list(getattr(snapshot, "reason_codes", None) or []),
+        }
+    except Exception as exc:  # noqa: BLE001 - pressure sampling is fail-open
+        return {
+            "host_memory_pressure_state": "unknown",
+            "host_pressure_reasons": [f"sampler_error:{type(exc).__name__}"],
+        }
+
+
+def drain_due(
+    engine,
+    *,
+    now: float | None = None,
+    pressure_provider: Callable[[], Any] | None = None,
+) -> dict | None:
     """Drain one due batch through ``engine.refresh_concepts``.
 
     Returns the refresh report, or None if no batch was due. On a deferred result
@@ -135,7 +160,12 @@ def drain_due(engine, *, now: float | None = None) -> dict | None:
     batch = refresh_queue.take_due_batch(now=now)
     if not batch:
         return None
-    report = engine.refresh_concepts(batch, persist=True, refresh_embeddings=True)
+    report = engine.refresh_concepts(
+        batch,
+        persist=True,
+        refresh_embeddings=True,
+        **_pressure_kwargs(pressure_provider),
+    )
     _record_drain(report)  # MONITOR-163: retain a compact summary for observability
     if report.get("deferred"):
         # Could not acquire the reflection lock — retry on a later tick.
@@ -143,12 +173,16 @@ def drain_due(engine, *, now: float | None = None) -> dict | None:
             refresh_queue.enqueue(cid, now=now)
         logger.info("tfidf refresh drain: deferred (%s) — re-enqueued %d ids", report["deferred"], len(batch))
     else:
+        requeue_ids = list(dict.fromkeys(report.get("requeue_ids", [])))
+        for cid in requeue_ids:
+            refresh_queue.enqueue(cid, now=now)
         logger.info(
-            "tfidf refresh drain: refreshed=%d skipped=%d df_delta=%s embeddings=%d pending=%d",
+            "tfidf refresh drain: refreshed=%d skipped=%d df_delta=%s embeddings=%d requeued=%d pending=%d",
             len(report.get("refreshed", [])),
             len(report.get("skipped", [])),
             report.get("df_recount_delta"),
             report.get("embeddings_refreshed", 0),
+            len(requeue_ids),
             refresh_queue.pending_count(),
         )
     return report
@@ -192,6 +226,7 @@ def _record_drain(report: dict) -> None:
         "skipped_count": len(report.get("skipped", [])),
         "df_recount_delta": report.get("df_recount_delta"),
         "embeddings_refreshed": report.get("embeddings_refreshed", 0),
+        "requeue_count": len(report.get("requeue_ids", [])),
         "duration_s": report.get("duration_s"),
     }
 
@@ -217,7 +252,7 @@ def get_drain_status() -> dict:
     }
 
 
-async def _drain_loop() -> None:
+async def _drain_loop(pressure_provider: Callable[[], Any] | None = None) -> None:
     global _consecutive_failures, _failures_total, _last_error
     from app.retrieval import retrieval_engine
 
@@ -231,7 +266,11 @@ async def _drain_loop() -> None:
             if refresh_queue.pending_count() == 0:
                 continue
             # refresh_concepts is synchronous + CPU-bound (force_idf_recalculation).
-            await asyncio.to_thread(drain_due, retrieval_engine)
+            await asyncio.to_thread(
+                drain_due,
+                retrieval_engine,
+                pressure_provider=pressure_provider,
+            )
             _consecutive_failures = 0
         except asyncio.CancelledError:
             logger.info("tfidf refresh drain: cancelled (shutdown)")
@@ -249,7 +288,10 @@ async def _drain_loop() -> None:
                 return
 
 
-async def start_refresh_drain() -> asyncio.Task | None:
+async def start_refresh_drain(
+    *,
+    pressure_provider: Callable[[], Any] | None = None,
+) -> asyncio.Task | None:
     """Start the drain loop, or return None if the feature is disabled."""
     global _drain_task
     if not drain_enabled():
@@ -257,7 +299,10 @@ async def start_refresh_drain() -> asyncio.Task | None:
         return None
     if _drain_task is not None and not _drain_task.done():
         return _drain_task
-    _drain_task = asyncio.create_task(_drain_loop(), name="pith-tfidf-refresh-drain")
+    _drain_task = asyncio.create_task(
+        _drain_loop(pressure_provider),
+        name="pith-tfidf-refresh-drain",
+    )
     return _drain_task
 
 

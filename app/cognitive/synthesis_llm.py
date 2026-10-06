@@ -43,6 +43,7 @@ MODEL = os.environ.get("PITH_SYNTHESIS_MODEL", MAINTENANCE_LLM_MODEL)
 TIMEOUT_SECONDS = int(os.environ.get("PITH_SYNTHESIS_TIMEOUT_S", "15"))
 MAX_TOKENS = 500
 SUMMARY_TRUNCATE = 500  # Max chars per concept summary in prompts
+MAX_SYNTHESIS_SOURCES = 10  # Individual source summaries per model call
 
 MAX_CLUSTERS = int(os.environ.get("PITH_SYNTHESIS_MAX_CLUSTERS", "5"))
 MIN_CLUSTER_SIZE = int(os.environ.get("PITH_SYNTHESIS_MIN_CLUSTER_SIZE", "3"))
@@ -240,23 +241,28 @@ def _cluster_candidates(candidates: list[dict]) -> list[dict]:
 
     clusters = []
     for area, concepts in by_area.items():
-        if len(concepts) < MIN_CLUSTER_SIZE:
+        evaluated = concepts[:MAX_SYNTHESIS_SOURCES]
+        if len(evaluated) < MIN_CLUSTER_SIZE:
             continue
 
-        avg_conf = sum(c["confidence"] for c in concepts) / len(concepts)
-        summaries = [c["summary"] for c in concepts]
+        # Rank whole groups as before, but derive evidence only from model inputs.
+        score = sum(c["confidence"] for c in concepts)
+        avg_conf = sum(c["confidence"] for c in evaluated) / len(evaluated)
+        summaries = [c["summary"] for c in evaluated]
         target_type, question_template = _classify_cluster_type(summaries)
         theme = _extract_theme(summaries, area)
 
         clusters.append(
             {
                 "knowledge_area": area,
-                "concepts": concepts,
+                "concepts": evaluated,
+                "candidate_count": len(concepts),
+                "deferred_source_ids": [c["id"] for c in concepts[MAX_SYNTHESIS_SOURCES:]],
                 "avg_confidence": avg_conf,
                 "target_type": target_type,
                 "synthesis_hint": question_template.format(theme=theme),
                 "theme": theme,
-                "score": len(concepts) * avg_conf,  # Rank metric
+                "score": score,  # Full-group ranking; not evidence strength
             }
         )
 
@@ -276,11 +282,12 @@ def _build_synthesis_prompt(cluster: dict) -> tuple[str, tuple[float, float]]:
     Returns (prompt_text, (conf_low, conf_high)) so the caller can clamp
     the LLM's output to the earned confidence bracket.
     """
+    evaluated = cluster["concepts"][:MAX_SYNTHESIS_SOURCES]
     summaries = []
-    for i, c in enumerate(cluster["concepts"][:10], 1):
+    for i, c in enumerate(evaluated, 1):
         summaries.append(f"{i}. {c['summary']}")
 
-    n = len(cluster["concepts"])
+    n = len(evaluated)
     conf_low, conf_high, tier_label = _confidence_bracket(n)
 
     prompt = PROMPT_L1_SYNTHESIS.format(
@@ -532,11 +539,10 @@ async def run_synthesis() -> dict:
     # 7.2 Cluster
     clusters = _cluster_candidates(candidates)
     if not clusters:
-        # Mark all candidates as evaluated even if no clusters formed
-        all_ids = [c["id"] for c in candidates]
-        _mark_evaluated(all_ids)
         logger.info(
-            "REFLECT-030: No clusters met minimum size (%d) — marking %d evaluated", MIN_CLUSTER_SIZE, len(all_ids)
+            "REFLECT-030: No clusters met minimum size (%d) — retaining %d eligible candidates",
+            MIN_CLUSTER_SIZE,
+            len(candidates),
         )
         return {"status": "completed", "reason": "no_qualifying_clusters", "candidates": len(candidates)}
 
@@ -557,6 +563,8 @@ async def run_synthesis() -> dict:
         cluster_detail = {
             "knowledge_area": cluster["knowledge_area"],
             "concept_count": len(cluster["concepts"]),
+            "candidate_count": cluster["candidate_count"],
+            "deferred_source_ids": cluster["deferred_source_ids"],
             "theme": cluster["theme"],
             "source_ids": source_ids,
         }

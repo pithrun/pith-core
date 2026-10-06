@@ -121,6 +121,42 @@ def _required_context_cache_servable() -> tuple[bool, str]:
         return False, f"error={_error_text(exc)}"
 
 
+def _request_required_context_cache_recovery() -> str:
+    """Schedule a single-flight refresh only for eligible, pressure-safe work."""
+    try:
+        from app.session.required_context_cache import get_required_context
+        from app.storage.connection import read_snapshot_db
+
+        deferred, mode, level = _pressure_backpressure_active()
+        if deferred or mode == "unknown" or level == "unknown":
+            return "deferred_pressure"
+        with read_snapshot_db("autolearn_cache_recovery", allow_fallback=False) as conn:
+            _set_busy_timeout(conn)
+            ready = conn.execute(
+                """SELECT 1 FROM autolearn_maintenance_queue
+                   WHERE status='queued'
+                     AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+                   LIMIT 1""",
+                (_utc_now_iso(),),
+            ).fetchone()
+        if ready is None:
+            return "no_ready_work"
+        # No cache payload or queue claim is used until a later servable pass.
+        _, stats = get_required_context(
+            prefer_stale_fallback=True,
+            background_refresh=True,
+            allow_sync_refresh=False,
+        )
+        if stats.refresh_scheduled:
+            return "scheduled"
+        if stats.refresh_in_flight:
+            return "in_flight"
+        return "not_scheduled"
+    except Exception:
+        # Keep private storage/loader details out of public health and labels.
+        return "unavailable"
+
+
 def _autolearn_pressure_starved(conn) -> bool:
     from app.core.config import (
         get_autolearn_catchup_enabled,
@@ -835,6 +871,7 @@ def run_autolearn_maintenance_supervisor_once(
         else get_autolearn_maintenance_supervisor_max_wall_seconds()
     )
     started_at = _utc_now_iso()
+    _set_supervisor_state(last_cache_recovery=None)
     if _benchmark_mode_active():
         result = {
             "success": True,
@@ -896,11 +933,17 @@ def run_autolearn_maintenance_supervisor_once(
     try:
         servable, servable_reason = _required_context_cache_servable()
         if not servable:
+            recovery = (
+                _request_required_context_cache_recovery()
+                if selected_batch_size > 0 and selected_max_wall > 0
+                else "disabled_budget"
+            )
             result = {
                 "success": True,
                 "status": "skipped_required_context_cache",
                 "processed": 0,
                 "reason": servable_reason,
+                "cache_recovery": recovery,
             }
             _set_supervisor_state(
                 running=False,
@@ -909,7 +952,9 @@ def run_autolearn_maintenance_supervisor_once(
                 last_processed=0,
                 last_error=None,
                 last_reason=servable_reason,
+                last_cache_recovery=recovery,
             )
+            _record_metric("autolearn_required_context_recovery_total", 1.0, {"status": recovery})
             _record_metric("autolearn_maintenance_supervisor_pass_total", 1.0, {"status": result["status"]})
             return result
         with owned_connection() as conn:

@@ -459,6 +459,13 @@ def detect_correction(
     composite = min(1.0, composite)
 
     if composite < CORRECTION_CONFIDENCE_THRESHOLD:
+        # ARCH-V116: count rejected invocations, not unique turns.
+        try:
+            from app.core.metrics_facade import metrics as _gate_m
+
+            _gate_m.record("coggov009_gated_count", 1.0)
+        except Exception:
+            logger.warning("ARCH-V116: gated correction metric emission failed")
         return None
 
     return CorrectionEvent(

@@ -31,6 +31,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
 
+from pith_client.learning_receipts import learning_result_body
+
 
 def _bootstrap_mcp_imports():
     """Import MCP SDK, surfacing any failure with structured diagnostic output.
@@ -643,6 +645,7 @@ def _emit_lifecycle_api_call_event(
     body = result if isinstance(result, dict) else {}
     auto_learned = body.get("auto_learned")
     auto_learned_events = auto_learned.get("events") if isinstance(auto_learned, dict) else None
+    learning_body = learning_result_body(operation, body)
     _transport_event(
         "lifecycle_api_call",
         operation=operation,
@@ -661,7 +664,9 @@ def _emit_lifecycle_api_call_event(
         extracted_concepts_present=bool(request_args.get("extracted_concepts_json")),
         auto_learned=bool(auto_learned),
         learning_events=body.get("learning_events") if body.get("learning_events") is not None else auto_learned_events,
-        accepted_learning_events=body.get("accepted_learning_events"),
+        accepted_learning_events=learning_body.get("accepted_learning_events"),
+        learning_capture_state=learning_body.get("learning_capture_state"),
+        errors=learning_body.get("errors"),
         checkpoint_task_id=request_args.get("task_id") or body.get("task_id"),
     )
 

@@ -2328,6 +2328,14 @@ def _abstention_fallback_env_float(
     return max(minimum, min(maximum, value))
 
 
+def _abstention_fallback_deadline_mode() -> str:
+    value = os.environ.get(
+        "PITH_ABSTENTION_FALLBACK_DEADLINE_MODE",
+        "observe",
+    ).strip().lower()
+    return value if value in {"observe", "enforce"} else "observe"
+
+
 def _abstention_fallback_deadline_remaining_ms(turn_deadline: Any) -> float | None:
     if not hasattr(turn_deadline, "remaining_ms"):
         return None
@@ -2388,6 +2396,12 @@ def _abstention_fallback_error_trace(turn_deadline: Any) -> dict[str, Any]:
         "admitted_ids": [],
         "rejected": [],
         "skipped_reason": "fallback_error",
+        "deadline_policy_mode": _abstention_fallback_deadline_mode(),
+        "would_skip_reason": (
+            "deadline_unbounded_search"
+            if bool(getattr(turn_deadline, "enabled", False))
+            else None
+        ),
         "latency_ms": None,
         "deadline_remaining_ms": _abstention_fallback_deadline_remaining_ms(
             turn_deadline
@@ -6174,10 +6188,12 @@ class ConversationTurnMixin:
             reset_samples_on_successful_probe: bool = True,
         ):
             from app.core.foreground_contract import (
-                ForegroundContractConfig,
+                build_foreground_contract_config,
             )
 
-            return ForegroundContractConfig(
+            return build_foreground_contract_config(
+                recorder=_foreground_contract_record,
+                caller="conversation_turn",
                 unit=unit,
                 criticality=criticality,
                 min_remaining_ms=min_remaining_ms,
@@ -6190,10 +6206,29 @@ class ConversationTurnMixin:
 
         def _foreground_contract_decide(config, *, phase: str):
             try:
-                from app.core.foreground_contract import get_foreground_contract
+                from app.core.foreground_contract import (
+                    ForegroundContractDecision,
+                    ForegroundDecision,
+                    get_foreground_contract,
+                )
+
+                if not config.valid:
+                    decision = ForegroundContractDecision(
+                        unit=config.unit,
+                        decision=ForegroundDecision.SKIP,
+                        reason="invalid_config",
+                        remaining_ms=_turn_deadline.remaining_ms(),
+                        mode=config.mode,
+                    )
+                    _foreground_contract_record(
+                        "ct_foreground_contract_decision_total",
+                        1.0,
+                        decision.metric_labels(answer_path=_foreground_answer_path()),
+                    )
+                    return decision
 
                 return get_foreground_contract(_foreground_contract_record).decide(
-                    config,
+                    config.config,
                     deadline=_turn_deadline,
                     answer_path=_foreground_answer_path(),
                 )
@@ -6205,8 +6240,10 @@ class ConversationTurnMixin:
             try:
                 from app.core.foreground_contract import get_foreground_contract
 
+                if not config.valid:
+                    return
                 get_foreground_contract(_foreground_contract_record).record_latency_ms(
-                    config,
+                    config.config,
                     elapsed_ms,
                     answer_path=_foreground_answer_path(),
                 )
@@ -6217,7 +6254,9 @@ class ConversationTurnMixin:
             try:
                 from app.core.foreground_contract import get_foreground_contract
 
-                get_foreground_contract(_foreground_contract_record).cancel_recovery_probe(config)
+                if not config.valid:
+                    return
+                get_foreground_contract(_foreground_contract_record).cancel_recovery_probe(config.config)
             except Exception as _fg_err:
                 logger.debug("FOREGROUND-CONTRACT: %s recovery probe cancel failed: %s", phase, _fg_err)
 
@@ -7868,6 +7907,8 @@ class ConversationTurnMixin:
                 except (TypeError, ValueError):
                     pass
                 search_results = retrieval_engine.search_lightweight(search_query, **_slw_kwargs)
+        _t_search_lw_end = time.perf_counter()  # PERF-017: search_lightweight sub-metric
+        _stage3_supersession_rescue_start = time.perf_counter()
         try:
             from app.core.config import get_feature_flag as _get_feature_flag
             from app.session.supersession_chain_rescue import (
@@ -7936,7 +7977,10 @@ class ConversationTurnMixin:
                     pass
         except Exception as _supersession_rescue_err:
             logger.warning("SUPERSESSION-CHAIN-RESCUE failed (non-fatal): %s", _supersession_rescue_err)
-        _t_search_lw_end = time.perf_counter()  # PERF-017: search_lightweight sub-metric
+        _stage3_add_ms(
+            "ct_subphase_supersession_rescue_ms",
+            _stage3_supersession_rescue_start,
+        )
         _stage3_set_count("ct_subphase_initial_result_count", len(search_results or []))
         _base_retrieval_trace: dict[str, Any] | None = None
         _candidate_flow_trace_requested = _retrieval_candidate_flow_trace_requested(request)
@@ -10025,17 +10069,21 @@ class ConversationTurnMixin:
         _stage3_set_count("ct_subphase_fact_supplement_candidates_count", 0)
         _fact_supplement_attempted = False
         _fact_supplement_fg_config = None
+        _fact_supplement_min_ms = _env_float("PITH_FOREGROUND_FACT_SUPPLEMENT_MIN_MS", 250.0)
         if (
             _FACT_SUPPLEMENT_ENABLED
             and top_results
             and edges
-            and _turn_deadline_optional("injection.fact_supplement")
+            and _turn_deadline_optional(
+                "injection.fact_supplement",
+                min_remaining_ms=_fact_supplement_min_ms,
+            )
             and _stage3_optional_can_start("injection.fact_supplement", min_remaining_ms=50.0)
         ):
             _fact_supplement_fg_config = _foreground_contract_config(
                 unit="injection.fact_supplement",
                 criticality="quality_sensitive_optional",
-                min_remaining_ms=_env_float("PITH_FOREGROUND_FACT_SUPPLEMENT_MIN_MS", 250.0),
+                min_remaining_ms=_fact_supplement_min_ms,
                 recent_p95_limit_ms=_env_float(
                     "PITH_FOREGROUND_FACT_SUPPLEMENT_P95_LIMIT_MS",
                     250.0,
@@ -10186,6 +10234,7 @@ class ConversationTurnMixin:
             25.0,
             5000.0,
         )
+        _kw_contract_min_ms = _env_float("PITH_FOREGROUND_KEYWORD_SUPPLEMENT_MIN_MS", 250.0)
         _stage3_keyword_start = time.perf_counter()
         _stage3_set_count("ct_subphase_keyword_supplement_added_count", 0)
         _stage3_set_count("ct_subphase_keyword_supplement_rows_count", 0)
@@ -10203,13 +10252,16 @@ class ConversationTurnMixin:
         if (
             _KW_SUPPLEMENT_ENABLED
             and top_results
-            and _turn_deadline_optional("injection.keyword_supplement", min_remaining_ms=_KW_MIN_REMAINING_MS)
+            and _turn_deadline_optional(
+                "injection.keyword_supplement",
+                min_remaining_ms=max(_KW_MIN_REMAINING_MS, _kw_contract_min_ms),
+            )
             and _stage3_optional_can_start("injection.keyword_supplement", min_remaining_ms=50.0)
         ):
             _keyword_supplement_fg_config = _foreground_contract_config(
                 unit="injection.keyword_supplement",
                 criticality="quality_sensitive_optional",
-                min_remaining_ms=_env_float("PITH_FOREGROUND_KEYWORD_SUPPLEMENT_MIN_MS", 250.0),
+                min_remaining_ms=_kw_contract_min_ms,
                 recent_p95_limit_ms=_env_float(
                     "PITH_FOREGROUND_KEYWORD_SUPPLEMENT_P95_LIMIT_MS",
                     250.0,
@@ -10583,15 +10635,17 @@ class ConversationTurnMixin:
         _stage3_verbatim_start = time.perf_counter()
         _stage3_set_count("ct_subphase_verbatim_added_count", 0)
         _stage3_set_count("ct_subphase_locomo_parity_vf1_count", 0)
+        _verbatim_path_b_min_ms = _env_float("PITH_FOREGROUND_VERBATIM_PATH_B_MIN_MS", 500.0)
         _verbatim_path_b_allowed = _VERBATIM_RETRIEVAL_ENABLED and _turn_deadline_optional(
-            "injection.verbatim_retrieval"
+            "injection.verbatim_retrieval",
+            min_remaining_ms=_verbatim_path_b_min_ms,
         )
         _verbatim_path_b_fg_config = None
         if _verbatim_path_b_allowed:
             _verbatim_path_b_fg_config = _foreground_contract_config(
                 unit="injection.verbatim_path_b",
                 criticality="quality_sensitive_optional",
-                min_remaining_ms=_env_float("PITH_FOREGROUND_VERBATIM_PATH_B_MIN_MS", 500.0),
+                min_remaining_ms=_verbatim_path_b_min_ms,
                 recent_p95_limit_ms=_env_float("PITH_FOREGROUND_VERBATIM_PATH_B_P95_LIMIT_MS", 350.0),
                 circuit_ttl_s=_env_float("PITH_FOREGROUND_VERBATIM_PATH_B_CIRCUIT_TTL_S", 60.0),
             )
@@ -11115,10 +11169,18 @@ class ConversationTurnMixin:
         _GATE_MAX_PAIRS = int(os.environ.get('PITH_SCORE_GATE_MAX_PAIRS', '3'))
         _stage3_score_gate_start = time.perf_counter()
         _score_gate_fg_config = None
+        _score_gate_min_ms = _env_float("PITH_FOREGROUND_SCORE_GATE_MIN_MS", 500.0)
         _stage3_set_count("ct_subphase_injection_score_gate_inflated_count", 0)
         _stage3_set_count("ct_subphase_injection_score_gate_scored_count", 0)
         _stage3_set_count("ct_subphase_injection_score_gate_skipped_count", 0)
-        if _SCORE_GATE_ENABLED and top_results and _turn_deadline_optional("injection.score_gate"):
+        if (
+            _SCORE_GATE_ENABLED
+            and top_results
+            and _turn_deadline_optional(
+                "injection.score_gate",
+                min_remaining_ms=_score_gate_min_ms,
+            )
+        ):
             try:
                 _sg_inflated = [
                     (i, r) for i, r in enumerate(top_results)
@@ -11138,7 +11200,7 @@ class ConversationTurnMixin:
                     _score_gate_fg_config = _foreground_contract_config(
                         unit="injection.score_gate",
                         criticality="quality_sensitive_optional",
-                        min_remaining_ms=_env_float("PITH_FOREGROUND_SCORE_GATE_MIN_MS", 500.0),
+                        min_remaining_ms=_score_gate_min_ms,
                         recent_p95_limit_ms=_env_float(
                             "PITH_FOREGROUND_SCORE_GATE_P95_LIMIT_MS",
                             500.0,
@@ -11650,11 +11712,12 @@ class ConversationTurnMixin:
         _stage3_add_ms("ct_subphase_injection_source_set_trace_ms", _stage3_source_set_trace_start)
 
         _stage3_serial_order_start = time.perf_counter()
-        if top_results and _turn_deadline_optional("injection.serial_order_map", 50.0):
+        _serial_order_min_ms = _env_float("PITH_FOREGROUND_SERIAL_ORDER_MAP_MIN_MS", 150.0)
+        if top_results and _turn_deadline_optional("injection.serial_order_map", _serial_order_min_ms):
             _serial_order_fg_config = _foreground_contract_config(
                 unit="injection.serial_order_map",
                 criticality="quality_sensitive_optional",
-                min_remaining_ms=_env_float("PITH_FOREGROUND_SERIAL_ORDER_MAP_MIN_MS", 75.0),
+                min_remaining_ms=_serial_order_min_ms,
                 recent_p95_limit_ms=_env_float(
                     "PITH_FOREGROUND_SERIAL_ORDER_MAP_P95_LIMIT_MS",
                     150.0,
@@ -12168,10 +12231,11 @@ class ConversationTurnMixin:
         _stage3_add_ms("ct_subphase_injection_session_local_grounding_ms", _stage3_session_local_grounding_start)
 
         _stage3_recency_baseline_start = time.perf_counter()
+        _recency_baseline_min_ms = _env_float("PITH_FOREGROUND_RECENCY_BASELINE_MIN_MS", 250.0)
         _recency_baseline_fg_config = _foreground_contract_config(
             unit="injection.recency_baseline",
             criticality="quality_sensitive_optional",
-            min_remaining_ms=_env_float("PITH_FOREGROUND_RECENCY_BASELINE_MIN_MS", 250.0),
+            min_remaining_ms=_recency_baseline_min_ms,
             recent_p95_limit_ms=_env_float(
                 "PITH_FOREGROUND_RECENCY_BASELINE_P95_LIMIT_MS",
                 250.0,
@@ -12183,7 +12247,10 @@ class ConversationTurnMixin:
         )
         _recency_baseline_attempted = False
         try:
-            if not _turn_deadline_optional("injection.recency_baseline"):
+            if not _turn_deadline_optional(
+                "injection.recency_baseline",
+                min_remaining_ms=_recency_baseline_min_ms,
+            ):
                 raise _BudgetSkip()
             _recency_baseline_decision = _foreground_contract_decide(
                 _recency_baseline_fg_config,
@@ -12881,6 +12948,7 @@ class ConversationTurnMixin:
             logger.debug(f"PRODUCT-003: abstention_signal failed (non-fatal): {e}")
 
         _abstention_fallback_trace = None
+        _stage3_abstention_fallback_start = time.perf_counter()
         try:
             _abstention_fallback_trace = self._maybe_run_abstention_fallback(
                 request=request,
@@ -12934,6 +13002,11 @@ class ConversationTurnMixin:
             )
             _abstention_fallback_trace = _abstention_fallback_error_trace(
                 _turn_deadline
+            )
+        finally:
+            _stage3_add_ms(
+                "ct_subphase_abstention_fallback_ms",
+                _stage3_abstention_fallback_start,
             )
 
         _nonstrategy_recovery_trace = None
@@ -14544,13 +14617,8 @@ class ConversationTurnMixin:
         if auto_learn_result:
             # Synchronous path (feature flag OFF) — original behavior preserved
             budget_warnings = auto_learn_result.budget_warnings or []
+            auto_learned = auto_learn_result.learning_summary()
             if auto_learn_result.learning_events > 0:
-                auto_learned = {
-                    "events": auto_learn_result.learning_events,
-                    "concepts_created": [c.concept_id for c in auto_learn_result.concepts_created],
-                    "concepts_evolved": [c.concept_id for c in auto_learn_result.concepts_evolved],
-                    "budget_warnings": budget_warnings,
-                }
                 try:
                     from app.api.pricing import conversation_meter
                     remaining = conversation_meter.consume_turn()
@@ -16238,6 +16306,8 @@ class ConversationTurnMixin:
             "admitted_ids": [],
             "rejected": [],
             "skipped_reason": None,
+            "deadline_policy_mode": _abstention_fallback_deadline_mode(),
+            "would_skip_reason": None,
             "latency_ms": None,
             "deadline_remaining_ms": _abstention_fallback_deadline_remaining_ms(
                 turn_deadline
@@ -16295,6 +16365,18 @@ class ConversationTurnMixin:
                 turn_deadline
             )
             return trace
+
+        if bool(getattr(turn_deadline, "enabled", False)):
+            trace["would_skip_reason"] = "deadline_unbounded_search"
+            if trace["deadline_policy_mode"] == "enforce":
+                if hasattr(turn_deadline, "skip"):
+                    turn_deadline.skip(
+                        "retrieval.abstention_fallback",
+                        "deadline_unbounded_search",
+                        priority="required_degraded",
+                    )
+                trace["skipped_reason"] = "deadline_unbounded_search"
+                return trace
 
         max_results = _abstention_fallback_env_int(
             "PITH_ABSTENTION_FALLBACK_MAX_RESULTS",

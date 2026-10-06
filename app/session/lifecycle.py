@@ -706,7 +706,12 @@ class LifecycleMixin:
             "learning_events": self.current_session.learning_event_count,
             "access_records_flushed": flushed,
             "reflection_triggered": False,
-            "last_exchange_flushed": last_learn_result is not None and last_learn_result.learning_events > 0,
+            "last_exchange_flushed": (
+                last_learn_result is not None
+                and last_learn_result.accepted_learning_events > 0
+                and last_learn_result.learning_capture_state == "accepted"
+                and last_learn_result.errors == 0),
+            "last_exchange_learning": last_learn_result.learning_summary() if last_learn_result is not None else None,
         }
 
         # ARCH-002: Capture session state before clearing.

@@ -31,13 +31,16 @@ from app.core.deadline import TurnDeadline
 from app.core.file_lock import lock_fd_exclusive, unlock_fd
 from app.core.foreground_contract import (
     ForegroundContractConfig,
+    ForegroundContractDecision,
     ForegroundDecision,
+    build_foreground_contract_config,
     foreground_contract_mode_for_unit,
     get_foreground_contract,
 )
 from app.core.models import SearchQuery, SearchResult
 from app.core.profile import resolve_data_dir
 from app.retrieval import refresh_drain as _refresh_drain
+from app.retrieval.foreground_embedding import foreground_embedding_process
 from app.retrieval.incremental_tfidf import IncrementalTfidfIndex
 from app.retrieval.query_intent import QueryIntentExpansion, expand_query_intent
 from app.retrieval.searchable_text import (
@@ -3101,7 +3104,7 @@ class RetrievalEngine:
         """
         _slw_min_remaining_ms = _env_float("PITH_TURN_DEADLINE_MIN_RETRIEVAL_MS", 250.0)
         _slw_min_embedding_init_ms = _env_float("PITH_SLW_MIN_EMBEDDING_INIT_MS", 100.0)
-        _slw_min_embedding_search_ms = _env_float("PITH_SLW_MIN_EMBEDDING_SEARCH_MS", 250.0)
+        _slw_min_embedding_search_ms = _env_float("PITH_SLW_MIN_EMBEDDING_SEARCH_MS", 500.0)
         _slw_embedding_search_p95_limit_ms = _env_float(
             "PITH_FOREGROUND_EMBEDDING_SEARCH_P95_LIMIT_MS",
             500.0,
@@ -3118,6 +3121,21 @@ class RetrievalEngine:
         _slw_embedding_search_admission_enabled = _env_flag(
             "PITH_SLW_EMBEDDING_SEARCH_ADMISSION_ENABLED",
             True,
+        )
+        _slw_foreground_embedding_enabled = _env_flag(
+            "PITH_FOREGROUND_EMBEDDING_ENABLED",
+            True,
+        )
+        _slw_foreground_embedding_bounded_enabled = _env_flag(
+            "PITH_FOREGROUND_EMBEDDING_BOUNDED_ENABLED",
+            False,
+        )
+        _slw_foreground_embedding_timeout_ms = max(
+            50.0,
+            min(
+                2000.0,
+                _env_float("PITH_FOREGROUND_EMBEDDING_SEARCH_TIMEOUT_MS", 600.0),
+            ),
         )
         _slw_semantic_recovery_enabled = get_feature_flag("LIVE_SEMANTIC_RECOVERY_ENABLED", False)
         _slw_semantic_recovery_top_k = _env_int_clamped(
@@ -3136,7 +3154,7 @@ class RetrievalEngine:
             "PITH_SLW_SEMANTIC_RECOVERY_MIN_SCORE",
             MIN_RETRIEVAL_SIMILARITY,
         )
-        _slw_min_semantic_recovery_ms = _env_float("PITH_SLW_MIN_SEMANTIC_RECOVERY_MS", 250.0)
+        _slw_min_semantic_recovery_ms = _env_float("PITH_SLW_MIN_SEMANTIC_RECOVERY_MS", 750.0)
         _slw_semantic_recovery_p95_limit_ms = _env_float(
             "PITH_FOREGROUND_SEMANTIC_RECOVERY_P95_LIMIT_MS",
             750.0,
@@ -3691,6 +3709,80 @@ class RetrievalEngine:
                     recovery_cancel_err,
                 )
 
+        def _run_embedding_encoder(
+            query: str,
+            result_limit: int,
+            *,
+            phase: str,
+        ) -> tuple[list[tuple[str, float]] | None, str, float]:
+            if deadline and deadline.enabled:
+                if not _slw_foreground_embedding_enabled:
+                    return None, "semantic_disabled", 0.0
+                if _slw_foreground_embedding_bounded_enabled:
+                    bounded_started = time.perf_counter()
+                    remaining_ms = deadline.remaining_ms()
+                    available_ms = max(
+                        0.0,
+                        (remaining_ms if remaining_ms is not None else 0.0)
+                        - _slw_min_batch_load_ms,
+                    )
+                    timeout_ms = min(
+                        _slw_foreground_embedding_timeout_ms,
+                        available_ms,
+                    )
+                    if timeout_ms < 50.0:
+                        return None, "deadline_tail_reserved", 0.0
+                    worker_result = foreground_embedding_process.encode(
+                        query,
+                        timeout_ms=timeout_ms,
+                    )
+                    def _bounded_elapsed_ms() -> float:
+                        return round(
+                            max(
+                                worker_result.elapsed_ms,
+                                (time.perf_counter() - bounded_started) * 1000.0,
+                            ),
+                            2,
+                        )
+                    _record_metric(
+                        "search_lightweight.foreground_embedding_process_ms",
+                        worker_result.elapsed_ms,
+                        {"phase": phase, "outcome": worker_result.outcome},
+                    )
+                    _record_metric(
+                        "search_lightweight.foreground_embedding_process_total",
+                        1.0,
+                        {"phase": phase, "outcome": worker_result.outcome},
+                    )
+                    if worker_result.encode_ms is not None:
+                        _record_metric(
+                            "search_lightweight.foreground_embedding_encode_ms",
+                            worker_result.encode_ms,
+                            {"phase": phase, "outcome": worker_result.outcome},
+                        )
+                    if worker_result.outcome != "completed" or worker_result.vector is None:
+                        return (
+                            None,
+                            worker_result.outcome,
+                            _bounded_elapsed_ms(),
+                        )
+                    try:
+                        raw = embedding_engine.search_vector(
+                            worker_result.vector,
+                            top_k=result_limit,
+                        )
+                    except (TypeError, ValueError):
+                        return (
+                            None,
+                            "invalid_vector",
+                            _bounded_elapsed_ms(),
+                        )
+                    return raw, "completed", _bounded_elapsed_ms()
+
+            started = time.perf_counter()
+            raw = embedding_engine.search(query, top_k=result_limit)
+            return raw, "synchronous", round((time.perf_counter() - started) * 1000.0, 2)
+
         def _run_semantic_recovery(
             fallback_reason: str,
             current_results: list[SearchResult],
@@ -3736,7 +3828,9 @@ class RetrievalEngine:
                 _finish_semantic_recovery("deadline_before_start")
                 return current_results
 
-            recovery_config = ForegroundContractConfig(
+            recovery_config_result = build_foreground_contract_config(
+                recorder=_record_metric,
+                caller="retrieval.semantic_recovery",
                 unit="retrieval.semantic_recovery",
                 criticality="quality_sensitive_optional",
                 min_remaining_ms=_slw_min_semantic_recovery_ms,
@@ -3745,15 +3839,28 @@ class RetrievalEngine:
                 circuit_ttl_s=_slw_semantic_recovery_circuit_ttl_s,
                 skip_when_cold=False,
             )
-            recovery_decision = None
-            try:
-                recovery_decision = get_foreground_contract(_record_metric).decide(
-                    recovery_config,
-                    deadline=deadline,
-                    answer_path="unknown",
+            recovery_config = recovery_config_result.config
+            if not recovery_config_result.valid:
+                recovery_decision = ForegroundContractDecision(
+                    unit=recovery_config_result.unit,
+                    decision=ForegroundDecision.SKIP,
+                    reason="invalid_config",
+                    remaining_ms=deadline.remaining_ms() if deadline else None,
+                    mode=recovery_config_result.mode,
                 )
-            except Exception as recovery_decision_err:
-                logger.debug("FOREGROUND-CONTRACT: semantic recovery decision failed: %s", recovery_decision_err)
+            else:
+                recovery_decision = None
+                try:
+                    recovery_decision = get_foreground_contract(_record_metric).decide(
+                        recovery_config,
+                        deadline=deadline,
+                        answer_path="unknown",
+                    )
+                except Exception as recovery_decision_err:
+                    logger.debug(
+                        "FOREGROUND-CONTRACT: semantic recovery decision failed: %s",
+                        recovery_decision_err,
+                    )
             if recovery_decision is not None and recovery_decision.decision is ForegroundDecision.SKIP:
                 if deadline:
                     deadline.skip(
@@ -3767,19 +3874,19 @@ class RetrievalEngine:
 
             _semantic_recovery_set("attempted", True)
             _semantic_recovery_set("search_started", True)
-            recovery_start = time.perf_counter()
             try:
-                raw_recovery_results = embedding_engine.search(
+                raw_recovery_results, recovery_outcome, recovery_latency_ms = _run_embedding_encoder(
                     effective_query_text,
-                    top_k=_slw_semantic_recovery_top_k,
+                    _slw_semantic_recovery_top_k,
+                    phase="semantic_recovery",
                 )
-                recovery_latency_ms = round((time.perf_counter() - recovery_start) * 1000.0, 2)
                 _semantic_recovery_set("latency_ms", recovery_latency_ms)
+                _semantic_recovery_set("worker_outcome", recovery_outcome)
                 _semantic_recovery_set("raw_count", len(raw_recovery_results or []))
                 _record_metric(
                     "search_lightweight.semantic_recovery_latency_ms",
                     recovery_latency_ms,
-                    {"trigger_reason": fallback_reason},
+                    {"trigger_reason": fallback_reason, "outcome": recovery_outcome},
                 )
             except Exception:
                 _cancel_foreground_recovery_probe(
@@ -3799,6 +3906,12 @@ class RetrievalEngine:
                     phase="retrieval.semantic_recovery",
                 )
                 logger.debug("FOREGROUND-CONTRACT: semantic recovery latency record failed: %s", recovery_latency_err)
+            if raw_recovery_results is None:
+                _finish_semantic_recovery(
+                    f"embedding_{recovery_outcome}",
+                    attempted=True,
+                )
+                return current_results
 
             candidate_ids = [cid for cid, score in raw_recovery_results if score >= _slw_semantic_recovery_min_score]
             _semantic_recovery_set("candidate_id_count", len(candidate_ids))
@@ -3904,7 +4017,9 @@ class RetrievalEngine:
                 _slw_embedding_search_skip_when_cold = (
                     _slw_embedding_search_cold_skip_enabled and not _slw_embedding_search_ready_for_probe
                 )
-                _slw_foreground_config = ForegroundContractConfig(
+                _slw_foreground_config_result = build_foreground_contract_config(
+                    recorder=_record_metric,
+                    caller="retrieval.embedding_search",
                     unit="retrieval.embedding_search",
                     criticality="quality_sensitive_optional",
                     min_remaining_ms=_slw_min_embedding_search_ms,
@@ -3913,15 +4028,28 @@ class RetrievalEngine:
                     circuit_ttl_s=_slw_embedding_search_circuit_ttl_s,
                     skip_when_cold=_slw_embedding_search_skip_when_cold,
                 )
-                _slw_fg_decision = None
-                try:
-                    _slw_fg_decision = get_foreground_contract(_record_metric).decide(
-                        _slw_foreground_config,
-                        deadline=deadline,
-                        answer_path="unknown",
+                _slw_foreground_config = _slw_foreground_config_result.config
+                if not _slw_foreground_config_result.valid:
+                    _slw_fg_decision = ForegroundContractDecision(
+                        unit=_slw_foreground_config_result.unit,
+                        decision=ForegroundDecision.SKIP,
+                        reason="invalid_config",
+                        remaining_ms=deadline.remaining_ms() if deadline else None,
+                        mode=_slw_foreground_config_result.mode,
                     )
-                except Exception as _slw_fg_err:
-                    logger.debug("FOREGROUND-CONTRACT: retrieval shadow decision failed: %s", _slw_fg_err)
+                else:
+                    _slw_fg_decision = None
+                    try:
+                        _slw_fg_decision = get_foreground_contract(_record_metric).decide(
+                            _slw_foreground_config,
+                            deadline=deadline,
+                            answer_path="unknown",
+                        )
+                    except Exception as _slw_fg_err:
+                        logger.debug(
+                            "FOREGROUND-CONTRACT: retrieval shadow decision failed: %s",
+                            _slw_fg_err,
+                        )
                 if _slw_fg_decision is not None and _slw_fg_decision.decision is ForegroundDecision.SKIP:
                     if deadline:
                         deadline.skip(
@@ -3955,18 +4083,23 @@ class RetrievalEngine:
                 else:
                     query_text = effective_query_text
                     _probe_set("embedding", "search_started", True)
-                    _embedding_search_start = time.perf_counter()
                     try:
-                        raw_results = embedding_engine.search(query_text, top_k=top_k)
-                        _probe_set("embedding", "raw_count", len(raw_results or []))
-                        _embedding_search_elapsed_ms = round(
-                            (time.perf_counter() - _embedding_search_start) * 1000.0,
-                            2,
+                        raw_results, embedding_outcome, _embedding_search_elapsed_ms = (
+                            _run_embedding_encoder(
+                                query_text,
+                                top_k,
+                                phase="embedding_search",
+                            )
                         )
+                        _probe_set("embedding", "raw_count", len(raw_results or []))
                         _record_metric(
                             "search_lightweight.embedding_search_ms",
                             _embedding_search_elapsed_ms,
-                            {"path": "embedding", "admission": "started"},
+                            {
+                                "path": "embedding",
+                                "admission": "started",
+                                "outcome": embedding_outcome,
+                            },
                         )
                     except Exception:
                         _cancel_foreground_recovery_probe(
@@ -3987,100 +4120,122 @@ class RetrievalEngine:
                         )
                         logger.debug("FOREGROUND-CONTRACT: retrieval latency record failed: %s", _slw_fg_err)
 
-                    # PERF-076: Batch load all candidate concepts in one query
-                    _candidate_ids = [cid for cid, score in raw_results if score >= MIN_RETRIEVAL_SIMILARITY]
-                    _probe_set("embedding", "candidate_id_count", len(_candidate_ids))
-                    if deadline and not deadline.can_start(
-                        "retrieval.load_concepts_batch",
-                        min_remaining_ms=_slw_min_batch_load_ms,
-                    ):
-                        deadline.skip(
-                            "retrieval.load_concepts_batch",
-                            "deadline_before_start",
-                            priority="optional",
-                            min_remaining_ms=_slw_min_batch_load_ms,
-                        )
-                        _probe_set("embedding", "search_skipped_reason", "batch_deadline_before_start")
-                        return _finish_live_probe([])
-                    from app.storage.concepts import load_concepts_batch
-
-                    _batch_load_start = time.perf_counter()
-                    _batch_cache = load_concepts_batch(_candidate_ids)
-                    _probe_set("embedding", "loaded_count", len(_batch_cache or {}))
-                    _record_metric(
-                        "search_lightweight.batch_load_ms",
-                        round((time.perf_counter() - _batch_load_start) * 1000.0, 2),
-                        {"path": "embedding"},
-                    )
-
-                    results = []
-                    for _slw_i, (concept_id, emb_score) in enumerate(raw_results):
-                        # OPT-1c: Check at first iteration then every 10 (PERF-076 tightened)
-                        if _slw_should_check_timeout(_slw_i):
-                            _slw_elapsed_ms = (_time_mod_slw.perf_counter() - _slw_start) * 1000.0
-                            if _slw_elapsed_ms > _slw_soft_timeout_s * 1000.0:
-                                _slw_timed_out = True
-                                _slw_stop = _slw_should_stop_for_timeout(_slw_i, len(results))
-                                _record_slw_soft_timeout(
-                                    "embedding",
-                                    _slw_i,
-                                    len(raw_results),
-                                    _slw_elapsed_ms,
-                                    len(results),
-                                    "stop" if _slw_stop else "materialize",
-                                )
-                                logger.warning(
-                                    f"OPT-1c: search_lightweight soft timeout at iteration {_slw_i}/{len(raw_results)} "
-                                    f"({_slw_elapsed_ms:.0f}ms > "
-                                    f"{_slw_soft_timeout_s * 1000:.0f}ms) — "
-                                    f"{'stopping' if _slw_stop else 'materializing emergency candidate'} with "
-                                    f"{len(results)} partial results"
-                                )
-                                if _slw_stop:
-                                    break
-                        if emb_score < MIN_RETRIEVAL_SIMILARITY:  # RETRIEVAL-031: raised from 0.15
-                            _probe_inc("embedding", "score_floor_rejected_count")
-                            continue
-                        concept = _batch_cache.get(concept_id)  # PERF-076: dict lookup, not DB query
-                        if not concept:
-                            continue
-                        if concept.confidence < min_confidence:
-                            _probe_inc("embedding", "confidence_rejected_count")
-                            continue
-
-                        score = self._governance_score(concept, emb_score)
-                        if score < 0:
-                            if not include_deprecated:
-                                _probe_inc("embedding", "governance_rejected_count")
-                                continue  # Hard-filtered (STALE/SUPERSEDED)
-                            score = 0.01  # RETRIEVAL-056: include_deprecated — floor score
-                        # SESSION-012: Cross-session proximity boost (post-scoring, additive)
-                        if _concurrent_ids and getattr(concept, "session_id", None) in _concurrent_ids:
-                            score = min(1.0, score + RETRIEVAL_WEIGHT_SESSION_PROXIMITY)
-                        results.append(
-                            SearchResult(
-                                concept_id=concept.id,
-                                version=concept.version,
-                                summary=concept.summary,
-                                confidence=concept.confidence,
-                                relevance_score=score,
-                                knowledge_area=concept.metadata.get("knowledge_area"),
-                                ka_relative_authority=getattr(concept, "ka_relative_authority", None),
-                                maturity=getattr(concept, "maturity", None),
-                                created_at=concept.created_at,  # RETRIEVAL-053
-                                metadata=_diagnostic_source_metadata(concept),
+                    if raw_results is None:
+                        fallback_reason = f"embedding_{embedding_outcome}"
+                        _probe_set("embedding", "search_skipped_reason", fallback_reason)
+                        if deadline:
+                            deadline.skip(
+                                "retrieval.embedding_search",
+                                fallback_reason,
+                                priority="optional",
                             )
+                        _record_metric(
+                            "search_lightweight.fallback_total",
+                            1.0,
+                            {
+                                "from": "embedding",
+                                "to": "tfidf",
+                                "reason": fallback_reason,
+                                "mode": "bounded_process",
+                            },
                         )
-                    _probe_set("embedding", "result_count", len(results))
-                    lexical_admission = self._admit_strong_lexical_evidence(
-                        results,
-                        effective_query_text,
-                        path="search_lightweight",
-                        deadline=deadline,
-                    )
-                    results = lexical_admission.results
-                    _slw_lexical_protected_ids = lexical_admission.protected_ids
-                    self.last_lexical_evidence_support_trace = lexical_admission.support_trace
+                        results = _run_tfidf_path(fallback_reason, "bounded_process")
+                    else:
+                        # PERF-076: Batch load all candidate concepts in one query
+                        _candidate_ids = [
+                            cid for cid, score in raw_results if score >= MIN_RETRIEVAL_SIMILARITY
+                        ]
+                        _probe_set("embedding", "candidate_id_count", len(_candidate_ids))
+                        if deadline and not deadline.can_start(
+                            "retrieval.load_concepts_batch",
+                            min_remaining_ms=_slw_min_batch_load_ms,
+                        ):
+                            deadline.skip(
+                                "retrieval.load_concepts_batch",
+                                "deadline_before_start",
+                                priority="optional",
+                                min_remaining_ms=_slw_min_batch_load_ms,
+                            )
+                            _probe_set("embedding", "search_skipped_reason", "batch_deadline_before_start")
+                            return _finish_live_probe([])
+                        from app.storage.concepts import load_concepts_batch
+
+                        _batch_load_start = time.perf_counter()
+                        _batch_cache = load_concepts_batch(_candidate_ids)
+                        _probe_set("embedding", "loaded_count", len(_batch_cache or {}))
+                        _record_metric(
+                            "search_lightweight.batch_load_ms",
+                            round((time.perf_counter() - _batch_load_start) * 1000.0, 2),
+                            {"path": "embedding"},
+                        )
+
+                        results = []
+                        for _slw_i, (concept_id, emb_score) in enumerate(raw_results):
+                            # OPT-1c: Check at first iteration then every 10 (PERF-076 tightened)
+                            if _slw_should_check_timeout(_slw_i):
+                                _slw_elapsed_ms = (_time_mod_slw.perf_counter() - _slw_start) * 1000.0
+                                if _slw_elapsed_ms > _slw_soft_timeout_s * 1000.0:
+                                    _slw_timed_out = True
+                                    _slw_stop = _slw_should_stop_for_timeout(_slw_i, len(results))
+                                    _record_slw_soft_timeout(
+                                        "embedding",
+                                        _slw_i,
+                                        len(raw_results),
+                                        _slw_elapsed_ms,
+                                        len(results),
+                                        "stop" if _slw_stop else "materialize",
+                                    )
+                                    logger.warning(
+                                        f"OPT-1c: search_lightweight soft timeout at iteration {_slw_i}/{len(raw_results)} "
+                                        f"({_slw_elapsed_ms:.0f}ms > "
+                                        f"{_slw_soft_timeout_s * 1000:.0f}ms) — "
+                                        f"{'stopping' if _slw_stop else 'materializing emergency candidate'} with "
+                                        f"{len(results)} partial results"
+                                    )
+                                    if _slw_stop:
+                                        break
+                            if emb_score < MIN_RETRIEVAL_SIMILARITY:
+                                _probe_inc("embedding", "score_floor_rejected_count")
+                                continue
+                            concept = _batch_cache.get(concept_id)
+                            if not concept:
+                                continue
+                            if concept.confidence < min_confidence:
+                                _probe_inc("embedding", "confidence_rejected_count")
+                                continue
+
+                            score = self._governance_score(concept, emb_score)
+                            if score < 0:
+                                if not include_deprecated:
+                                    _probe_inc("embedding", "governance_rejected_count")
+                                    continue
+                                score = 0.01
+                            if _concurrent_ids and getattr(concept, "session_id", None) in _concurrent_ids:
+                                score = min(1.0, score + RETRIEVAL_WEIGHT_SESSION_PROXIMITY)
+                            results.append(
+                                SearchResult(
+                                    concept_id=concept.id,
+                                    version=concept.version,
+                                    summary=concept.summary,
+                                    confidence=concept.confidence,
+                                    relevance_score=score,
+                                    knowledge_area=concept.metadata.get("knowledge_area"),
+                                    ka_relative_authority=getattr(concept, "ka_relative_authority", None),
+                                    maturity=getattr(concept, "maturity", None),
+                                    created_at=concept.created_at,
+                                    metadata=_diagnostic_source_metadata(concept),
+                                )
+                            )
+                        _probe_set("embedding", "result_count", len(results))
+                        lexical_admission = self._admit_strong_lexical_evidence(
+                            results,
+                            effective_query_text,
+                            path="search_lightweight",
+                            deadline=deadline,
+                        )
+                        results = lexical_admission.results
+                        _slw_lexical_protected_ids = lexical_admission.protected_ids
+                        self.last_lexical_evidence_support_trace = lexical_admission.support_trace
         else:
             # TF-IDF fallback path
             results = _run_tfidf_path()
@@ -4593,6 +4748,34 @@ class RetrievalEngine:
             if c.get("classification") == CLASS_LEXICAL_STALE and "gold" in (c.get("sources") or [])
         )
 
+    def _build_verified_fresh_index(self) -> tuple[IncrementalTfidfIndex, dict[str, Any]]:
+        """Build and verify a fresh TF-IDF candidate without mutating live state."""
+        fresh = IncrementalTfidfIndex()
+        self._build_into(fresh)
+
+        stale_after = self._count_gold_lexical_stale(fresh)
+        if stale_after > 0:
+            raise RuntimeError(
+                f"verify failed: {stale_after} gold concepts still lexical_stale after rebuild"
+            )
+
+        df_delta = self._recount_df_delta(fresh)
+        if df_delta != 0:
+            raise RuntimeError(f"verify failed: DF recount delta {df_delta} != 0")
+
+        count = fresh.document_count
+        dtc = len(fresh.document_term_counts)
+        cids = len(fresh.concept_ids)
+        if not (count == dtc == cids):
+            raise RuntimeError(
+                f"verify failed: consistency invariant count={count} dtc={dtc} cids={cids}"
+            )
+
+        return fresh, {
+            "stale_after": stale_after,
+            "df_recount_delta": df_delta,
+        }
+
     def rebuild_and_swap_repair(self, *, dry_run: bool = False) -> dict:
         """Rebuild the TF-IDF index into a fresh instance and atomically swap.
 
@@ -4649,27 +4832,8 @@ class RetrievalEngine:
                     stale_before = self._count_gold_lexical_stale(self.index)
                     report["stale_before"] = stale_before
 
-                    fresh = IncrementalTfidfIndex()
-                    self._build_into(fresh)
-
-                    # Verify the FRESH index before any swap.
-                    stale_after = self._count_gold_lexical_stale(fresh)
-                    report["stale_after"] = stale_after
-                    if stale_after > 0:
-                        raise RuntimeError(
-                            f"verify failed: {stale_after} gold concepts still lexical_stale after rebuild"
-                        )
-
-                    df_delta = self._recount_df_delta(fresh)
-                    report["df_recount_delta"] = df_delta
-                    if df_delta != 0:
-                        raise RuntimeError(f"verify failed: DF recount delta {df_delta} != 0")
-
-                    count = fresh.document_count
-                    dtc = len(fresh.document_term_counts)
-                    cids = len(fresh.concept_ids)
-                    if not (count == dtc == cids):
-                        raise RuntimeError(f"verify failed: consistency invariant count={count} dtc={dtc} cids={cids}")
+                    fresh, gates = self._build_verified_fresh_index()
+                    report.update(gates)
 
                     # No-writer assertion: a bypassing writer would have bumped this.
                     assert self.index.index_version == v0, (
@@ -4749,12 +4913,165 @@ class RetrievalEngine:
             logger.warning(f"refresh_concepts: embedding refresh failed for {concept_id}: {e}")
             return False
 
+    def _refresh_concepts_fresh(
+        self,
+        concept_ids,
+        *,
+        persist: bool,
+        refresh_embeddings: bool,
+        host_memory_pressure_state: str,
+        host_pressure_reasons: list[str],
+    ) -> dict:
+        """Refresh through a verified fresh index while the old index serves readers."""
+        report: dict[str, Any] = {
+            "refreshed": [],
+            "skipped": [],
+            "stale_before": None,
+            "stale_after": None,
+            "df_recount_delta": None,
+            "v0": None,
+            "swapped": False,
+            "embeddings_refreshed": 0,
+            "deferred": None,
+            "fresh_candidate": True,
+            "host_memory_pressure_state": host_memory_pressure_state,
+            "host_pressure_reasons": host_pressure_reasons,
+            "post_swap_integrity": None,
+            "post_repair_integrity": None,
+            "requeue_ids": [],
+            "convergence_error": None,
+        }
+        t0 = time.perf_counter()
+        ids = list(dict.fromkeys(concept_ids))
+        if not ids:
+            report["duration_s"] = 0.0
+            return report
+
+        texts: dict[str, str] = {}
+        for cid in ids:
+            row = self._load_concept_row_for_index(cid)
+            if row is None:
+                report["skipped"].append({"id": cid, "reason": "not_current"})
+                continue
+            text = build_searchable_text(row)
+            if not text.strip():
+                report["skipped"].append({"id": cid, "reason": "empty_text"})
+                continue
+            texts[cid] = text
+
+        if host_memory_pressure_state in {"high", "critical"}:
+            report["deferred"] = f"host_memory_pressure_{host_memory_pressure_state}"
+            report["duration_s"] = round(time.perf_counter() - t0, 3)
+            return report
+
+        lock_dir = Path(resolve_data_dir()) / "locks"
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        lock_path = lock_dir / "reflection.lock"
+        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            try:
+                lock_fd_exclusive(fd)
+            except BlockingIOError:
+                report["deferred"] = "reflection_active"
+                return report
+
+            backup_path = None
+            backup_made = False
+            old_index = self.index
+            try:
+                v_for_backup = old_index.index_version
+                backup_path = f"{self.index_path}.refresh-backup-{v_for_backup}"
+                if persist and Path(self.index_path).exists():
+                    if Path(backup_path).exists():
+                        shutil.rmtree(backup_path)
+                    shutil.copytree(self.index_path, backup_path)
+                    backup_made = True
+
+                with self.quiesce_writers():
+                    v0 = old_index.index_version
+                    report["v0"] = v0
+                    report["stale_before"] = self._count_gold_lexical_stale(old_index)
+                    fresh, gates = self._build_verified_fresh_index()
+                    report.update(gates)
+
+                    if self.index is not old_index or old_index.index_version != v0:
+                        raise RuntimeError("no-writer assertion failed during fresh refresh")
+
+                    for cid in texts:
+                        if cid in fresh.concept_id_to_idx:
+                            report["refreshed"].append(cid)
+                        else:
+                            report["skipped"].append({"id": cid, "reason": "not_in_index"})
+
+                    self.index = fresh
+                    if persist:
+                        fresh.save(self.index_path)
+                        report["swapped"] = True
+
+                if backup_made:
+                    try:
+                        shutil.rmtree(backup_path)
+                    except Exception:
+                        logger.warning("refresh_concepts: could not remove successful refresh backup")
+
+            except BaseException:
+                self.index = old_index
+                if backup_made and backup_path and Path(backup_path).exists():
+                    try:
+                        if Path(self.index_path).exists():
+                            shutil.rmtree(self.index_path)
+                        shutil.move(backup_path, self.index_path)
+                        restored = IncrementalTfidfIndex()
+                        if restored.load(self.index_path):
+                            self.index = restored
+                        logger.warning("refresh_concepts: restored fresh-refresh backup after failure")
+                    except Exception as restore_exc:
+                        logger.error(f"refresh_concepts: fresh-refresh backup restore FAILED: {restore_exc}")
+                raise
+
+            if persist:
+                try:
+                    post_swap = self.verify_index_integrity()
+                    report["post_swap_integrity"] = post_swap
+                    post_repair = post_swap
+                    if not post_swap.get("is_healthy", False):
+                        repair = self.repair_index_drift(integrity=post_swap)
+                        post_repair = repair.get("post_repair_integrity") or self.verify_index_integrity()
+                    report["post_repair_integrity"] = post_repair
+                    report["requeue_ids"] = list(post_repair.get("orphan_ids", []))
+                    if post_repair.get("ghost_ids"):
+                        report["convergence_error"] = "remaining_ghosts"
+                except Exception as convergence_exc:
+                    report["convergence_error"] = type(convergence_exc).__name__
+                    if report["post_swap_integrity"]:
+                        report["requeue_ids"] = list(
+                            report["post_swap_integrity"].get("orphan_ids", [])
+                        )
+                    logger.warning(
+                        "refresh_concepts: post-swap convergence failed: %s",
+                        convergence_exc,
+                    )
+
+            if persist and refresh_embeddings:
+                for cid, text in texts.items():
+                    if self._refresh_concept_embedding(cid, text):
+                        report["embeddings_refreshed"] += 1
+            return report
+        finally:
+            try:
+                unlock_fd(fd)
+            finally:
+                os.close(fd)
+                report["duration_s"] = round(time.perf_counter() - t0, 3)
+
     def refresh_concepts(
         self,
         concept_ids,
         *,
         persist: bool = True,
         refresh_embeddings: bool = True,
+        host_memory_pressure_state: str = "unknown",
+        host_pressure_reasons: list[str] | None = None,
     ) -> dict:
         """Refresh the stored representation of existing concepts in place.
 
@@ -4787,6 +5104,9 @@ class RetrievalEngine:
                 NOT the live runtime singleton.
             refresh_embeddings: also re-embed + persist embeddings (live SQLite write;
                 set False for copy/offline harness runs against a read-only DB).
+            host_memory_pressure_state: normalized state sampled by the orchestration
+                layer. High and critical states defer copy-backed rebuild work.
+            host_pressure_reasons: bounded reason codes from the same snapshot.
 
         Returns a report dict (refreshed / skipped / gate metrics / swapped).
         """
@@ -4806,6 +5126,16 @@ class RetrievalEngine:
         if not ids:
             report["duration_s"] = 0.0
             return report
+        pressure_state = str(host_memory_pressure_state or "unknown").strip().lower()
+        pressure_reasons = [str(reason)[:100] for reason in (host_pressure_reasons or [])[:20]]
+        if _env_flag("PITH_TFIDF_FRESH_REFRESH_ENABLED", False):
+            return self._refresh_concepts_fresh(
+                ids,
+                persist=persist,
+                refresh_embeddings=refresh_embeddings,
+                host_memory_pressure_state=pressure_state,
+                host_pressure_reasons=pressure_reasons,
+            )
 
         lock_dir = Path(resolve_data_dir()) / "locks"
         lock_dir.mkdir(parents=True, exist_ok=True)

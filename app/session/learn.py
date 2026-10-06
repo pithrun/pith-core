@@ -64,6 +64,7 @@ from app.cognitive.taxonomy import (  # DEBT-030/DEBT-108
     infer_knowledge_area,
     normalize_knowledge_area_boundary,
 )
+from app.session.learning_receipts import LearningReceiptBuilder
 from app.session.self_model import self_model_manager
 from app.storage import (
     _get_connection,
@@ -924,6 +925,9 @@ class SessionLearnMixin:
         _verbatim_attachment_count = 0
         _verbatim_fragment_count = 0
         evolved_this_call: set = set()  # S3: per-call evidence cap
+        _client_cap = max(0, int(os.environ.get("PITH_MAX_INSIGHTS_PER_CALL", "7")))
+        _client_receipt = LearningReceiptBuilder(len(request.extracted_concepts or []), _client_cap)
+        _processing_rejected = 0
 
         # --- Step 0: Session boundary check ---
         # EC12 finding: session_learn succeeds after session_end, but counters
@@ -969,7 +973,12 @@ class SessionLearnMixin:
                 f"Concepts in this call: {len(request.extracted_concepts or [])}. "
                 f"Raise PITH_SESSION_LEARN_RATE_LIMIT env var for bulk-ingest scenarios."
             )
+            _client_receipt = LearningReceiptBuilder(len(request.extracted_concepts or []), 0)
+            for deferred_range in _client_receipt.ranges:
+                deferred_range.reason = "rate_limit"
             return SessionLearnResponse(
+                client_learning_receipt=_client_receipt.build(),
+                request_id=request.request_id,
                 concepts_created=[],
                 concepts_evolved=[],
                 associations_created=0,
@@ -1176,9 +1185,11 @@ class SessionLearnMixin:
 
             # Parse and validate
             valid_concepts = []
+            valid_indexes = []
+            original_index_by_identity = {}
             # BENCHMARK-002: Cap is configurable via PITH_MAX_INSIGHTS_PER_CALL (default 7).
             # Benchmark sends 20-concept batches; set env var to 30 to pass all through.
-            _client_cap = int(os.environ.get("PITH_MAX_INSIGHTS_PER_CALL", "7"))
+            # Admission cap and receipt share the same server-owned bound.
             from app.core.config import BENCHMARK as _bm_cap
             if _bm_cap.cap_debug_logging:
                 logger.warning(
@@ -1188,9 +1199,18 @@ class SessionLearnMixin:
                 )
             for i, raw in enumerate(request.extracted_concepts[:_client_cap]):
                 try:
+                    if isinstance(raw, dict) and ("type" in raw or "content" in raw):
+                        _client_receipt.mark(i, "rejected", "use_concept_type_and_evidence")
+                        garbage_rejected += 1
+                        rejection_details.append({"index": i, "reason": "use_concept_type_and_evidence",
+                                                  "summary_preview": "", "stage": "validation"})
+                        continue
                     ec = ExtractedConcept(**raw) if isinstance(raw, dict) else raw
                     valid_concepts.append(ec)
+                    valid_indexes.append(i)
+                    original_index_by_identity[id(ec)] = i
                 except Exception as e:
+                    _client_receipt.mark(i, "rejected", "invalid_concept")
                     logger.warning(f"session_learn: invalid extracted concept: {e}")
                     garbage_rejected += 1
                     # Extract summary preview from raw data for diagnostics
@@ -1218,12 +1238,16 @@ class SessionLearnMixin:
                     logger.info(f"session_learn: garbage rejected: {r['reason']} — {r['summary_preview']}")
                     rejection_details.append(
                         {
-                            "index": r["index"],
+                            "index": valid_indexes[r["index"]],
                             "reason": r["reason"],
                             "summary_preview": r["summary_preview"],
                             "stage": "garbage_detection",
                         }
                     )
+
+                for rejection in rejections:
+                    _client_receipt.mark(valid_indexes[rejection["index"]], "rejected",
+                                         "garbage_detection")
 
                 # Emit budget_warnings for per-call limit hits
                 for r in rejections:
@@ -1240,6 +1264,7 @@ class SessionLearnMixin:
                 # DEBT-030: infer_knowledge_area hoisted to module-level import
                 for ec in survivors:
                     client_metadata = dict(ec.metadata or {})
+                    client_metadata.pop("_client_input_index", None)
                     for key in (
                         "beam_source_key",
                         "beam_source_turn_id",
@@ -1277,6 +1302,7 @@ class SessionLearnMixin:
                         conf = min(conf, 0.40)
                     tier2_insights.append(
                         {
+                            "_client_input_index": original_index_by_identity[id(ec)],
                             "summary": ec.summary,
                             "confidence": conf,
                             "type": ec.concept_type or "observation",
@@ -1380,7 +1406,9 @@ class SessionLearnMixin:
         merged_insights.sort(key=quality_score, reverse=True)
         # BENCHMARK-002: Allow higher throughput during bulk ingestion.
         # Production default is 7 to bound per-call latency.
-        _max_insights_per_call = int(os.environ.get("PITH_MAX_INSIGHTS_PER_CALL", "7"))
+        _max_insights_per_call = _client_cap
+        for deferred_insight in merged_insights[_max_insights_per_call:]:
+            _client_receipt.mark(deferred_insight.get("_client_input_index"), "deferred", "quality_cap")
         merged_insights = merged_insights[:_max_insights_per_call]
         if _wall_budget_exhausted_at("after_quality_cap"):
             logger.warning("session_learn: wall budget reached after quality cap; preserving capped concepts for core persistence")
@@ -1504,6 +1532,9 @@ class SessionLearnMixin:
             _budget_exhausted = False
             _record_learning_latency_metrics(elapsed_ms)
             return SessionLearnResponse(
+                client_learning_receipt=_client_receipt.build(),
+                request_id=request.request_id,
+                learning_capture_state=_client_receipt.capture_state(0, errors, garbage_rejected),
                 concepts_created=[],
                 concepts_evolved=[],
                 associations_created=0,
@@ -1569,8 +1600,8 @@ class SessionLearnMixin:
         _overhead_ms = (t_insights - t0) * 1000
 
         from app.core.config import AUTOLEARN_BUDGET_MS as _learn_budget
-        from app.core.config import AUTOLEARN_PER_INSIGHT_BUDGET_MS as _per_insight_budget
         from app.core.config import AUTOLEARN_MAX_BUDGET_MS as _max_budget
+        from app.core.config import AUTOLEARN_PER_INSIGHT_BUDGET_MS as _per_insight_budget
 
         # PERF-038: Scale budget by insight count, capped at max.
         _effective_budget = min(
@@ -1605,8 +1636,12 @@ class SessionLearnMixin:
                     f"{idx}/{len(merged_insights)} insights, skipping {_skipped_count}"
                 )
                 concepts_skipped += _skipped_count
+                for deferred_insight in merged_insights[idx:]:
+                    _client_receipt.mark(deferred_insight.get("_client_input_index"), "deferred", "time_budget")
                 _budget_exhausted = True
                 break
+            result = None
+            _client_index = insight.pop("_client_input_index", None)
             try:
                 ext_source = insight.get("extraction_source", "heuristic")
                 _process_single_started = time.perf_counter()
@@ -1633,7 +1668,14 @@ class SessionLearnMixin:
                 if _process_single_ms > _slowest_insight_ms:
                     _slowest_insight_ms = _process_single_ms
                     _slowest_insight_action = str(result.get("action", "unknown"))
-                if result["action"] == "created":
+                _disposition = _client_receipt.processed(_client_index, result)
+                if _disposition == "error":
+                    errors += 1
+                    continue
+                elif _disposition == "rejected":
+                    _processing_rejected += 1
+                    concepts_skipped += 1
+                if result.get("action") == "created":
                     concepts_created.append(result["learned_concept"])
                     if _should_archive_lifecycle_probe_insight(insight):
                         _archive_lifecycle_probe_concept(result["learned_concept"].concept_id, insight)
@@ -1653,19 +1695,24 @@ class SessionLearnMixin:
                     if "explicit_supersessions" in result:
                         explicit_supersession_total += result["explicit_supersessions"]
                         concepts_superseded += result["explicit_supersessions"]
-                elif result["action"] == "evolved":
+                elif result.get("action") == "evolved":
                     concepts_evolved.append(result["evolved_concept"])
                     associations_created += result.get("associations", 0)
                     source_breakdown[ext_source] = source_breakdown.get(ext_source, 0) + 1
-                elif result["action"] == "skipped_duplicate":
+                elif result.get("action") == "skipped_duplicate":
                     duplicates_skipped += 1
-                elif result["action"] == "skipped_per_call_cap":
+                elif result.get("action") == "skipped_per_call_cap":
                     duplicates_skipped += 1
-                elif result["action"] == "skipped_confidence":
+                elif result.get("action") in {"skipped_confidence", "skipped_confidence_heuristic",
+                                          "skipped_short_summary", "skipped_no_evidence"}:
                     concepts_skipped += 1
-                elif result["action"] == "skipped_saturated":
+                elif result.get("action") in {"skipped_saturated", "skipped_evidence_cap"}:
                     duplicates_skipped += 1
             except Exception as e:
+                saved = ((result.get("learned_concept") or result.get("evolved_concept"))
+                         if isinstance(result, dict) else None)
+                _client_receipt.mark(_client_index, "error", "processing_exception", "unknown",
+                                     getattr(saved, "concept_id", None))
                 _record_learning_subphase("insight_error", 0.0)
                 logger.error(f"session_learn: insight processing failed: {e}")
                 errors += 1
@@ -1866,14 +1913,10 @@ class SessionLearnMixin:
                 )
 
         accepted_learning_events = learning_events
-        if accepted_learning_events > 0:
-            learning_capture_state = "accepted"
-        elif errors > 0:
-            learning_capture_state = "error"
-        elif garbage_rejected > 0 or rejection_details:
-            learning_capture_state = "rejected"
-        else:
-            learning_capture_state = "zero_learning"
+        learning_capture_state = _client_receipt.capture_state(
+            accepted_learning_events, errors, garbage_rejected + _processing_rejected,
+            deferred=_budget_exhausted,
+        )
 
         if _counter_commit_rejected:
             learning_capture_state = "degraded_terminal_session"
@@ -2077,6 +2120,8 @@ class SessionLearnMixin:
                 )
 
         return SessionLearnResponse(
+            client_learning_receipt=_client_receipt.build(),
+            request_id=request.request_id,
             concepts_created=concepts_created,
             concepts_evolved=concepts_evolved,
             associations_created=associations_created,
