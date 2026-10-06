@@ -194,7 +194,7 @@ def test_windows_release_binaries_are_explicitly_allowed() -> None:
         public_safety_scan.REPO_ROOT
         / "integrations"
         / "claude-desktop-extension"
-        / "pith-claude-1.0.10.mcpb",
+        / "pith-claude-1.0.11.mcpb",
     ]
 
     assert public_safety_scan.binary_findings(paths) == []
