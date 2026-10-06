@@ -183,7 +183,7 @@ def _cmd_run_inner(args):
     # Amendment 11: Rotate logs before each run
     _rotate_logs()
 
-    from app.ops.maintenance import run_maintenance_sync
+    from app.ops.maintenance import ALL_PHASES, run_maintenance_sync
 
     phases = None
     if args.phases:
@@ -192,9 +192,11 @@ def _cmd_run_inner(args):
         except ValueError:
             print("Error: --phases must be comma-separated integers (e.g., 1,2,5)")
             sys.exit(1)
-        invalid = [p for p in phases if p < 1 or p > 5]
+        valid_phases = sorted(ALL_PHASES)
+        invalid = [p for p in phases if p not in ALL_PHASES]
         if invalid:
-            print(f"Error: invalid phase numbers {invalid}. Valid: 1-5")
+            valid_display = ",".join(str(phase) for phase in valid_phases)
+            print(f"Error: invalid phase numbers {invalid}. Valid: {valid_display}")
             sys.exit(1)
 
     print(f"{'[DRY RUN] ' if args.dry_run else ''}Running Pith maintenance...")

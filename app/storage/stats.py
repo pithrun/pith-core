@@ -1010,13 +1010,14 @@ def get_pith_stats_aggregates(conn: sqlite3.Connection | None = None) -> dict:
         _corr_avg_conf = round(float(_corr_events_row["avg_conf"] or 0.0), 3)
         _corr_total_affected = int(_corr_events_row["total_affected"] or 0)
 
+        # ARCH-V116: legacy evidence_appends counts selected append attempts.
         _corr_metrics_row = conn.execute("""
             SELECT
                 COALESCE(SUM(CASE WHEN metric = 'coggov009_gated_count' THEN value ELSE 0 END), 0) as gated,
-                COALESCE(SUM(CASE WHEN metric = 'coggov009_evidence_appends' THEN value ELSE 0 END), 0) as appends,
+                COALESCE(SUM(CASE WHEN metric = 'coggov012_evidence_appends' THEN value ELSE 0 END), 0) as appends,
                 COALESCE(SUM(CASE WHEN metric = 'coggov006_layer5_fires' THEN value ELSE 0 END), 0) as l5_fires
             FROM metrics
-            WHERE metric IN ('coggov009_gated_count', 'coggov009_evidence_appends', 'coggov006_layer5_fires')
+            WHERE metric IN ('coggov009_gated_count', 'coggov012_evidence_appends', 'coggov006_layer5_fires')
         """).fetchone()
         _corr_gated = int(_corr_metrics_row["gated"] or 0)
         _corr_appends = int(_corr_metrics_row["appends"] or 0)

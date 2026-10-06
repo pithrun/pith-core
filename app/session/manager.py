@@ -403,17 +403,10 @@ class SessionManager(
 
             # Store results for next turn's consumption (A1 amendment)
             # Build the auto_learned summary dict
-            _auto_learned_dict = None
             _budget_warnings = auto_learn_result.budget_warnings or []
-            if auto_learn_result.learning_events > 0:
-                _auto_learned_dict = {
-                    "events": auto_learn_result.learning_events,
-                    "concepts_created": [c.concept_id for c in auto_learn_result.concepts_created],
-                    "concepts_evolved": [c.concept_id for c in auto_learn_result.concepts_evolved],
-                    "budget_warnings": _budget_warnings,
-                }
-                if _workstream_link_result:
-                    _auto_learned_dict["workstream_links"] = _workstream_link_result
+            _auto_learned_dict = auto_learn_result.learning_summary()
+            if _workstream_link_result:
+                _auto_learned_dict["workstream_links"] = _workstream_link_result
             # Atomic assignment — GIL protects reference swap
             self._last_autolearn_result = _auto_learned_dict
             self._last_autolearn_result_obj = auto_learn_result

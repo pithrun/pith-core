@@ -29,7 +29,19 @@ from app.storage import (
 
 STALE_PROCESSING_TIMEOUT = timedelta(minutes=WRITE_STALE_MINUTES)
 STATUS_ENDPOINT_ALLOWLIST = frozenset({"session_learn", "session_end", "checkpoint"})
+WRITE_DURABILITY_CONFLICT_MODES = frozenset(
+    {
+        "already_processing",
+        "binding_mismatch",
+        "claim_lost",
+        "claim_missing",
+        "failed_without_payload",
+        "payload_conflict",
+    }
+)
 STATUS_SUMMARY_FIELDS = (
+    "errors",
+    "client_learning_receipt",
     "learning_events",
     "concepts_created",
     "concepts_evolved",
@@ -278,6 +290,23 @@ def _flush_metrics() -> None:
     _wd_metrics.flush()
 
 
+def _write_durability_conflict(endpoint: str, mode: str, detail: object) -> HTTPException:
+    """Build one observable 409 with bounded, identity-free labels."""
+
+    if _wd_metrics:
+        labels = {
+            "endpoint": endpoint if endpoint in STATUS_ENDPOINT_ALLOWLIST else "other",
+            "mode": mode if mode in WRITE_DURABILITY_CONFLICT_MODES else "other",
+        }
+        try:
+            _wd_metrics.record("write_durability_blocked_409", 1.0, labels)
+            _flush_metrics()
+        except Exception:
+            # Observability is best-effort and must never replace the intended 409.
+            pass
+    return HTTPException(status_code=409, detail=detail)
+
+
 def begin_write_request(
     endpoint: str,
     request_id: str | None,
@@ -325,14 +354,16 @@ def begin_write_request(
                     or row.get("session_id") != authority.session_id
                     or row.get("external_request_id") != external_request_id
                 ):
-                    raise HTTPException(
-                        status_code=409,
-                        detail={"error": "binding_mismatch"},
+                    raise _write_durability_conflict(
+                        endpoint,
+                        "binding_mismatch",
+                        {"error": "binding_mismatch"},
                     )
                 if row.get("request_hash") != request_hash:
-                    raise HTTPException(
-                        status_code=409,
-                        detail={"error": "request_payload_conflict"},
+                    raise _write_durability_conflict(
+                        endpoint,
+                        "payload_conflict",
+                        {"error": "request_payload_conflict"},
                     )
             if row["status"] == "committed" and row["response"]:
                 payload = dict(row["response"])
@@ -364,33 +395,38 @@ def begin_write_request(
                             claim_token=row.get("claim_token"),
                         )
                     return WriteReplayState(replay=payload, request_id=request_id)
-                raise HTTPException(status_code=409, detail="Prior write request failed without replay payload")
+                raise _write_durability_conflict(
+                    endpoint,
+                    "failed_without_payload",
+                    "Prior write request failed without replay payload",
+                )
             updated_at = _parse_timestamp(row["updated_at"])
             if (
                 row["status"] == "processing"
                 and updated_at is not None
                 and datetime.now(UTC) - updated_at < STALE_PROCESSING_TIMEOUT
             ):
-                if _wd_metrics and conn is None:
-                    _wd_metrics.record("write_durability_blocked_409", 1.0, {"endpoint": endpoint})
-                    _flush_metrics()
-                raise HTTPException(status_code=409, detail="Duplicate write request is already processing")
+                raise _write_durability_conflict(
+                    endpoint,
+                    "already_processing",
+                    "Duplicate write request is already processing",
+                )
             # MONITOR-135: stale processing reclaim
             if row.get("request") is not None and request_payload is not None and row["request"] != request_payload:
-                if _wd_metrics and conn is None:
-                    _wd_metrics.record("write_durability_payload_mismatch_409", 1.0, {"endpoint": endpoint})
-                    _flush_metrics()
-                raise HTTPException(
-                    status_code=409, detail="Duplicate write request payload differs from stored processing payload"
+                raise _write_durability_conflict(
+                    endpoint,
+                    "payload_conflict",
+                    "Duplicate write request payload differs from stored processing payload",
                 )
             if _wd_metrics and conn is None:
                 _wd_metrics.record("write_durability_stale_reclaim", 1.0, {"endpoint": endpoint})
             if authority is not None:
                 expected_claim_token = row.get("claim_token")
                 if not expected_claim_token:
-                    raise HTTPException(
-                        status_code=409,
-                        detail={"error": "managed_replay_claim_missing"},
+                    raise _write_durability_conflict(
+                        endpoint,
+                        "claim_missing",
+                        {"error": "managed_replay_claim_missing"},
                     )
                 if conn is not None:
                     updated = _mark_write_request_processing_conn(
@@ -416,9 +452,10 @@ def begin_write_request(
                         new_claim_token=claim_token,
                     )
                 if updated != 1:
-                    raise HTTPException(
-                        status_code=409,
-                        detail={"error": "managed_replay_claim_lost"},
+                    raise _write_durability_conflict(
+                        endpoint,
+                        "claim_lost",
+                        {"error": "managed_replay_claim_lost"},
                     )
                 return _managed_state(
                     replay=None,
@@ -466,13 +503,15 @@ def begin_write_request(
                     else load_write_request_replay(endpoint, profile, storage_request_id)
                 )
                 if winner and winner.get("request_hash") == request_hash:
-                    raise HTTPException(
-                        status_code=409,
-                        detail={"error": "managed_replay_already_processing"},
+                    raise _write_durability_conflict(
+                        endpoint,
+                        "already_processing",
+                        {"error": "managed_replay_already_processing"},
                     ) from exc
-                raise HTTPException(
-                    status_code=409,
-                    detail={"error": "request_payload_conflict"},
+                raise _write_durability_conflict(
+                    endpoint,
+                    "payload_conflict",
+                    {"error": "request_payload_conflict"},
                 ) from exc
             return _managed_state(
                 replay=None,
@@ -511,9 +550,10 @@ def commit_write_request(
             expected_claim_token=replay_state.claim_token if replay_state else None,
         )
     if replay_state and replay_state.binding_hash is not None and updated != 1:
-        raise HTTPException(
-            status_code=409,
-            detail={"error": "managed_replay_claim_lost"},
+        raise _write_durability_conflict(
+            endpoint,
+            "claim_lost",
+            {"error": "managed_replay_claim_lost"},
         )
     _flush_metrics()
     return response
@@ -682,9 +722,10 @@ def fail_write_request(
             expected_claim_token=replay_state.claim_token if replay_state else None,
         )
     if replay_state and replay_state.binding_hash is not None and updated != 1:
-        raise HTTPException(
-            status_code=409,
-            detail={"error": "managed_replay_claim_lost"},
+        raise _write_durability_conflict(
+            endpoint,
+            "claim_lost",
+            {"error": "managed_replay_claim_lost"},
         )
     if _wd_metrics:
         _wd_metrics.record("write_request_failed_terminal", 1.0, {"endpoint": endpoint, "error_class": error_class})

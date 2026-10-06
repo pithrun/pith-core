@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# Pith Installer v1.0.10
+# Pith Installer v1.0.11
 # macOS developer preview installer; Linux remains an unverified source/developer path.
 
 # Configuration
@@ -15,7 +15,7 @@ PITH_REPAIR_RUNTIME="${PITH_REPAIR_RUNTIME:-0}"
 PITH_FORCE_MANAGED_PYTHON="${PITH_FORCE_MANAGED_PYTHON:-0}"
 # Keep PITH_VERSION on line 18.
 # scripts/version-bump.sh and TEST-090 depend on this exact location.
-PITH_VERSION="1.0.10"
+PITH_VERSION="1.0.11"
 PITH_INSTALL_TELEMETRY_URL="${PITH_INSTALL_TELEMETRY_URL-https://pith.run/telemetry/install}"
 PITH_INSTALL_TELEMETRY_EVENT_VERSION="${PITH_INSTALL_TELEMETRY_EVENT_VERSION:-1}"
 PITH_RELEASE_CHANNEL="${PITH_RELEASE_CHANNEL:-unknown}"
@@ -1010,6 +1010,14 @@ activate_staged_server_tree() {
     local target="$2"
 
     validate_staged_server_tree "$stage" || return 1
+    # OPS-602: preserve operator configuration before the managed source swap.
+    if [[ -e "$target/.env" || -L "$target/.env" ]]; then
+        if [[ -L "$target/.env" || ! -f "$target/.env" ]]; then
+            mark_error "Refusing linked or non-file server .env during upgrade"
+            return 1
+        fi
+        cp -p "$target/.env" "$stage/.env" || return 1
+    fi
     normalize_server_tree_modes "$stage"
     safe_rm_pith_server_path "$target"
     mv "$stage" "$target"
@@ -2534,8 +2542,8 @@ print_wrapper_help() {
             echo "  Restore a profile database from a backup file."
             ;;
         update)
-            echo "Usage: pith update"
-            echo "  Run local dependency and migration update checks."
+            echo "Usage: pith update [--check] [--json]"
+            echo "  Refresh the application and CLI within the installed release channel."
             ;;
         version)
             echo "Usage: pith version"
@@ -2848,25 +2856,8 @@ PY
         ;;
     update)
         if is_help_request; then print_wrapper_help update; exit 0; fi
-        echo "Checking for updates..."
-        source "$VENV_PATH/bin/activate"
-        # Run any migration scripts if they exist
-        if [[ -f "$PITH_SERVER_PATH/migrations/run.sh" ]]; then
-            echo "Running migrations..."
-            bash "$PITH_SERVER_PATH/migrations/run.sh"
-        fi
-        # Upgrade core deps
-        pip install --quiet --upgrade -r "$PITH_SERVER_PATH/requirements.txt" 2>/dev/null || true
-        # Re-run platform-aware embedding installation
-        echo "Checking embedding dependencies..."
-        # Source the install_embeddings function if available
-        INSTALLER="$PITH_SERVER_PATH/scripts/install.sh"
-        if [[ -f "$INSTALLER" ]]; then
-            # Extract and run the install functions
-            source <(sed -n '/^install_pytorch()/,/^}/p; /^install_embeddings()/,/^}/p' "$INSTALLER" 2>/dev/null) 2>/dev/null
-            install_embeddings 2>/dev/null || true
-        fi
-        echo "Update complete"
+        "$VENV_PATH/bin/python3" "$PITH_SERVER_PATH/scripts/update_application.py" --home "$PITH_HOME" "${@:2}"
+        exit $?
         ;;
     version)
         if is_help_request; then print_wrapper_help version; exit 0; fi

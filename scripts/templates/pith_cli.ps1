@@ -550,6 +550,11 @@ function Write-PithNativeTransportEvent {
     if (-not $SurfaceId) {
         $SurfaceId = if ($Operation -eq "conversation_turn") { "local_api_cli" } else { "local_api_cli" }
     }
+    $LearningBody = $Body
+    if ($Operation -eq "conversation_turn" -and $AutoLearned) { $LearningBody = $AutoLearned }
+    if ($Operation -eq "session_end" -and $Body.Contains("last_exchange_learning") -and $Body["last_exchange_learning"]) {
+        $LearningBody = $Body["last_exchange_learning"]
+    }
     $Entry = [ordered]@{
         ts = [DateTimeOffset]::UtcNow.ToString("o")
         event = "lifecycle_api_call"
@@ -571,7 +576,9 @@ function Write-PithNativeTransportEvent {
         extracted_concepts_present = [bool](Get-PithPayloadValue -Payload $Payload -Name "extracted_concepts_json")
         auto_learned = [bool]$AutoLearned
         learning_events = if ($Body.Contains("learning_events")) { $Body["learning_events"] } elseif ($AutoLearned -and $AutoLearned.Contains("events")) { $AutoLearned["events"] } else { $null }
-        accepted_learning_events = if ($Body.Contains("accepted_learning_events")) { $Body["accepted_learning_events"] } else { $null }
+        accepted_learning_events = if ($LearningBody.Contains("accepted_learning_events")) { $LearningBody["accepted_learning_events"] } else { $null }
+        learning_capture_state = if ($LearningBody.Contains("learning_capture_state")) { $LearningBody["learning_capture_state"] } else { $null }
+        errors = if ($LearningBody.Contains("errors")) { $LearningBody["errors"] } else { $null }
         checkpoint_task_id = if ((Get-PithPayloadValue -Payload $Payload -Name "task_id")) { Get-PithPayloadValue -Payload $Payload -Name "task_id" } elseif ($Body.Contains("task_id")) { $Body["task_id"] } else { $null }
     }
 
@@ -1641,8 +1648,8 @@ function Print-PithWrapperHelp {
             Write-Host "  Restore a profile database from a backup file."
         }
         "update" {
-            Write-Host "Usage: pith update"
-            Write-Host "  Run local dependency and embedding update checks."
+            Write-Host "Usage: pith update [--check] [--json]"
+            Write-Host "  Refresh the application and CLI within the installed release channel."
         }
         "version" {
             Write-Host "Usage: pith version"
@@ -2558,44 +2565,10 @@ switch ($action) {
     "update" {
         if (Test-PithHelpRequest) { Print-PithWrapperHelp -CommandName "update"; exit 0 }
         Assert-PithNotUninstalling -ActionName "update"
-        Write-Host "Updating Pith..."
-        & $MyInvocation.MyCommand.Path stop
-        Start-Sleep -Seconds 1
-        $CoreReqFile = "$PithHome\logs\core_requirements_windows_update.txt"
-        Get-Content -Path "$PithServerPath\requirements.txt" | Where-Object {
-            $_ -notmatch '^\s*sentence-transformers\b' -and $_ -notmatch '^\s*torch\b'
-        } | Set-Content -Path $CoreReqFile
-        & $PipExe install --quiet --upgrade -r $CoreReqFile 2>$null
-        $coreUpdateExit = if ($null -eq $LASTEXITCODE) { 0 } else { $LASTEXITCODE }
-        if ($coreUpdateExit -ne 0) {
-            Write-Host "Core dependency update failed (exit $coreUpdateExit)." -ForegroundColor Red
-            exit $coreUpdateExit
-        }
-
-        $WindowsEmbeddingRuntime = "$PithServerPath\scripts\windows_embedding_runtime.ps1"
-        if (Test-Path $WindowsEmbeddingRuntime) {
-            . $WindowsEmbeddingRuntime
-            $EmbedResult = Install-PithEmbeddings `
-                -PithHome $PithHome `
-                -VenvPath $VenvPath `
-                -PipExe $PipExe `
-                -PythonExe $PythonExe
-            if (-not $EmbedResult) {
-                Write-Host "  Pith will run with TF-IDF search (fully functional, reduced semantic quality)." -ForegroundColor Yellow
-            }
-        } else {
-            Write-Host "Embedding runtime helper missing. Using TF-IDF search." -ForegroundColor Yellow
-            "embeddings=false`nreason=embedding_runtime_script_missing" | Out-File "$PithHome\.install_capabilities"
-        }
-
-        & $MyInvocation.MyCommand.Path start
-        $updateStartExit = if ($null -eq $LASTEXITCODE) { 0 } else { $LASTEXITCODE }
-        if ($updateStartExit -ne 0) {
-            Write-Host "Update completed, but Pith failed to restart (exit $updateStartExit)." -ForegroundColor Red
-            exit $updateStartExit
-        }
-        Write-Host "Update complete"
-        exit 0
+        $UpdateArgs = @($args | Select-Object -Skip 1)
+        & $PythonExe "$PithServerPath\scripts\update_application.py" --home $PithHome @UpdateArgs
+        $updateExit = if ($null -eq $LASTEXITCODE) { 1 } else { $LASTEXITCODE }
+        exit $updateExit
     }
     "uninstall" {
         if (Test-PithHelpRequest) { Print-PithWrapperHelp -CommandName "uninstall"; exit 0 }

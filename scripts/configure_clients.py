@@ -70,13 +70,13 @@ from app.ops.codex_plugin_contract import (
 
 LEGACY_SERVER_NAMES = ["pith-mcp", "pith", "pith-mcp-wrapper"]
 PITH_CLAUDE_CODE_HOOK_SCRIPT_NAME = "claude-code-pith-lifecycle.py"
-PITH_CLAUDE_CODE_HOOK_VERSION = "claude-code-pith-lifecycle.v7"
+PITH_CLAUDE_CODE_HOOK_VERSION = "claude-code-pith-lifecycle.v8"
 PITH_CLAUDE_CODE_CONVERSATION_TURN_TOOL = "mcp__pith__pith_conversation_turn"
 PITH_CLAUDE_CODE_INSTRUCTIONS_FILE = "CLAUDE.md"
 PITH_CLAUDE_CODE_INSTRUCTIONS_BEGIN = "<!-- PITH COGNITIVE LOOP: START -->"
 PITH_CLAUDE_CODE_INSTRUCTIONS_END = "<!-- PITH COGNITIVE LOOP: END -->"
 PITH_CODEX_HOOK_SCRIPT_NAME = "codex-pith-lifecycle.py"
-PITH_CODEX_HOOK_VERSION = "codex-pith-lifecycle.v3"
+PITH_CODEX_HOOK_VERSION = "codex-pith-lifecycle.v4"
 PITH_CODEX_CONVERSATION_TURN_TOOL = "mcp__pith__pith_conversation_turn"
 CLAUDE_MCPB_MAX_BYTES = 4 * 1024 * 1024
 CLAUDE_MCPB_MEMBERS = ["manifest.json", "server/index.cjs", "server/windows_bootstrap.py"]
@@ -970,8 +970,16 @@ def _codex_hooks_path(plat):
     return Path(_expand("~/.codex/hooks.json", plat))
 
 
+def _embed_learning_classifier(script):
+    source = (Path(__file__).resolve().parents[1] / "pith_client" / "learning_receipts.py").read_text()
+    marker = '\nif __name__ == "__main__":'
+    if script.count(marker) != 1:
+        raise ValueError("standalone hook entrypoint missing")
+    return script.replace(marker, "\n" + source + marker)
+
+
 def _claude_code_hook_script_content():
-    return textwrap.dedent(
+    return _embed_learning_classifier(textwrap.dedent(
         r'''
         #!/usr/bin/env python3
         """Pith lifecycle hook for Claude Code.
@@ -991,7 +999,7 @@ def _claude_code_hook_script_content():
         from pathlib import Path
 
         PITH_HOME = Path(__file__).resolve().parents[1]
-        HOOK_VERSION = "claude-code-pith-lifecycle.v7"
+        HOOK_VERSION = "claude-code-pith-lifecycle.v8"
         STATE_DIR = PITH_HOME / "cache" / "claude-code-lifecycle"
         LOG_PATH = PITH_HOME / "logs" / "claude-code-lifecycle.log"
         MIN_LEARNABLE_RESPONSE_CHARS = 30
@@ -1847,21 +1855,7 @@ def _claude_code_hook_script_content():
 
 
         def _classify_stop_learn_response(resp):
-            if not isinstance(resp, dict):
-                return None
-            try:
-                accepted_events = int(resp.get("accepted_learning_events") or resp.get("learning_events") or 0)
-            except (TypeError, ValueError):
-                accepted_events = 0
-            capture_state = str(resp.get("learning_capture_state") or "")
-            if accepted_events > 0 or capture_state == "accepted":
-                return "committed"
-            if resp.get("persistence_state") == "failed" or resp.get("processing_state") == "failed":
-                return "failed"
-            if resp.get("persistence_state") == "committed" or resp.get("processing_state") == "committed":
-                return "degraded_zero_learning"
-            status = str(resp.get("status") or resp.get("processing_state") or "ok")
-            return status
+            return classify_learning_result(resp)
 
 
         def _reconcile_stop_learn_status(state, request_id):
@@ -1877,7 +1871,15 @@ def _claude_code_hook_script_content():
             replay_status = str(resp.get("status") or resp.get("processing_state") or "")
             if replay_status:
                 state["last_stop_learn_replay_status"] = replay_status
-            status = _classify_stop_learn_response(resp.get("summary") if isinstance(resp.get("summary"), dict) else resp)
+            summary = resp.get("summary")
+            if isinstance(summary, dict):
+                for key in ("learning_events", "accepted_learning_events", "learning_capture_state",
+                            "session_linkage_state", "errors", "client_learning_receipt"):
+                    state.pop("last_stop_learn_" + key, None)
+                    if key in summary:
+                        state["last_stop_learn_" + key] = summary[key]
+            state["last_stop_learn_request_id"] = request_id
+            status = _classify_stop_learn_response(resp)
             if status:
                 return status
             if replay_status == "failed":
@@ -1890,28 +1892,30 @@ def _claude_code_hook_script_content():
             if not payload:
                 state["last_stop_learn_status"] = "skipped"
                 return
-            resp, error = _call_pith_result("session_learn", payload, timeout=4.0)
+            for key in ("learning_events", "accepted_learning_events", "learning_capture_state",
+                        "session_linkage_state", "errors", "client_learning_receipt"):
+                state.pop("last_stop_learn_" + key, None)
+            state.pop("last_stop_learn_response_hash", None)
             request_id = payload.get("request_id")
             state["last_stop_learn_request_id"] = request_id
+            resp, error = _call_pith_result("session_learn", payload, timeout=4.0)
             if isinstance(resp, dict):
+                for key in ("learning_events", "accepted_learning_events", "learning_capture_state",
+                            "session_linkage_state", "errors", "client_learning_receipt"):
+                    if key in resp:
+                        state["last_stop_learn_" + key] = resp[key]
                 status = _classify_stop_learn_response(resp)
                 if status in {"processing", "unknown_pending"}:
                     status = _reconcile_stop_learn_status(state, request_id) or status
                 state["last_stop_learn_status"] = status or "ok"
-                state["last_stop_learn_learning_events"] = resp.get("learning_events")
-                state["last_stop_learn_accepted_learning_events"] = resp.get("accepted_learning_events")
-                state["last_stop_learn_learning_capture_state"] = resp.get("learning_capture_state")
-                state["last_stop_learn_session_linkage_state"] = resp.get("session_linkage_state")
                 if state["last_stop_learn_status"] == "committed":
                     state["last_stop_learn_response_hash"] = _sha256_text(response)
-                else:
-                    state.pop("last_stop_learn_response_hash", None)
                 _log(f"stop_learn_sent request_id={request_id} status={state['last_stop_learn_status']}")
                 return
             reconciled = _reconcile_stop_learn_status(state, request_id)
             state["last_stop_learn_status"] = reconciled or ("unknown_pending" if request_id else "failed")
             state["last_stop_learn_error"] = error or "unknown_error"
-            _log(f"stop_learn_pending request_id={request_id} status={state['last_stop_learn_status']} error={error}")
+            _log(f"stop_learn_pending request_id={request_id} status={state['last_stop_learn_status']}")
 
 
         def _queue_backstop_retry(state, payload, error):
@@ -2135,11 +2139,11 @@ def _claude_code_hook_script_content():
         if __name__ == "__main__":
             raise SystemExit(main())
         '''
-    ).lstrip()
+    ).lstrip())
 
 
 def _codex_hook_script_content():
-    return textwrap.dedent(
+    return _embed_learning_classifier(textwrap.dedent(
         r'''
         #!/usr/bin/env python3
         """Pith lifecycle hook for Codex.
@@ -2161,7 +2165,7 @@ def _codex_hook_script_content():
         from pathlib import Path
 
         PITH_HOME = Path(__file__).resolve().parents[1]
-        HOOK_VERSION = "codex-pith-lifecycle.v3"
+        HOOK_VERSION = "codex-pith-lifecycle.v4"
         STATE_DIR = PITH_HOME / "cache" / "codex-lifecycle"
         LOG_PATH = PITH_HOME / "logs" / "codex-lifecycle.log"
         def _float_env(name, default):
@@ -2991,6 +2995,8 @@ def _codex_hook_script_content():
                 "learning_events",
                 "accepted_learning_events",
                 "learning_capture_state",
+                "errors",
+                "client_learning_receipt",
                 "session_linkage_state",
             ):
                 if key in state:
@@ -3006,6 +3012,8 @@ def _codex_hook_script_content():
                 "learning_events",
                 "accepted_learning_events",
                 "learning_capture_state",
+                "errors",
+                "client_learning_receipt",
                 "session_linkage_state",
             ):
                 state.pop(key, None)
@@ -3075,6 +3083,9 @@ def _codex_hook_script_content():
             task_id = os.environ.get("PITH_CODEX_CURRENT_TASK_ID", "").strip()
             if task_id:
                 payload["current_task_id"] = task_id[:256]
+            cached_session_id = state.get("pith_session_id")
+            if cached_session_id and cached_session_id == state.get("stale_pith_session_id"):
+                state.pop("pith_session_id", None)
             if state.get("pith_session_id"):
                 payload["session_id"] = state["pith_session_id"]
             if state.get("previous_message"):
@@ -3155,39 +3166,11 @@ def _codex_hook_script_content():
 
 
         def _classify_learn_response(resp):
-            if not isinstance(resp, dict):
-                return "failed"
-            try:
-                accepted = int(resp.get("accepted_learning_events") or resp.get("learning_events") or 0)
-            except (TypeError, ValueError):
-                accepted = 0
-            if accepted > 0 or resp.get("learning_capture_state") == "accepted":
-                return "committed"
-            if resp.get("persistence_state") == "failed" or resp.get("processing_state") == "failed":
-                return "failed"
-            if resp.get("persistence_state") == "committed" or resp.get("processing_state") == "committed":
-                return "degraded_zero_learning"
-            return str(resp.get("status") or resp.get("processing_state") or "ok")
+            return classify_learning_result(resp)
 
 
         def _classify_learn_status_response(resp):
-            if not isinstance(resp, dict):
-                return None
-            summary = resp.get("summary")
-            if isinstance(summary, dict):
-                status = _classify_learn_response(summary)
-                if status:
-                    return status
-            status = str(resp.get("status") or resp.get("processing_state") or "").strip()
-            if status == "committed":
-                return _classify_learn_response(summary if isinstance(summary, dict) else resp)
-            if status == "failed":
-                return "failed"
-            if status == "processing":
-                return "processing"
-            if status in {"queued", "retry", "unknown"}:
-                return "unknown_pending"
-            return _classify_learn_response(resp)
+            return classify_learning_result(resp)
 
 
         def _copy_learn_response_fields(state, resp, prefix=""):
@@ -3197,8 +3180,11 @@ def _codex_hook_script_content():
                 "learning_events",
                 "accepted_learning_events",
                 "learning_capture_state",
+                "errors",
+                "client_learning_receipt",
                 "session_linkage_state",
             ):
+                state.pop(f"{prefix}{key}", None)
                 if key in resp:
                     state[f"{prefix}{key}"] = resp.get(key)
 
@@ -3333,6 +3319,7 @@ def _codex_hook_script_content():
             if managed_followup:
                 payload["binding"] = binding
                 payload["binding_generation"] = generation
+            _copy_learn_response_fields(state, {})
             state["learning_request_id"] = request_id
             state["learning_binding_mode"] = "managed" if managed_followup else "shadow"
             learn_response, error = _call_pith_result("session_learn", payload, LEARN_TIMEOUT_SECONDS)
@@ -3342,11 +3329,11 @@ def _codex_hook_script_content():
                 reconciled = _reconcile_learn_status(state, request_id)
                 state["learning_status"] = reconciled or ("unknown_pending" if request_id else "failed")
             elif isinstance(learn_response, dict):
+                _copy_learn_response_fields(state, learn_response)
                 status = _classify_learn_response(learn_response)
                 if status in LEARN_PENDING_STATUSES:
                     status = _reconcile_learn_status(state, request_id) or status
                 state["learning_status"] = status
-                _copy_learn_response_fields(state, learn_response)
             else:
                 reconciled = _reconcile_learn_status(state, request_id)
                 state["learning_status"] = reconciled or ("unknown_pending" if request_id else "failed")
@@ -3507,7 +3494,7 @@ def _codex_hook_script_content():
         if __name__ == "__main__":
             raise SystemExit(main())
         '''
-    ).lstrip()
+    ).lstrip())
 
 
 def _write_claude_code_hook_script(pith_home, dry_run=False):

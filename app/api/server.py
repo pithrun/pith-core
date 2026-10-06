@@ -1139,7 +1139,7 @@ def auto_associate_single(*args: Any, **kwargs: Any) -> Any:
 # MATURITY-001: Maturities blocked from external API results
 _BLOCKED_MATURITIES = {"QUARANTINED", "DISCARDED"}
 
-SERVER_VERSION = os.environ.get("PITH_VERSION", "1.0.10")
+SERVER_VERSION = os.environ.get("PITH_VERSION", "1.0.11")
 
 app = FastAPI(
     title="Pith Server",
@@ -1617,6 +1617,20 @@ def _build_ready_state() -> dict:
     except Exception as exc:
         semantic_full_search_state = "unknown"
         semantic_warm_readiness = {"state": "unknown", "error": _safe_error(exc)}
+    try:
+        from app.retrieval.foreground_embedding import foreground_embedding_process
+
+        foreground_embedding = {
+            **foreground_embedding_process.snapshot(),
+            "bounded_enabled": _env_flag("PITH_FOREGROUND_EMBEDDING_BOUNDED_ENABLED", False),
+            "semantic_enabled": _env_flag("PITH_FOREGROUND_EMBEDDING_ENABLED", True),
+            "timeout_ms": max(
+                50.0,
+                min(2000.0, _startup_env_float("PITH_FOREGROUND_EMBEDDING_SEARCH_TIMEOUT_MS", 600.0)),
+            ),
+        }
+    except Exception as exc:
+        foreground_embedding = {"state": "unknown", "error": _safe_error(exc)}
     return {
         "status": "healthy" if process_state in {"starting", "running"} else "stopping",
         "service": "pith",
@@ -1630,6 +1644,7 @@ def _build_ready_state() -> dict:
         "retrieval_state": retrieval_state,
         "semantic_full_search_state": semantic_full_search_state,
         "semantic_warm_readiness": semantic_warm_readiness,
+        "foreground_embedding": foreground_embedding,
         "retrieval_index": retrieval_index,
         "maintenance_state": maintenance_state,
         "degraded_reason": degraded_reason,
@@ -1687,6 +1702,10 @@ def _derive_health_status(ready: dict) -> None:
     components = ready.get("components") if isinstance(ready.get("components"), dict) else {}
     for name, raw_state in components.items():
         state = str(raw_state or "unknown").lower()
+        if name == "maintenance_scheduler" and state == "external":
+            external_state = str(components.get("maintenance_scheduler_external") or "unknown").lower()
+            if external_state in {"healthy", "available"}:
+                continue
         if state in normal_states:
             continue
         reason = f"component:{name}:{state}"
@@ -2225,6 +2244,14 @@ async def _warm_embeddings_for_startup() -> None:
                 result="empty_index",
                 query_path_warmed=False,
             )
+        if _env_flag("PITH_FOREGROUND_EMBEDDING_BOUNDED_ENABLED", False) and _env_flag(
+            "PITH_FOREGROUND_EMBEDDING_ENABLED",
+            True,
+        ):
+            from app.retrieval.foreground_embedding import foreground_embedding_process
+
+            foreground_embedding_process.start_async()
+            logger.info("Startup: bounded foreground embedding worker start scheduled")
     except asyncio.CancelledError:
         logger.info("Startup: semantic embedding warmup cancelled")
         retrieval_engine.record_semantic_warm_readiness(
@@ -2709,9 +2736,12 @@ async def _complete_startup_initialization():
         # RETRIEVAL-125 Phase C: steady-state TF-IDF/embedding refresh drain
         # (gated OFF by default via PITH_TFIDF_REFRESH_DRAIN).
         try:
+            from app.ops.host_pressure import build_host_pressure_snapshot
             from app.retrieval.refresh_drain import start_refresh_drain
 
-            _drain_task = await start_refresh_drain()
+            _drain_task = await start_refresh_drain(
+                pressure_provider=lambda: build_host_pressure_snapshot(use_cache=True),
+            )
             if _drain_task is not None:
                 app.state.refresh_drain_task = _drain_task
                 logger.info("Startup: TF-IDF refresh drain started")
@@ -2946,6 +2976,13 @@ async def shutdown_event():
         logger.info("Shutdown: diagnostic warmer stopped")
     except Exception as e:
         logger.warning(f"Shutdown: diagnostic warmer shutdown failed: {e}")
+    try:
+        from app.retrieval.foreground_embedding import foreground_embedding_process
+
+        foreground_embedding_process.shutdown()
+        logger.info("Shutdown: foreground embedding worker stopped")
+    except Exception as e:
+        logger.warning(f"Shutdown: foreground embedding worker stop failed: {e}")
     release_brain_lock()
     logger.info("Pith Server shutting down...")
 

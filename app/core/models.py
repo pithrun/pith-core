@@ -1714,6 +1714,41 @@ class EvolvedConcept(BaseModel):
     change: str
 
 
+class ClientLearningItem(BaseModel):
+    input_index: int = Field(ge=0)
+    status: Literal["created", "evolved", "skipped", "rejected", "deferred", "error"]
+    reason: str
+    persistence_evidence: Literal["reported_saved", "not_attempted", "unknown"]
+    concept_id: str | None = None
+
+
+class ClientLearningRange(BaseModel):
+    start_index: int = Field(ge=0)
+    end_index_exclusive: int = Field(ge=0)
+    reason: str
+    persistence_evidence: Literal["not_attempted"] = "not_attempted"
+
+
+class ClientLearningReceipt(BaseModel):
+    version: Literal[1] = 1
+    input_count: int = Field(ge=0)
+    items: list[ClientLearningItem] = Field(default_factory=list)
+    deferred_ranges: list[ClientLearningRange] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_partition(self):
+        spans = [(item.input_index, item.input_index + 1) for item in self.items]
+        spans.extend((item.start_index, item.end_index_exclusive) for item in self.deferred_ranges)
+        cursor = 0
+        for start, end in sorted(spans):
+            if start != cursor or end <= start or end > self.input_count:
+                raise ValueError("receipt must partition original input indexes exactly once")
+            cursor = end
+        if cursor != self.input_count:
+            raise ValueError("receipt has missing original input indexes")
+        return self
+
+
 class SessionLearnResponse(BaseModel):
     """Post-response learning response.
 
@@ -1740,10 +1775,30 @@ class SessionLearnResponse(BaseModel):
     persistence_state: str = "committed"
     processing_state: str = "committed"
     accepted_learning_events: int = 0
-    learning_capture_state: str = "zero_learning"  # accepted|zero_learning|rejected|error
+    learning_capture_state: str = "zero_learning"  # accepted|partial|deferred|zero_learning|rejected|error
+    client_learning_receipt: ClientLearningReceipt | None = None
     session_linkage_state: str = "unbound"  # linked|mismatch|unbound
     request_id: str | None = None
     retry_after_seconds: float | None = None
+
+    def learning_summary(self):
+        """Completed operation evidence, including zero/partial outcomes."""
+        return {
+            "events": self.learning_events,
+            "learning_events": self.learning_events,
+            "accepted_learning_events": self.accepted_learning_events,
+            "learning_capture_state": self.learning_capture_state,
+            "errors": self.errors,
+            "processing_state": self.processing_state,
+            "persistence_state": self.persistence_state,
+            "request_id": self.request_id,
+            "session_linkage_state": self.session_linkage_state,
+            "client_learning_receipt": (
+                self.client_learning_receipt.model_dump() if self.client_learning_receipt else None),
+            "concepts_created": [c.concept_id for c in self.concepts_created],
+            "concepts_evolved": [c.concept_id for c in self.concepts_evolved],
+            "budget_warnings": list(self.budget_warnings),
+        }
 
 
 # --- Auto-Association Models (P1.3) ---

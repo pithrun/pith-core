@@ -143,8 +143,21 @@ class EmbeddingEngine:
             return []
 
         query_vec = self.embed_text(query_text)  # (384,)
+        return self.search_vector(query_vec, top_k=top_k)
+
+    def search_vector(self, query_vec: np.ndarray, top_k: int = 10) -> list[tuple[str, float]]:
+        """Score a validated query vector against the parent-owned embedding index."""
+        vector = np.asarray(query_vec)
+        if vector.dtype != np.float32 or vector.shape != (EMBEDDING_DIM,) or not np.isfinite(vector).all():
+            raise ValueError("invalid query embedding")
+        norm = float(np.linalg.norm(vector))
+        if norm < 0.5 or norm > 1.5:
+            raise ValueError("invalid query embedding norm")
+        if self._index_matrix is None or len(self._index_ids) == 0:
+            return []
+
         # Dot product = cosine similarity for L2-normalized vectors
-        scores = self._index_matrix @ query_vec  # (N,)
+        scores = self._index_matrix @ vector  # (N,)
 
         # Get top-k indices
         if len(scores) <= top_k:
