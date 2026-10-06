@@ -1,11 +1,11 @@
-# Pith Installer v1.0.9 (Windows PowerShell)
+# Pith Installer v1.0.10 (Windows PowerShell)
 # Windows equivalent installer
 
 #Requires -Version 5.0
 
 param(
     [switch]$Force = $false,
-    [string]$PithVersion = "1.0.9"
+    [string]$PithVersion = "1.0.10"
 )
 
 # Strict error handling
@@ -1800,9 +1800,9 @@ if (-not (Test-Path $ReqFile)) {
 $CoreDepsLog = "$PithHome\logs\core_dependency_install.log"
 $CoreReqFile = "$PithHome\logs\core_requirements_windows.txt"
 New-Item -ItemType Directory -Path "$PithHome\logs" -Force | Out-Null
-Get-Content -Path $ReqFile | Where-Object {
+Get-Content -Path $ReqFile -Encoding UTF8 | Where-Object {
     $_ -notmatch '^\s*sentence-transformers\b' -and $_ -notmatch '^\s*torch\b'
-} | Set-Content -Path $CoreReqFile
+} | Set-Content -Path $CoreReqFile -Encoding UTF8
 $CoreDepsExit = Invoke-PithEmbeddingCommand `
     -PithHome $PithHome `
     -EmbedLog $CoreDepsLog `
@@ -1813,7 +1813,7 @@ $CoreDepsExit = Invoke-PithEmbeddingCommand `
 if ($CoreDepsExit -ne 0) {
     Write-Error-Custom "Core dependency installation failed. Details: $CoreDepsLog"
 }
-Write-Success "Installed core dependencies"
+Write-Host "Core dependency installation command completed"
 
 Write-Host "Installing embeddings (CPU-only PyTorch)..."
 $EmbedResult = Install-PithEmbeddings `
@@ -1824,6 +1824,67 @@ $EmbedResult = Install-PithEmbeddings `
 if (-not $EmbedResult) {
     Write-Host "  Pith will run with TF-IDF search (fully functional, reduced semantic quality)." -ForegroundColor Yellow
 }
+
+function Assert-PithCoreDependencyHealth {
+    param(
+        [string]$PythonExe, [string]$PithHome, [string]$PithServerPath,
+        [string]$CoreReqFile
+    )
+
+    $HealthLog = "$PithHome\logs\core_dependency_health.log"
+    $ResultLog = "$PithHome\logs\core_dependency_health.stdout.log"
+    $Checker = "$PithServerPath\scripts\windows_dependency_health.py"
+    if (-not (Test-Path -LiteralPath $Checker -PathType Leaf)) {
+        Write-Error-Custom "Installation incomplete: dependency checker missing. Details: $HealthLog"
+    }
+    try {
+        $HealthExit = Invoke-PithEmbeddingCommand `
+            -PithHome $PithHome -EmbedLog $HealthLog -FilePath $PythonExe `
+            -Arguments @("-I", "-B", $Checker, "--requirements", $CoreReqFile) `
+            -Name "core_dependency_health" -TimeoutSeconds 180
+        if ($null -eq $HealthExit -or $HealthExit -ne 0) {
+            throw "Dependency checker failed (exit=$HealthExit)."
+        }
+        $CurrentResult = Get-Item -LiteralPath $ResultLog -ErrorAction Stop
+        if ($CurrentResult.Length -lt 2 -or $CurrentResult.Length -gt 1048576) {
+            throw "Dependency checker output size invalid."
+        }
+        $ResultText = Get-Content -LiteralPath $ResultLog -Raw -Encoding UTF8 -ErrorAction Stop
+        if (-not $ResultText.TrimStart().StartsWith("{")) {
+            throw "Dependency checker output root is not an object."
+        }
+        $Result = $ResultText | ConvertFrom-Json -ErrorAction Stop
+        if ($Result -isnot [System.Management.Automation.PSCustomObject]) {
+            throw "Dependency checker output is not an object."
+        }
+        foreach ($Field in @("schema_version", "distribution_count", "runtime_file_count", "failure_count", "imports_checked")) {
+            if (($Result.$Field -isnot [int]) -and ($Result.$Field -isnot [long])) {
+                throw "Dependency checker field '$Field' is not an integer."
+            }
+        }
+        foreach ($Field in @("scope", "status", "import_status")) {
+            if ($Result.$Field -isnot [string]) {
+                throw "Dependency checker field '$Field' is not a string."
+            }
+        }
+        if ($Result.schema_version -ne 1 -or
+            $Result.scope -cne "core_runtime_dependencies" -or
+            $Result.status -cne "pass" -or
+            $Result.distribution_count -lt 1 -or $Result.distribution_count -gt 400 -or
+            $Result.runtime_file_count -lt 1 -or $Result.runtime_file_count -gt 250000 -or
+            $Result.failure_count -ne 0 -or
+            $Result.failures -isnot [array] -or @($Result.failures).Count -ne 0 -or
+            $Result.import_status -cne "pass" -or $Result.imports_checked -ne 13) {
+            throw "Dependency checker did not provide complete successful evidence."
+        }
+    }
+    catch {
+        Write-Error-Custom "Installation incomplete: core dependency health failed. $($_.Exception.Message) Details: $HealthLog"
+    }
+    Write-Success "Verified core runtime dependencies"
+}
+
+Assert-PithCoreDependencyHealth -PythonExe $PythonExe -PithHome $PithHome -PithServerPath $PithServerPath -CoreReqFile $CoreReqFile
 
 $VenvPathRecord = "$PithHome\config\venv.path"
 $ExistingVenvPathRecord = Get-Item -LiteralPath $VenvPathRecord -Force -ErrorAction SilentlyContinue
@@ -2459,11 +2520,20 @@ function Test-PithInstallerConversationReady {
         $Response = Invoke-WebRequest -Uri "http://127.0.0.1:$Port/readyz" -UseBasicParsing `
             -TimeoutSec 2 -ErrorAction Stop
         if ($Response.StatusCode -ne 200) { return $false }
+        if (($Response.Content -isnot [string]) -or (-not $Response.Content.TrimStart().StartsWith("{"))) {
+            return $false
+        }
         $Ready = $Response.Content | ConvertFrom-Json
+        if ($Ready -isnot [System.Management.Automation.PSCustomObject]) { return $false }
+        foreach ($Field in @("service", "version", "process_state", "write_state", "retrieval_state")) {
+            if ($Ready.$Field -isnot [string]) { return $false }
+        }
         return (
-            ([string]$Ready.process_state -eq "running") -and
-            ([string]$Ready.write_state -eq "accepting") -and
-            ([string]$Ready.retrieval_state -ne "recovering")
+            ($Ready.service -ceq "pith") -and
+            ($Ready.version -ceq $PithVersion) -and
+            ($Ready.process_state -ceq "running") -and
+            ($Ready.write_state -ceq "accepting") -and
+            ($Ready.retrieval_state -ceq "ready")
         )
     }
     catch {
@@ -2471,12 +2541,15 @@ function Test-PithInstallerConversationReady {
     }
 }
 
-# Pre-check: if something is already running on the selected port and healthy, skip
-# Handles: (1) dev env where Docker Pith is on the selected port, (2) re-running installer
+# Pre-check: accept only the expected Pith service/version with positive readiness.
+# A foreign or wrong-version service is not accepted. Same-version profile ownership
+# is not proven by readyz; re-running the installer still uses the selected port.
+$HealthCheckPassed = $false
 $ExistingHealthy = $false
 $ExistingHealthy = Test-PithInstallerConversationReady -Port $PithPort
 
 if ($ExistingHealthy) {
+    $HealthCheckPassed = $true
     Write-Success "Pith server already running on port $PithPort - conversation readiness passed"
 } else {
 
@@ -2542,6 +2615,10 @@ catch {
 }
 
 }  # end of port pre-check else block
+
+if (-not $HealthCheckPassed) {
+    Write-Error-Custom "Installation incomplete: Pith conversation readiness failed. See $PithHome\logs\server.err.log and $PithHome\logs\server.log"
+}
 
 Write-Host ""
 

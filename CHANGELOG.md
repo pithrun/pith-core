@@ -4,6 +4,13 @@ All notable changes to Pith are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.10] - 2026-10-05
+
+### Fixed
+- Windows installs and upgrades verify required runtime dependency files and library imports after dependency installation.
+- The Windows installer reports completion only when the expected Pith version responds with positive service readiness.
+- Dependency-check and readiness failures stop the installer and identify diagnostic logs.
+
 ## [1.0.9] - 2026-10-04
 
 ### Fixed
