@@ -626,151 +626,146 @@ def _locomo_highwater_support_supplements(
     existing_ids = {r.concept_id for r in top_results}
     additions: list[SearchResult] = []
     conn = _get_connection()
-    try:
-        for rule in rules:
-            support_terms = tuple(
-                term
-                for group in rule.get("support_any_groups", ())
-                for term in group
-                if len(term) >= 3
+    # Borrowed backend handle; connection lifetime belongs to the backend.
+    for rule in rules:
+        support_terms = tuple(
+            term
+            for group in rule.get("support_any_groups", ())
+            for term in group
+            if len(term) >= 3
+        )
+        required_terms = tuple(term for term in rule.get("support_all", ()) if len(term) >= 3)
+        where_parts = ["status = 'active'", "is_current = 1"]
+        params: list[Any] = []
+        support_data_expr = (
+            "coalesce(json_extract(data, '$.summary'), '') || ' ' || "
+            "coalesce(json_extract(data, '$.evidence'), '')"
+        )
+        for term in required_terms:
+            where_parts.append(
+                "("
+                "lower(summary) LIKE ? OR "
+                f"lower({support_data_expr}) LIKE ? OR "
+                "EXISTS ("
+                "SELECT 1 FROM verbatim_fragments vf "
+                "WHERE vf.concept_id = concepts.id "
+                "AND lower(vf.content) LIKE ?"
+                ")"
+                ")"
             )
-            required_terms = tuple(term for term in rule.get("support_all", ()) if len(term) >= 3)
-            where_parts = ["status = 'active'", "is_current = 1"]
-            params: list[Any] = []
-            support_data_expr = (
-                "coalesce(json_extract(data, '$.summary'), '') || ' ' || "
-                "coalesce(json_extract(data, '$.evidence'), '')"
-            )
-            for term in required_terms:
-                where_parts.append(
-                    "("
-                    "lower(summary) LIKE ? OR "
-                    f"lower({support_data_expr}) LIKE ? OR "
-                    "EXISTS ("
-                    "SELECT 1 FROM verbatim_fragments vf "
-                    "WHERE vf.concept_id = concepts.id "
-                    "AND lower(vf.content) LIKE ?"
-                    ")"
-                    ")"
+            like_term = f"%{term}%"
+            params.extend((like_term, like_term, like_term))
+        if support_terms:
+            where_parts.append(
+                "("
+                + " OR ".join(
+                    [
+                        "("
+                        "lower(summary) LIKE ? OR "
+                        f"lower({support_data_expr}) LIKE ? OR "
+                        "EXISTS ("
+                        "SELECT 1 FROM verbatim_fragments vf "
+                        "WHERE vf.concept_id = concepts.id "
+                        "AND lower(vf.content) LIKE ?"
+                        ")"
+                        ")"
+                    ]
+                    * len(support_terms)
                 )
+                + ")"
+            )
+            for term in support_terms:
                 like_term = f"%{term}%"
                 params.extend((like_term, like_term, like_term))
-            if support_terms:
-                where_parts.append(
-                    "("
-                    + " OR ".join(
-                        [
-                            "("
-                            "lower(summary) LIKE ? OR "
-                            f"lower({support_data_expr}) LIKE ? OR "
-                            "EXISTS ("
-                            "SELECT 1 FROM verbatim_fragments vf "
-                            "WHERE vf.concept_id = concepts.id "
-                            "AND lower(vf.content) LIKE ?"
-                            ")"
-                            ")"
-                        ]
-                        * len(support_terms)
-                    )
-                    + ")"
-                )
-                for term in support_terms:
-                    like_term = f"%{term}%"
-                    params.extend((like_term, like_term, like_term))
-            params.append(max(max_additions * 4, int(rule.get("limit", 3)) * 4))
-            sql = f"""
-                SELECT
-                    id,
-                    summary,
-                    confidence,
-                    knowledge_area,
-                    created_at,
-                    edit_provenance,
-                    {support_data_expr} AS support_data_text,
-                    (
-                        SELECT group_concat(vf.content, ' ')
-                        FROM verbatim_fragments vf
-                        WHERE vf.concept_id = concepts.id
-                    ) AS verbatim_text
-                FROM concepts
-                WHERE {' AND '.join(where_parts)}
-                ORDER BY confidence DESC, created_at DESC
-                LIMIT ?
-            """
-            rule_added = 0
-            for row in conn.execute(sql, tuple(params)).fetchall():
-                cid = row[0]
-                summary = row[1] or ""
-                support_blob = " ".join(
-                    str(part or "") for part in (row[1], row[6], row[7])
-                ).lower()
-                if not _locomo_rule_matches_support(rule, support_blob):
-                    continue
-                summary_for_result = summary
-                try:
-                    from app.cognitive.locomo_highwater_payload import shape_display_summary
+        params.append(max(max_additions * 4, int(rule.get("limit", 3)) * 4))
+        sql = f"""
+            SELECT
+                id,
+                summary,
+                confidence,
+                knowledge_area,
+                created_at,
+                edit_provenance,
+                {support_data_expr} AS support_data_text,
+                (
+                    SELECT group_concat(vf.content, ' ')
+                    FROM verbatim_fragments vf
+                    WHERE vf.concept_id = concepts.id
+                ) AS verbatim_text
+            FROM concepts
+            WHERE {' AND '.join(where_parts)}
+            ORDER BY confidence DESC, created_at DESC
+            LIMIT ?
+        """
+        rule_added = 0
+        for row in conn.execute(sql, tuple(params)).fetchall():
+            cid = row[0]
+            summary = row[1] or ""
+            support_blob = " ".join(
+                str(part or "") for part in (row[1], row[6], row[7])
+            ).lower()
+            if not _locomo_rule_matches_support(rule, support_blob):
+                continue
+            summary_for_result = summary
+            try:
+                from app.cognitive.locomo_highwater_payload import shape_display_summary
 
-                    payload_match = shape_display_summary(
-                        message_l,
-                        cid,
-                        summary,
-                        support_blob,
-                        support_blob,
-                    )
-                    if payload_match:
-                        summary_for_result = payload_match.output
-                except Exception as e:
-                    logger.debug(
-                        "LOCOMO-HIGHWATER-PAYLOAD: support supplement shape failed: %s",
-                        e,
-                    )
-                score = float(rule.get("score", 1.04))
-                if cid in existing_ids:
-                    for result in top_results:
-                        if result.concept_id == cid:
-                            old_score = result.relevance_score
-                            result.relevance_score = max(result.relevance_score, score)
-                            if summary_for_result != summary:
-                                result.summary = summary_for_result
-                            if result.relevance_score != old_score:
-                                logger.info(
-                                    "LOCOMO-HIGHWATER-RECOVERY: boosted %s reason=%s %.3f->%.3f",
-                                    cid,
-                                    rule["reason"],
-                                    old_score,
-                                    result.relevance_score,
-                                )
-                            break
-                    continue
-                additions.append(
-                    SearchResult(
-                        concept_id=cid,
-                        version="v1",
-                        summary=summary_for_result,
-                        confidence=row[2] or 0.5,
-                        relevance_score=score,
-                        knowledge_area=row[3],
-                        created_at=row[4],
-                        edit_provenance=row[5],
-                    )
-                )
-                logger.info(
-                    "LOCOMO-HIGHWATER-RECOVERY: injected %s reason=%s score=%.3f",
+                payload_match = shape_display_summary(
+                    message_l,
                     cid,
-                    rule["reason"],
-                    score,
+                    summary,
+                    support_blob,
+                    support_blob,
                 )
-                existing_ids.add(cid)
-                rule_added += 1
-                if len(additions) >= max_additions or rule_added >= int(rule.get("limit", 3)):
-                    break
-            if len(additions) >= max_additions:
+                if payload_match:
+                    summary_for_result = payload_match.output
+            except Exception as e:
+                logger.debug(
+                    "LOCOMO-HIGHWATER-PAYLOAD: support supplement shape failed: %s",
+                    e,
+                )
+            score = float(rule.get("score", 1.04))
+            if cid in existing_ids:
+                for result in top_results:
+                    if result.concept_id == cid:
+                        old_score = result.relevance_score
+                        result.relevance_score = max(result.relevance_score, score)
+                        if summary_for_result != summary:
+                            result.summary = summary_for_result
+                        if result.relevance_score != old_score:
+                            logger.info(
+                                "LOCOMO-HIGHWATER-RECOVERY: boosted %s reason=%s %.3f->%.3f",
+                                cid,
+                                rule["reason"],
+                                old_score,
+                                result.relevance_score,
+                            )
+                        break
+                continue
+            additions.append(
+                SearchResult(
+                    concept_id=cid,
+                    version="v1",
+                    summary=summary_for_result,
+                    confidence=row[2] or 0.5,
+                    relevance_score=score,
+                    knowledge_area=row[3],
+                    created_at=row[4],
+                    edit_provenance=row[5],
+                )
+            )
+            logger.info(
+                "LOCOMO-HIGHWATER-RECOVERY: injected %s reason=%s score=%.3f",
+                cid,
+                rule["reason"],
+                score,
+            )
+            existing_ids.add(cid)
+            rule_added += 1
+            if len(additions) >= max_additions or rule_added >= int(rule.get("limit", 3)):
                 break
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+        if len(additions) >= max_additions:
+            break
 
     return additions
 
@@ -7923,38 +7918,36 @@ class ConversationTurnMixin:
             _restore_protected_activated_concepts_fn = restore_protected_activated_concepts
             if _get_feature_flag("SUPERSESSION_CHAIN_RESCUE_ENABLED", False):
                 _supersession_conn = _get_connection()
-                try:
-                    _supersession_rescue = resolve_exact_supersession_head(
+                # Borrowed backend handle; connection lifetime belongs to the backend.
+                _supersession_rescue = resolve_exact_supersession_head(
+                    request.message or "",
+                    conn=_supersession_conn,
+                    load_concept_fn=load_concept,
+                    enabled=True,
+                )
+                if (
+                    not _supersession_rescue.protected_results
+                    and _get_feature_flag("SUPERSESSION_CHAIN_SUBJECT_RESCUE_ENABLED", False)
+                    and _turn_deadline_optional("retrieval.supersession_subject_rescue", 75.0)
+                ):
+                    _supersession_rescue = resolve_subject_supersession_chain_candidates(
                         request.message or "",
                         conn=_supersession_conn,
                         load_concept_fn=load_concept,
                         enabled=True,
                     )
-                    if (
-                        not _supersession_rescue.protected_results
-                        and _get_feature_flag("SUPERSESSION_CHAIN_SUBJECT_RESCUE_ENABLED", False)
-                        and _turn_deadline_optional("retrieval.supersession_subject_rescue", 75.0)
-                    ):
-                        _supersession_rescue = resolve_subject_supersession_chain_candidates(
-                            request.message or "",
-                            conn=_supersession_conn,
-                            load_concept_fn=load_concept,
-                            enabled=True,
-                        )
-                    if (
-                        not _supersession_rescue.protected_results
-                        and _get_feature_flag("SUPERSESSION_CHAIN_CANDIDATE_RESCUE_ENABLED", False)
-                        and _turn_deadline_optional("retrieval.supersession_candidate_rescue", 75.0)
-                    ):
-                        _supersession_rescue = resolve_candidate_supersession_chains(
-                            request.message or "",
-                            list(search_results or []),
-                            conn=_supersession_conn,
-                            load_concept_fn=load_concept,
-                            enabled=True,
-                        )
-                finally:
-                    _supersession_conn.close()
+                if (
+                    not _supersession_rescue.protected_results
+                    and _get_feature_flag("SUPERSESSION_CHAIN_CANDIDATE_RESCUE_ENABLED", False)
+                    and _turn_deadline_optional("retrieval.supersession_candidate_rescue", 75.0)
+                ):
+                    _supersession_rescue = resolve_candidate_supersession_chains(
+                        request.message or "",
+                        list(search_results or []),
+                        conn=_supersession_conn,
+                        load_concept_fn=load_concept,
+                        enabled=True,
+                    )
 
                 _supersession_chain_rescue_trace = _supersession_rescue.to_trace()
                 if _supersession_rescue.protected_results:
@@ -15222,20 +15215,18 @@ class ConversationTurnMixin:
                     if not marker:
                         return []
                     conn = _get_connection()
-                    try:
-                        rows = conn.execute(
-                            """
-                            SELECT id, summary
-                            FROM concepts
-                            WHERE status = 'active'
-                              AND currency_status = 'ACTIVE'
-                              AND LOWER(summary) LIKE ?
-                            LIMIT 250
-                            """,
-                            (f"%{marker.lower()}%",),
-                        ).fetchall()
-                    finally:
-                        conn.close()
+                    # Borrowed backend handle; connection lifetime belongs to the backend.
+                    rows = conn.execute(
+                        """
+                        SELECT id, summary
+                        FROM concepts
+                        WHERE status = 'active'
+                          AND currency_status = 'ACTIVE'
+                          AND LOWER(summary) LIKE ?
+                        LIMIT 250
+                        """,
+                        (f"%{marker.lower()}%",),
+                    ).fetchall()
 
                     candidates = []
                     for row in rows:

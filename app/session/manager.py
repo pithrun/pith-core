@@ -260,7 +260,8 @@ class SessionManager(
         wait for main-path reads to complete and vice versa. This is safe
         but may add latency to whichever thread is waiting.
 
-        STABILITY-037: Added shutdown check and DB retry with connection recycle.
+        STABILITY-037: Skip work during shutdown.
+        INGEST-064: A failed invocation is not replayed; effects may already exist.
         """
         import sqlite3
         from app.storage.backend import get_backend
@@ -276,57 +277,43 @@ class SessionManager(
                 logger.info("S-1-BG: Skipping autolearn — server shutting down")
                 return
 
-            _max_retries = 2
-            _autolearn_succeeded = False
-            for _attempt in range(_max_retries):
-                try:
-                    auto_learn_result = self.session_learn(learn_request)
-                    logger.info(
-                        f"S-1-BG: Auto-learned: {auto_learn_result.learning_events} events, "
-                        f"sources={auto_learn_result.extraction_source_breakdown}"
-                    )
-                    if raw_capture_ref:
-                        try:
-                            from app.storage.turn_ingestion import mark_learning_status_default_db
+            # INGEST-064: failures do not prove previous learning writes were rolled back.
+            try:
+                auto_learn_result = self.session_learn(learn_request)
+                logger.info(
+                    f"S-1-BG: Auto-learned: {auto_learn_result.learning_events} events, "
+                    f"sources={auto_learn_result.extraction_source_breakdown}"
+                )
+                if raw_capture_ref:
+                    try:
+                        from app.storage.turn_ingestion import mark_learning_status_default_db
 
-                            mark_learning_status_default_db(
-                                **raw_capture_ref,
-                                status="attempted",
-                                concepts_extracted=auto_learn_result.learning_events,
-                            )
-                        except Exception as _ledger_err:
-                            logger.warning("turn_ingestion_ledger_update_failed: %s", _ledger_err)
-                    _autolearn_succeeded = True
-                    break  # Success — exit retry loop
-                except sqlite3.ProgrammingError as e:
-                    if "closed database" in str(e).lower() and _attempt < _max_retries - 1:
-                        logger.warning(
-                            f"S-1-BG: STABILITY-037 DB connection stale on attempt "
-                            f"{_attempt + 1}/{_max_retries}, recycling and retrying: {e}"
+                        mark_learning_status_default_db(
+                            **raw_capture_ref,
+                            status="attempted",
+                            concepts_extracted=auto_learn_result.learning_events,
                         )
-                        try:
-                            backend.get_connection()
-                        except Exception:
-                            pass
-                        continue
-                    logger.error(f"S-1-BG: Background auto-learn failed: {e}")
-                    if raw_capture_ref:
-                        try:
-                            from app.storage.turn_ingestion import mark_learning_status_default_db
+                    except Exception as _ledger_err:
+                        logger.warning("turn_ingestion_ledger_update_failed: %s", _ledger_err)
+            except sqlite3.ProgrammingError as e:
+                logger.error(f"S-1-BG: Background auto-learn failed: {e}")
+                if raw_capture_ref:
+                    try:
+                        from app.storage.turn_ingestion import mark_learning_status_default_db
 
-                            mark_learning_status_default_db(
-                                **raw_capture_ref,
-                                status="failed",
-                                error=str(e),
-                            )
-                        except Exception as _ledger_err:
-                            logger.warning("turn_ingestion_ledger_update_failed: %s", _ledger_err)
-                    return
-
-            if not _autolearn_succeeded:
+                        mark_learning_status_default_db(
+                            **raw_capture_ref,
+                            status="failed",
+                            error=str(e),
+                        )
+                    except Exception as _ledger_err:
+                        logger.warning("turn_ingestion_ledger_update_failed: %s", _ledger_err)
+                self._last_autolearn_result = None
+                self._last_autolearn_result_obj = None
+                self._last_autolearn_budget_warnings = []
                 return
 
-            # --- Post-autolearn tasks (outside retry loop) ---
+            # --- Post-autolearn tasks (after one learning invocation) ---
             # Track rejected-after-request gaps
             if auto_learn_result and auto_learn_result.garbage_rejected > 0 and self._last_extraction_request_types:
                 self._suppressed_gap_types.update(self._last_extraction_request_types)

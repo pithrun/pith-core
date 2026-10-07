@@ -3,6 +3,11 @@
 import logging
 
 from app.cognitive.ka_admission import resolve_ka_admission
+from app.cognitive.taxonomy import (  # KA-001/DEBT-108 (DEBT-112: removed unused imports)
+    classify_knowledge_area,
+    normalize_knowledge_area_boundary,
+)
+
 # FIX-3(A4): Import from config.py (centralized) to avoid circular import risk
 from app.core.config import MIN_CONFIDENCE_CHANGE, MIN_EVIDENCE_CHANGE
 from app.core.datetime_utils import _utc_now_iso
@@ -15,10 +20,6 @@ from app.storage import (
     load_concept_conn,
     save_concept,
     save_concept_conn,
-)
-from app.cognitive.taxonomy import (  # KA-001/DEBT-108 (DEBT-112: removed unused imports)
-    classify_knowledge_area,
-    normalize_knowledge_area_boundary,
 )
 
 logger = logging.getLogger(__name__)
@@ -50,14 +51,15 @@ def _enqueue_autolearn_maintenance(concept_id: str, concept_version: str = "v1",
 # DATA-041/DATA-053: Source-anchoring regex — extract file paths from evidence content.
 # DATA-053: Broadened from 4 patterns to also capture .yml/.yaml/.json/.md/.toml/.env files.
 import re as _re
+
 _FILE_PATH_RE = _re.compile(
-    r"(app/\S+\.py"                           # app/ Python files
-    r"|server\.js"                             # server.js
-    r"|tests?/\S+\.py"                        # test Python files
-    r"|migrations?/\S+\.py"                   # migration Python files
-    r"|\S+/\S+\.(?:py|yml|yaml|json|md|toml)" # nested paths with dir/ prefix
+    r"(app/\S+\.py"  # app/ Python files
+    r"|server\.js"  # server.js
+    r"|tests?/\S+\.py"  # test Python files
+    r"|migrations?/\S+\.py"  # migration Python files
+    r"|\S+/\S+\.(?:py|yml|yaml|json|md|toml)"  # nested paths with dir/ prefix
     r"|[\w][\w.\-]*\.(?:json|ya?ml|toml|md)"  # root-level config files
-    r"|\.env(?:\.\w+)?)"                      # .env dotfiles
+    r"|\.env(?:\.\w+)?)"  # .env dotfiles
 )
 
 
@@ -142,13 +144,14 @@ def create_concept(proposal: ConceptProposal) -> Concept:
             content = ev.get("content", "")
             # DATA-058: Strip URLs before matching to prevent false positives
             # (lookbehind at pattern level fails for sub-segments after ://)
-            _url_stripped = _re.sub(r'https?://\S+', '', content)
+            _url_stripped = _re.sub(r"https?://\S+", "", content)
             match = _FILE_PATH_RE.search(_url_stripped)
             if match:
                 ev["file_path"] = match.group(1)
     # MONITOR-059: Track file_path extraction hit rate post DATA-053 broadening
     try:
         from app.core.metrics_facade import metrics as _fp_metrics
+
         _ev_dicts = [ev for ev in sanitized_evidence if isinstance(ev, dict)]
         if _ev_dicts:
             _fp_hits = sum(1 for ev in _ev_dicts if ev.get("file_path"))
@@ -344,6 +347,7 @@ def _build_evolved_concept(old_concept: Concept, evolution: ConceptEvolution, ne
     data["confidence"] = max(0.0, min(1.0, old_concept.confidence + evolution.confidence_change))
     # STABILITY-026: M3 compliance — cap confidence for PSIS-quarantined concepts
     from app.core.config import PSIS_QUARANTINE_CONFIDENCE_CAP, PSIS_QUARANTINE_EVIDENCE_MARKER
+
     if PSIS_QUARANTINE_EVIDENCE_MARKER in data.get("evidence", []):
         data["confidence"] = min(data["confidence"], PSIS_QUARANTINE_CONFIDENCE_CAP)
     data["stability"] = min(1.0, old_concept.stability + 0.1)
@@ -452,33 +456,23 @@ def evolve_concept(evolution: ConceptEvolution) -> Concept | None:
         }
         # Clean out None values
         new_data = {k: v for k, v in new_data.items() if v is not None}
-        result_id = None
+        # Once selected, this mutation path owns the outcome. Never fall through.
+        with db_immediate() as conn:
+            result_id = evolve_concept_nonlossy(evolution.concept_id, new_data, conn)
+        if result_id is None:
+            return None
+        evolved = load_concept(result_id, track_access=False)
+        if evolved is None:
+            raise RuntimeError("Nonlossy evolution completed but concept reload failed")
+        _enqueue_autolearn_maintenance(evolved.id, evolved.version, source="learning_evolve_nonlossy")
         try:
-            with db_immediate() as conn:
-                result_id = evolve_concept_nonlossy(evolution.concept_id, new_data, conn)
-                if result_id:
-                    conn.commit()
-        except Exception:
-            logger.exception("Nonlossy evolution failed, falling through to legacy")
+            from app.retrieval import retrieval_engine
 
-        if result_id:
-            # Reload the evolved concept to return it
-            evolved = load_concept(result_id, track_access=False)
-            if evolved:
-                _enqueue_autolearn_maintenance(evolved.id, evolved.version, source="learning_evolve_nonlossy")
-                # P1 EMBED-001: Re-index evolved concept in retrieval engine
-                try:
-                    from app.retrieval import retrieval_engine
-
-                    retrieval_engine.add_concept(evolved.id)
-                except Exception as _reindex_err:
-                    logger.warning(f"EMBED-001: Failed to re-index {evolved.id} (non-fatal): {_reindex_err}")
-                # Phase 3 v1.1 WS3-2: Trigger cascade on significant corrections
-                _maybe_trigger_cascade(evolution, evolved)
-                return evolved
-        # If nonlossy returned None (feature off or concept not found), fall through
-        # to legacy path for backward compatibility
-        logger.debug("Nonlossy path returned None, using legacy evolve for %s", evolution.concept_id)
+            retrieval_engine.add_concept(evolved.id)
+        except Exception as reindex_error:
+            logger.warning("EMBED-001: Failed to re-index %s (non-fatal): %s", evolved.id, reindex_error)
+        _maybe_trigger_cascade(evolution, evolved)
+        return evolved
 
     if FEATURE_FLAGS.get("VERSION_CHAIN_CONCURRENCY_ENABLED", False):
         return _evolve_concept_atomic(evolution)
@@ -522,6 +516,7 @@ def _maybe_trigger_cascade(evolution: ConceptEvolution, evolved_concept) -> None
     """
     # BENCHMARK-005: Skip cascades in benchmark mode (expensive, wasted on ephemeral instances)
     from app.core.config import BENCHMARK as _bm_cascade
+
     if _bm_cascade.skip_cascades:
         return
     # --- Negative cascade (existing WS3-2) ---

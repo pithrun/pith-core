@@ -4,6 +4,23 @@ All notable changes to Pith are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.12] - 2026-10-07
+
+### Fixed
+- The Unix backup command forwards `--dry-run`, custom output paths and quiet mode, and preserves the backup helper exit status. A preview exits with status 2 without creating or pruning backups.
+- Backup retention preserves paths containing spaces and rejects invalid retention counts before writes.
+- Reviewed background paths no longer close shared SQLite connections owned by the storage backend.
+- Selected concept evolution reports declines and failures instead of silently creating a new concept after an unsuccessful evolution attempt.
+- Session learning avoids replaying a whole operation after an uncertain database failure.
+
+## [1.0.11] - 2026-10-06
+
+### Changed
+- Application updates verify release archives and refresh installed application files and the command-line wrapper.
+- Session learning reports accepted items and per-item errors.
+- Background maintenance can request a bounded cache refresh before retrying eligible work.
+- Foreground retrieval reports optional bounded embedding readiness.
+
 ## [1.0.10] - 2026-10-05
 
 ### Fixed
