@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# Pith Installer v1.0.11
+# Pith Installer v1.0.8
 # macOS developer preview installer; Linux remains an unverified source/developer path.
 
 # Configuration
@@ -15,7 +15,7 @@ PITH_REPAIR_RUNTIME="${PITH_REPAIR_RUNTIME:-0}"
 PITH_FORCE_MANAGED_PYTHON="${PITH_FORCE_MANAGED_PYTHON:-0}"
 # Keep PITH_VERSION on line 18.
 # scripts/version-bump.sh and TEST-090 depend on this exact location.
-PITH_VERSION="1.0.11"
+PITH_VERSION="1.0.12"
 PITH_INSTALL_TELEMETRY_URL="${PITH_INSTALL_TELEMETRY_URL-https://pith.run/telemetry/install}"
 PITH_INSTALL_TELEMETRY_EVENT_VERSION="${PITH_INSTALL_TELEMETRY_EVENT_VERSION:-1}"
 PITH_RELEASE_CHANNEL="${PITH_RELEASE_CHANNEL:-unknown}"
@@ -2534,8 +2534,8 @@ print_wrapper_help() {
             echo "  Tail the Pith log, or print a bounded snapshot."
             ;;
         backup)
-            echo "Usage: pith backup"
-            echo "  Run the configured WAL-safe backup helper."
+            echo "Usage: pith backup [--output PATH] [--quiet|-q] [--dry-run]"
+            echo "  Run the configured WAL-safe backup helper; --dry-run previews without writes (exit 2)."
             ;;
         restore)
             echo "Usage: pith restore [backup_file]"
@@ -2818,7 +2818,7 @@ PY
         ;;
     backup)
         if is_help_request; then print_wrapper_help backup; exit 0; fi
-        "$PITH_HOME/bin/backup"
+        "$PITH_HOME/bin/backup" "${ARGS[@]:1}"
         ;;
     restore)
         if is_help_request; then print_wrapper_help restore; exit 0; fi

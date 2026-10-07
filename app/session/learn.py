@@ -3956,7 +3956,6 @@ class SessionLearnMixin:
                 "associations": 0,
             }
 
-        _record_elapsed_subphase("insight_skip")
         return {"action": "skipped_duplicate"}
 
     def _create_new_concept(

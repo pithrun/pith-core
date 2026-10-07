@@ -1329,21 +1329,19 @@ def process_experiment_results(experiment_id: str, result: ExperimentResult) -> 
             from app.storage import _get_connection
 
             conn = _get_connection()
-            try:
-                cko = create_cko(
-                    conn=conn,
-                    title=result.cko_produced.get("title", "Experiment Result"),
-                    concept_ids=concept_ids,
-                    synthesis=result.cko_produced.get("synthesis", result.synthesis),
-                    knowledge_area=result.cko_produced.get("knowledge_area", "general"),
-                    cko_type="analysis",
-                )
-                cko_id = cko.id
-                logger.info(
-                    f"CKO-001: Created CKO {cko_id} from experiment {experiment_id} with {len(concept_ids)} concepts"
-                )
-            finally:
-                conn.close()
+            # Borrowed backend handle; connection lifetime belongs to the backend.
+            cko = create_cko(
+                conn=conn,
+                title=result.cko_produced.get("title", "Experiment Result"),
+                concept_ids=concept_ids,
+                synthesis=result.cko_produced.get("synthesis", result.synthesis),
+                knowledge_area=result.cko_produced.get("knowledge_area", "general"),
+                cko_type="analysis",
+            )
+            cko_id = cko.id
+            logger.info(
+                f"CKO-001: Created CKO {cko_id} from experiment {experiment_id} with {len(concept_ids)} concepts"
+            )
         except Exception as e:
             logger.warning(f"CKO-001: Failed to create CKO from experiment {experiment_id}: {e}")
 

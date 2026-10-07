@@ -959,7 +959,7 @@ class PostgreSQLBackend:
 # --- Backend Factory ---
 
 _backend: StorageBackend | None = None
-_backend_lock = threading.Lock()  # STABILITY-014 Fix 1: thread-safe singleton init
+_backend_lock = threading.RLock()  # STABILITY-049: serialize factory admission, allow owner callbacks
 
 
 def get_backend() -> StorageBackend:
@@ -969,14 +969,12 @@ def get_backend() -> StorageBackend:
         "sqlite"     — SQLiteBackend (default)
         "postgresql" — PostgreSQLBackend (Phase 5 stub)
 
-    The backend is lazy-initialized on first call and cached.
-    Thread-safe via double-checked locking (STABILITY-014).
+    Every factory getter is serialized until initialization completes.
+    The initializing thread may re-enter for existing synchronous callbacks.
     """
     global _backend
-    if _backend is not None:
-        return _backend
     with _backend_lock:
-        if _backend is not None:  # double-check after acquiring lock
+        if _backend is not None:
             return _backend
         backend_type = os.environ.get("PITH_STORAGE_BACKEND", "sqlite")
         if backend_type == "postgresql":
@@ -989,14 +987,30 @@ def get_backend() -> StorageBackend:
             from app.storage import DB_PATH, SCHEMA_DDL
 
             _backend = SQLiteBackend(DB_PATH, SCHEMA_DDL)
-        _backend.initialize()
-        logger.info("Storage backend initialized: %s", _backend.backend_type)
-    return _backend
+        candidate = _backend
+        try:
+            candidate.initialize()
+        except BaseException:
+            _backend = None
+            # Only the initializer owns this failed candidate; preserve its error.
+            for method_name in ("begin_shutdown", "close"):
+                try:
+                    cleanup = getattr(candidate, method_name, None)
+                    if callable(cleanup):
+                        cleanup()
+                except BaseException:
+                    logger.warning(
+                        "Failed backend initialization cleanup: %s", method_name, exc_info=True
+                    )
+            raise
+        logger.info("Storage backend initialized: %s", candidate.backend_type)
+        return candidate
 
 
 def reset_backend() -> None:
-    """Reset backend singleton (for testing)."""
+    """Reset backend singleton (for testing); does not drain raw readers."""
     global _backend
-    if _backend is not None and hasattr(_backend, "close"):
-        _backend.close()
-    _backend = None
+    with _backend_lock:
+        if _backend is not None and hasattr(_backend, "close"):
+            _backend.close()
+        _backend = None

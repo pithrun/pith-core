@@ -1139,7 +1139,7 @@ def auto_associate_single(*args: Any, **kwargs: Any) -> Any:
 # MATURITY-001: Maturities blocked from external API results
 _BLOCKED_MATURITIES = {"QUARANTINED", "DISCARDED"}
 
-SERVER_VERSION = os.environ.get("PITH_VERSION", "1.0.11")
+SERVER_VERSION = os.environ.get("PITH_VERSION", "1.0.12")
 
 app = FastAPI(
     title="Pith Server",
@@ -5105,9 +5105,12 @@ def _pith_propose_concept_inner(proposal: ConceptProposal):
     # §5.8.4 H18: Write-scoped governance context for event tracing
     from app.governance.governance_context import write_governance_context
 
-    _gov_ctx_mgr = write_governance_context("propose_concept")
-    _gov_ctx = _gov_ctx_mgr.__enter__()
+    with write_governance_context("propose_concept") as gov_ctx:
+        return _pith_propose_concept_with_governance(proposal, gov_ctx)
 
+
+def _pith_propose_concept_with_governance(proposal: ConceptProposal, _gov_ctx):
+    """One proposal attempt inside the caller-owned governance context."""
     # Memory Integrity §5.1.5: Write-time contradiction check
     contra_result = None
     try:
@@ -5143,11 +5146,6 @@ def _pith_propose_concept_inner(proposal: ConceptProposal):
                 )
             except Exception:
                 pass
-            # Flush governance context before raising
-            try:
-                _gov_ctx_mgr.__exit__(None, None, None)
-            except Exception:
-                pass
             raise HTTPException(
                 status_code=409, detail=f"Concept contradicts existing knowledge: {contra_result.reason}"
             )
@@ -5156,6 +5154,7 @@ def _pith_propose_concept_inner(proposal: ConceptProposal):
     except Exception as e:
         logger.warning(f"propose_concept: contradiction check failed (non-fatal): {e}")
 
+    evolution_selected = False
     # Memory Integrity §Gap 2 / A4-H1: Dedup at ingestion
     # INGEST-005: Use embedding dedup (matches session_learn path) with config thresholds
     try:
@@ -5223,6 +5222,7 @@ def _pith_propose_concept_inner(proposal: ConceptProposal):
                     "message": f"Near-duplicate of {top_match['concept_id']} (cosine={top_cosine:.3f})",
                 }
             elif _dedup_zone == "EVOLVE":
+                evolution_selected = True
                 try:
                     from app.cognitive.learning import evolve_concept
                     from app.core.models import ConceptEvolution
@@ -5242,9 +5242,15 @@ def _pith_propose_concept_inner(proposal: ConceptProposal):
                             "evolved_version": evolved.version,
                             "message": f"Merged into {top_match['concept_id']} (cosine={top_cosine:.3f})",
                         }
+                    raise HTTPException(status_code=400, detail="Evolution not warranted or concept not found")
+                except HTTPException:
+                    raise
                 except Exception as e:
-                    logger.warning(f"propose_concept: dedup merge failed, creating new: {e}")
+                    logger.exception("propose_concept: selected evolution failed; creation suppressed")
+                    raise HTTPException(status_code=500, detail="Concept evolution failed; outcome may be partial") from e
     except Exception as e:
+        if evolution_selected:
+            raise
         logger.warning(f"propose_concept: dedup check failed (non-fatal): {e}")
 
     # Create concept
@@ -5342,18 +5348,8 @@ def _pith_propose_concept_inner(proposal: ConceptProposal):
             )
         if ambient:
             response["ambient_context"] = {"related": ambient}
-        # §5.8.4 H18: Flush write-scoped governance context
-        try:
-            _gov_ctx_mgr.__exit__(None, None, None)
-        except Exception:
-            pass
         return response
     except Exception as e:
-        # Flush governance context on error path too
-        try:
-            _gov_ctx_mgr.__exit__(None, None, None)
-        except Exception:
-            pass
         raise HTTPException(status_code=500, detail=_safe_error(e))
 
 
@@ -5363,16 +5359,15 @@ def pith_evolve_concept_endpoint(evolution: ConceptEvolution):
     # §5.8.4 H18: Write-scoped governance context
     from app.governance.governance_context import write_governance_context
 
-    _gov_ctx_mgr = write_governance_context("evolve_concept")
-    _gov_ctx = _gov_ctx_mgr.__enter__()
+    with write_governance_context("evolve_concept"):
+        return _pith_evolve_concept_inner(evolution)
 
+
+def _pith_evolve_concept_inner(evolution: ConceptEvolution):
+    """Evolve within a governance context that closes on every outcome."""
     concept = evolve_concept(evolution)
 
     if not concept:
-        try:
-            _gov_ctx_mgr.__exit__(None, None, None)
-        except Exception:
-            pass
         raise HTTPException(status_code=400, detail="Evolution not warranted or concept not found")
 
     # Update index
@@ -5442,11 +5437,6 @@ def pith_evolve_concept_endpoint(evolution: ConceptEvolution):
         response["ambient_context"] = {"related": ambient}
     if dedup_warning:
         response["dedup_warning"] = dedup_warning
-    # §5.8.4 H18: Flush write-scoped governance context
-    try:
-        _gov_ctx_mgr.__exit__(None, None, None)
-    except Exception:
-        pass
     return response
 
 
@@ -9298,7 +9288,7 @@ def _run_session_learn_replay_payload(payload: dict) -> object:
         replay_payload["replay_fast_path"] = True
         replay_payload["trigger_path"] = replay_payload.get("trigger_path") or "session_learn_replay"
     request = SessionLearnRequest(**replay_payload)
-    return _with_db_retry(lambda: session_manager.session_learn(request))
+    return session_manager.session_learn(request)
 
 
 def _load_committed_session_learn_replay(request_id: str) -> dict | None:
@@ -9739,7 +9729,7 @@ def session_learn_endpoint(request: SessionLearnRequest):
             if callable(prepare_binding):
                 binding = prepare_binding(request)
             try:
-                return _with_db_retry(lambda: session_manager.session_learn(request))
+                return session_manager.session_learn(request)
             finally:
                 if binding is not None:
                     session_manager._pop_request_session(

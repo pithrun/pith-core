@@ -3859,19 +3859,17 @@ def _top3_association_strength(concept_id: str, thread_concept_ids: list[str]) -
         return 0.0
     placeholders = ",".join("?" for _ in other_ids)
     conn = get_db_connection()
-    try:
-        rows = conn.execute(
-            f"""
-            SELECT strength FROM associations
-            WHERE (source = ? AND target IN ({placeholders}))
-               OR (target = ? AND source IN ({placeholders}))
-            ORDER BY strength DESC
-            LIMIT 3
-            """,
-            (concept_id, *other_ids, concept_id, *other_ids),
-        ).fetchall()
-    finally:
-        conn.close()
+    # Borrowed backend handle; connection lifetime belongs to the backend.
+    rows = conn.execute(
+        f"""
+        SELECT strength FROM associations
+        WHERE (source = ? AND target IN ({placeholders}))
+           OR (target = ? AND source IN ({placeholders}))
+        ORDER BY strength DESC
+        LIMIT 3
+        """,
+        (concept_id, *other_ids, concept_id, *other_ids),
+    ).fetchall()
     strengths = [float(row[0] or 0.0) for row in rows]
     if not strengths:
         return 0.0
