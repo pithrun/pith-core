@@ -17,6 +17,9 @@ Lifecycle:
   - Overlapping CKOs (>60% shared constituents) → merge candidate
   - Max 10 active CKOs per knowledge_area
 
+Transaction ownership: helpers preserve a transaction already active on entry.
+The caller must commit or roll back it; standalone mutations retain their commits.
+
 Reference: COGNITIVE_GOVERNANCE_ARCHITECTURE_v1.3.md §Layer 4
 """
 
@@ -37,8 +40,8 @@ logger = logging.getLogger(__name__)
 # Schema — CKO storage table
 # =============================================================================
 
-CKO_TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS compound_knowledge_objects (
+CKO_TABLE_STATEMENTS = (
+    """CREATE TABLE IF NOT EXISTS compound_knowledge_objects (
     id TEXT PRIMARY KEY,
     title TEXT NOT NULL,
     cko_type TEXT NOT NULL DEFAULT 'analysis',
@@ -56,12 +59,13 @@ CREATE TABLE IF NOT EXISTS compound_knowledge_objects (
     last_accessed TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
-);
+);""",
+    "CREATE INDEX IF NOT EXISTS idx_cko_status ON compound_knowledge_objects(status);",
+    "CREATE INDEX IF NOT EXISTS idx_cko_area ON compound_knowledge_objects(knowledge_area);",
+    "CREATE INDEX IF NOT EXISTS idx_cko_authority ON compound_knowledge_objects(authority);",
+)
 
-CREATE INDEX IF NOT EXISTS idx_cko_status ON compound_knowledge_objects(status);
-CREATE INDEX IF NOT EXISTS idx_cko_area ON compound_knowledge_objects(knowledge_area);
-CREATE INDEX IF NOT EXISTS idx_cko_authority ON compound_knowledge_objects(authority);
-"""
+CKO_TABLE_SQL = "\n\n".join(CKO_TABLE_STATEMENTS)
 
 # Valid CKO types per spec
 CKO_TYPES = {"analysis", "plan", "assessment", "investigation"}
@@ -125,8 +129,9 @@ class CKO:
 
 
 def ensure_cko_table(conn: sqlite3.Connection) -> None:
-    """Create CKO table if not exists."""
-    conn.executescript(CKO_TABLE_SQL)
+    """Create the CKO schema without ending a caller-owned transaction."""
+    for statement in CKO_TABLE_STATEMENTS:
+        conn.execute(statement)
 
 
 def _is_missing_cko_table_error(exc: sqlite3.OperationalError) -> bool:
@@ -154,6 +159,7 @@ def create_cko(
     Returns:
         Created CKO with computed authority/currency
     """
+    caller_owns_transaction = conn.in_transaction
     ensure_cko_table(conn)
 
     if cko_type not in CKO_TYPES:
@@ -235,7 +241,8 @@ def create_cko(
             cko.updated_at,
         ),
     )
-    conn.commit()
+    if not caller_owns_transaction:
+        conn.commit()
 
     logger.info(
         f"Created CKO {cko_id}: {title} ({len(concept_ids)} concepts, "
@@ -365,6 +372,7 @@ def search_ckos(
     Returns:
         Scored and sorted list of CKOs
     """
+    caller_owns_transaction = conn.in_transaction
     if ensure_table:
         ensure_cko_table(conn)
 
@@ -424,7 +432,8 @@ def search_ckos(
         result_ckos.append(cko)
 
     if result_ckos:
-        conn.commit()
+        if not caller_owns_transaction:
+            conn.commit()
 
     return result_ckos
 
@@ -465,6 +474,7 @@ def refresh_cko(conn: sqlite3.Connection, cko_id: str) -> CKO | None:
     Called after constituent concepts are mutated (evolved, decayed, etc.).
     Follows the lifecycle: active → degraded → stale → archived.
     """
+    caller_owns_transaction = conn.in_transaction
     cko = load_cko(conn, cko_id)
     if not cko:
         return None
@@ -492,9 +502,18 @@ def refresh_cko(conn: sqlite3.Connection, cko_id: str) -> CKO | None:
            SET authority = ?, currency = ?, confidence = ?,
                degraded_constituents = ?, status = ?, updated_at = ?
            WHERE id = ?""",
-        (authority, currency, confidence, json.dumps(degraded), new_status, now, cko_id),
+        (
+            authority,
+            currency,
+            confidence,
+            json.dumps(degraded),
+            new_status,
+            now,
+            cko_id,
+        ),
     )
-    conn.commit()
+    if not caller_owns_transaction:
+        conn.commit()
 
     cko.authority = authority
     cko.currency = currency
@@ -521,6 +540,7 @@ def update_cko_synthesis(
 
     Used when concepts are added/removed from the CKO.
     """
+    caller_owns_transaction = conn.in_transaction
     cko = load_cko(conn, cko_id)
     if not cko:
         return None
@@ -554,7 +574,8 @@ def update_cko_synthesis(
             cko_id,
         ),
     )
-    conn.commit()
+    if not caller_owns_transaction:
+        conn.commit()
 
     cko.synthesis = new_synthesis
     cko.concept_ids = concept_ids
@@ -583,6 +604,7 @@ def run_cko_lifecycle(conn: sqlite3.Connection) -> dict[str, Any]:
 
     Returns summary of actions taken.
     """
+    caller_owns_transaction = conn.in_transaction
     ensure_cko_table(conn)
     actions = {"refreshed": 0, "archived": 0, "merge_candidates": []}
 
@@ -634,7 +656,8 @@ def run_cko_lifecycle(conn: sqlite3.Connection) -> dict[str, Any]:
         logger.info(f"Archived stale CKO {cko_id} ({title})")
 
     if actions["archived"] > 0:
-        conn.commit()
+        if not caller_owns_transaction:
+            conn.commit()
 
     # 3. Identify merge candidates (>60% shared constituents)
     active_ckos = conn.execute(
@@ -717,6 +740,8 @@ def list_ckos(
 
 def delete_cko(conn: sqlite3.Connection, cko_id: str) -> bool:
     """Permanently delete a CKO. Use archive via lifecycle for normal removal."""
+    caller_owns_transaction = conn.in_transaction
     result = conn.execute("DELETE FROM compound_knowledge_objects WHERE id = ?", (cko_id,))
-    conn.commit()
+    if not caller_owns_transaction:
+        conn.commit()
     return result.rowcount > 0
