@@ -4,6 +4,12 @@ All notable changes to Pith are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.13] - 2026-10-08
+
+### Fixed
+- Compound knowledge operations preserve the caller's database transaction, so an outer rollback also rolls back completed compound knowledge writes.
+- Schema initialization preserves open transactions. Standalone compound knowledge operations continue to save their results.
+
 ## [1.0.12] - 2026-10-07
 
 ### Fixed
