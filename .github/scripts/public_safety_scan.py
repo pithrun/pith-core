@@ -69,6 +69,7 @@ ALLOWED_CHANGED_BINARY_PATHS = {
     "integrations/claude-desktop-extension/pith-claude-1.0.11.mcpb",
     "integrations/claude-desktop-extension/pith-claude-1.0.12.mcpb",
     "integrations/claude-desktop-extension/pith-claude-1.0.13.mcpb",
+    "integrations/claude-desktop-extension/pith-claude-1.0.14.mcpb",
     "pith-server-latest.tar.gz",
     "pith-server-latest.zip",
 }
