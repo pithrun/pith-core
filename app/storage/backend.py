@@ -383,6 +383,7 @@ class SQLiteBackend:
         self._lock = threading.RLock()  # RLock: allows nested _db() calls on same thread
         self._nesting_depth = 0  # Track transaction nesting depth (same thread via RLock)
         self._shutting_down = False  # STABILITY-037: shutdown coordination flag
+        self._transaction_cleanup_failed = False
 
     def initialize(self) -> None:
         """Create tables, set pragmas, run migrations on first connection.
@@ -699,19 +700,20 @@ class SQLiteBackend:
         is_outermost = self._nesting_depth == 1
         try:
             conn = self.get_connection()
-            if is_outermost:
-                conn.execute("BEGIN")
+            owns_transaction = False
             try:
+                if is_outermost:
+                    owns_transaction = not conn.in_transaction
+                    conn.execute("BEGIN")
                 yield conn
                 if is_outermost:
                     if getattr(conn, "in_transaction", False):
                         conn.commit()
                     else:
                         logger.debug("db(): outer transaction already closed before context exit; skipping commit")
-            except Exception:
-                if is_outermost:
-                    if getattr(conn, "in_transaction", False):
-                        conn.rollback()
+            except BaseException:
+                if owns_transaction:
+                    self._rollback_after_error(conn, context="db")
                 raise
         finally:
             self._nesting_depth -= 1
@@ -799,9 +801,11 @@ class SQLiteBackend:
         is_outermost = self._nesting_depth == 1
         try:
             conn = self.get_connection()
-            if is_outermost:
-                conn.execute("BEGIN IMMEDIATE")
+            owns_transaction = False
             try:
+                if is_outermost:
+                    owns_transaction = not conn.in_transaction
+                    conn.execute("BEGIN IMMEDIATE")
                 yield conn
                 if is_outermost:
                     if getattr(conn, "in_transaction", False):
@@ -810,10 +814,9 @@ class SQLiteBackend:
                         logger.debug(
                             "db_immediate(): outer transaction already closed before context exit; skipping commit"
                         )
-            except Exception:
-                if is_outermost:
-                    if getattr(conn, "in_transaction", False):
-                        conn.rollback()
+            except BaseException:
+                if owns_transaction:
+                    self._rollback_after_error(conn, context="db_immediate")
                 raise
         finally:
             self._nesting_depth -= 1
@@ -831,6 +834,23 @@ class SQLiteBackend:
                     )
             self._lock.release()
 
+    def _rollback_after_error(self, conn: sqlite3.Connection, *, context: str) -> None:
+        """Roll back under the caller's SQL lock without replacing its primary error."""
+        try:
+            if getattr(conn, "in_transaction", False):
+                conn.rollback()
+        except BaseException:
+            # Keep this exact native handle for owner cleanup; never probe/recycle it.
+            self._transaction_cleanup_failed = True
+            try:
+                logger.error(
+                    "STABILITY-049: %s rollback failed; cached connection quarantined",
+                    context,
+                )
+            except BaseException:
+                # Diagnostics must not replace the body/commit error being propagated.
+                pass
+
     def get_connection(self) -> sqlite3.Connection:
         """Get persistent SQLite connection with WAL journal mode.
 
@@ -844,6 +864,8 @@ class SQLiteBackend:
         handles after unclean shutdown (e.g., SIGKILL from launchctl kickstart -k).
         """
         with self._lock:
+            if self._transaction_cleanup_failed:
+                raise RuntimeError("Database transaction cleanup failed; reset backend required")
             if self._conn is not None:
                 try:
                     self._conn.execute("SELECT 1")

@@ -4,6 +4,13 @@ All notable changes to Pith are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.14] - 2026-10-22
+
+### Fixed
+- Installers exclude incompatible Pydantic versions that prevent the MCP bridge from importing.
+- Interrupted database operations roll back transactions they own, including cancellation during transaction entry or commit.
+- If rollback fails, subsequent operations refuse the affected connection while preserving the original error.
+
 ## [1.0.13] - 2026-10-08
 
 ### Fixed

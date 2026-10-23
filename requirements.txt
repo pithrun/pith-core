@@ -1,6 +1,6 @@
 fastapi>=0.115.0,<1.0.0                              # Upgraded from ==0.115.0 for mcp SDK compat (starlette>=0.46)
 uvicorn[standard]==0.27.0
-pydantic>=2.11.0,<3.0.0                              # mcp>=1.12 requires pydantic>=2.11 (host_required constraint); was ==2.10.0
+pydantic>=2.11.0,<2.14.0                             # MCP 1.12.4 imports an API removed in Pydantic 2.14
 pyyaml==6.0.3
 scikit-learn==1.4.2
 numpy==1.26.4
