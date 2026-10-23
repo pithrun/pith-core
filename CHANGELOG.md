@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## [1.0.14] - 2026-10-22
 
 ### Fixed
+- Installers exclude incompatible Pydantic versions that prevent the MCP bridge from importing.
 - Interrupted database operations roll back transactions they own, including cancellation during transaction entry or commit.
 - If rollback fails, subsequent operations refuse the affected connection while preserving the original error.
 
